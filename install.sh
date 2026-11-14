@@ -271,10 +271,20 @@ setup_path() {
         fi
     done
 
+    # No rc file yet (common for freshly created server users): create the
+    # first candidate rather than leaving docent off PATH.
     if [ -z "$config_file" ]; then
-        say "${MUTED}No config file found for ${NC}${current_shell}${MUTED}. Manually add to your shell config:${NC}"
-        say "  $path_command"
-        return 0
+        config_file="${config_files%% *}"
+        if ! { mkdir -p "$(dirname "$config_file")" && touch "$config_file"; } 2>/dev/null; then
+            say "${MUTED}Could not create ${NC}${config_file}${MUTED}. Manually add to your shell config:${NC}"
+            say "  $path_command"
+            return 0
+        fi
+        # A bash login shell (SSH) reads ~/.profile, not ~/.bashrc; with
+        # neither present, add a ~/.profile that sources the new ~/.bashrc.
+        if [ "$config_file" = "$HOME/.bashrc" ] && [ ! -e "$HOME/.bash_profile" ] && [ ! -e "$HOME/.bash_login" ] && [ ! -e "$HOME/.profile" ]; then
+            printf '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n' > "$HOME/.profile"
+        fi
     fi
 
     add_to_path "$config_file" "$path_command"
