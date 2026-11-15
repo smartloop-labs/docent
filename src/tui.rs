@@ -1383,14 +1383,13 @@ enum AfterCheck {
     Passed,
     /// Ask the agent to fix it: the round this makes.
     Fix(u32),
-    /// The last fix changed nothing in what the check says: left to the
-    /// user, as another round would too.
+    /// A fix brought the check back to what it said before, so the
+    /// rounds go in circles: left to the user, as another would too.
     Stalled,
+    /// `FIX_ROUNDS` fixes and still failing: left to the user.
+    OutOfRounds,
 }
 
-/// The loop goes on as long as the errors are not fixed, round after round,
-/// and stops only when a round made no difference: the check's `output` is
-/// what it was after the last failure.
 /// Words for a reply being written, when the model writing it isn't known.
 const WORKING_WORDS: [&str; 12] = [
     "Generating",
@@ -1425,10 +1424,19 @@ const EDIT_ROUNDS: u32 = 2;
 /// Characters of a file sent back with an edit that didn't apply.
 const EDIT_SHOWN: usize = 40_000;
 
-fn after_check(code: Option<i32>, output: &str, fix_round: u32, last_failure: Option<&str>) -> AfterCheck {
+/// Rounds of fixes for one prompt's failing check, before it's left to
+/// the user.
+const FIX_ROUNDS: u32 = 5;
+
+/// The loop goes on as long as the errors are not fixed, round after round,
+/// and stops when the check's `output` is one it gave earlier in the turn,
+/// as a fix that undoes the last one would go round again, or after
+/// `FIX_ROUNDS`.
+fn after_check(code: Option<i32>, output: &str, fix_round: u32, failures: &[String]) -> AfterCheck {
     match code {
         Some(0) => AfterCheck::Passed,
-        _ if last_failure == Some(output) => AfterCheck::Stalled,
+        _ if failures.iter().any(|f| f == output) => AfterCheck::Stalled,
+        _ if fix_round >= FIX_ROUNDS => AfterCheck::OutOfRounds,
         _ => AfterCheck::Fix(fix_round + 1),
     }
 }
@@ -1531,9 +1539,9 @@ struct App {
     /// The project's enabled models, once read; empty asks for one on the
     /// card.
     enabled_models: Option<Vec<String>>,
-    /// What the check said when it last failed, to tell a round that fixed
-    /// nothing.
-    last_failure: Option<String>,
+    /// What the check said each time it failed this turn, to tell a round
+    /// that brought back errors already seen.
+    failures: Vec<String>,
     /// The last reply's shell commands, with their folder, waiting for the
     /// check of its files to pass before they run.
     commands: Option<(std::path::PathBuf, Vec<String>)>,
@@ -1634,7 +1642,7 @@ impl App {
             always_run: false,
             tooling: None,
             command_round: 0,
-            last_failure: None,
+            failures: Vec::new(),
             hint_at: 0,
             skills: Vec::new(),
             agent: None,
@@ -2209,7 +2217,7 @@ impl App {
                 self.entries.push(Entry::Notice(format!("{}: no errors in {}", check.command, files)));
                 self.run_build_check(&root, &written);
                 if self.check.is_none() {
-                    self.last_failure = None;
+                    self.failures.clear();
                     self.run_commands();
                 }
             }
@@ -2235,16 +2243,16 @@ impl App {
             self.answer_ask(false, false);
             return;
         }
-        match after_check(code, &output, self.fix_round, self.last_failure.as_deref()) {
+        match after_check(code, &output, self.fix_round, &self.failures) {
             AfterCheck::Passed => {
-                self.last_failure = None;
+                self.failures.clear();
                 let fixed = if self.fix_round > 0 { format!(" after {} fix(es)", self.fix_round) } else { String::new() };
                 self.entries.push(Entry::Notice(format!("{} passed{}", check.command, fixed)));
                 self.run_commands();
             }
             AfterCheck::Fix(round) => {
                 self.fix_round = round;
-                self.last_failure = Some(output.clone());
+                self.failures.push(output.clone());
                 self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", round)));
                 let shown = format!("Fix the errors from `{}`", check.command);
                 let what = match check.servers {
@@ -2258,11 +2266,13 @@ impl App {
                 );
                 self.send_turn(shown, message, Vec::new(), true);
             }
-            AfterCheck::Stalled => {
-                self.last_failure = None;
+            outcome @ (AfterCheck::Stalled | AfterCheck::OutOfRounds) => {
+                self.failures.clear();
+                let how = if outcome == AfterCheck::Stalled { "with errors it gave before" } else { "still" };
                 self.entries.push(Entry::Warning(format!(
-                    "{} still fails the same way after {} fix(es); the errors are above",
+                    "{} fails {} after {} fix(es); the errors are above",
                     check.command,
+                    how,
                     self.fix_round
                 )));
                 // The tool calls among them are dropped with them: the
@@ -2321,9 +2331,10 @@ impl App {
         });
         failed.extend(elided.into_iter().map(|f| (f.path, files::ELIDED.to_string())));
         let written = self.reply_files(&root, found, whole);
+        let runs = !commands.is_empty();
         // The reply's commands run once its files are in and checked: a
         // fix round's reply has none of its own, so the first reply's wait.
-        if !commands.is_empty() {
+        if runs {
             self.commands = Some((root.clone(), commands));
         }
         if !failed.is_empty() {
@@ -2349,7 +2360,9 @@ impl App {
         }
         if !written.is_empty() {
             self.run_check(&root, &written);
-        } else if self.fix_round > 0 {
+        } else if self.fix_round > 0 && !runs {
+            // A fix that's a command to run may yet change them: said only
+            // of one that's neither.
             self.entries.push(Entry::Warning("The fix changed no file, so the errors stand; see them above".to_string()));
         }
         if self.check.is_none() {
@@ -4089,7 +4102,7 @@ impl App {
         self.files_asked = false;
         self.manifest_asked = false;
         self.command_round = 0;
-        self.last_failure = None;
+        self.failures.clear();
         self.send_turn(input, message, files, making);
     }
 
@@ -7203,13 +7216,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_check_is_fixed_until_it_passes_or_a_round_changes_nothing() {
-        assert_eq!(after_check(Some(0), "", 0, None), AfterCheck::Passed);
-        assert_eq!(after_check(Some(0), "", 7, Some("err")), AfterCheck::Passed);
-        assert_eq!(after_check(Some(1), "err A", 0, None), AfterCheck::Fix(1));
-        assert_eq!(after_check(None, "err B", 1, Some("err A")), AfterCheck::Fix(2));
-        assert_eq!(after_check(Some(101), "err C", 9, Some("err B")), AfterCheck::Fix(10));
-        assert_eq!(after_check(Some(1), "err C", 10, Some("err C")), AfterCheck::Stalled);
+    fn a_failed_check_is_fixed_until_it_passes_repeats_itself_or_runs_out_of_rounds() {
+        let seen = |errors: &[&str]| errors.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        assert_eq!(after_check(Some(0), "", 0, &[]), AfterCheck::Passed);
+        assert_eq!(after_check(Some(0), "", 3, &seen(&["err"])), AfterCheck::Passed);
+        assert_eq!(after_check(Some(1), "err A", 0, &[]), AfterCheck::Fix(1));
+        assert_eq!(after_check(None, "err B", 1, &seen(&["err A"])), AfterCheck::Fix(2));
+        assert_eq!(after_check(Some(101), "err C", 2, &seen(&["err A", "err B"])), AfterCheck::Fix(3));
+        assert_eq!(after_check(Some(1), "err C", 3, &seen(&["err C"])), AfterCheck::Stalled);
+        // A fix that undoes the last one goes round in circles.
+        assert_eq!(after_check(Some(1), "err A", 2, &seen(&["err A", "err B"])), AfterCheck::Stalled);
+        assert_eq!(after_check(Some(1), "err F", FIX_ROUNDS, &seen(&["err E"])), AfterCheck::OutOfRounds);
         assert_eq!(head("abc", 5), "abc");
         assert_eq!(head("abcdef", 3), "abc\n(more output cut)");
     }
@@ -7566,8 +7583,8 @@ mod tests {
         // A check that fails for good drops them, and says so.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() { 1 }\n```\n\n```sh\ngit push\n```\n");
         let id = app.check.as_ref().unwrap().id;
-        app.fix_round = 10;
-        app.last_failure = Some("err".into());
+        app.fix_round = 3;
+        app.failures = vec!["err".into()];
         app.apply(AppEvent::Check(id, "err".into(), Ended::Exited(1)));
         assert!(app.commands.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w == "Not run, as the check failed: git push"), "{:?}", app.entries.len());
@@ -7996,6 +8013,23 @@ mod tests {
         app.phase = Phase::Ready;
         app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
         assert!(!app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("No files came"))));
+    }
+
+    #[test]
+    fn a_fix_that_changes_no_file_is_said_so_unless_it_runs_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.fix_round = 1;
+        let said = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Warning(w) if w.starts_with("The fix changed no file"))).count();
+        // Its command, `git checkout` say, may yet change them.
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["git checkout -- notes.md".into()]);
+        assert_eq!(said(&app), 0);
+        assert!(app.ask.is_some());
+        app.ask = None;
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
+        assert_eq!(said(&app), 1);
     }
 
     #[test]
