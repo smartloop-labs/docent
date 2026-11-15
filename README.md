@@ -386,6 +386,7 @@ an agent for that URL.
 | --- | --- | --- |
 | `SLP_HOME` | `~/.smartloop` | Where the workspace, models and logs live |
 | `SLP_PORT` | a free port | Pin the managed local agent to this port |
+| `DOCENT_TRACE` | off | `1` logs where each turn's time goes, as JSON lines, to `~/.smartloop/logs/docent-trace.jsonl` (or give a file path); `scripts/trace-summary.sh` sums it up |
 
 ## License
 

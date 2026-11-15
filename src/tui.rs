@@ -49,9 +49,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, lsp, mcp};
+use crate::{ModelRow, docent, files, framework, lsp, mcp, trace};
 
 const TICK: Duration = Duration::from_millis(100);
+/// A reply's layout taking this long is traced, with `DOCENT_TRACE`.
+const SLOW_LAYOUT: Duration = Duration::from_millis(20);
 /// How often the welcome card's agent state is re-read.
 const AGENT_EVERY: Duration = Duration::from_secs(3);
 /// The most lines the prompt grows to before it scrolls.
@@ -632,7 +634,8 @@ impl Reply {
             // the next tick.
             Some((_, at, true, _)) if streaming && fresh && *at == width => {}
             _ => {
-                self.rendered_at.set(Some(Instant::now()));
+                let laying = Instant::now();
+                self.rendered_at.set(Some(laying));
                 // While the reply comes in, a file still being given is only
                 // named: its change shows once its block is done, as a
                 // coding harness shows an edit once it's made.
@@ -699,6 +702,19 @@ impl Reply {
                         lines.push(Line::default());
                     }
                     lines.extend(part);
+                }
+                if laying.elapsed() >= SLOW_LAYOUT {
+                    let again = laid.iter().filter(|p| !pieces.iter().any(|q| q.start == p.start && q.key == p.key)).count();
+                    trace::event(
+                        "ui.slow_layout",
+                        serde_json::json!({
+                            "ms": trace::ms(laying.elapsed()),
+                            "bytes": text.len(),
+                            "pieces": laid.len(),
+                            "laid_again": again,
+                            "streaming": streaming,
+                        }),
+                    );
                 }
                 *pieces = laid;
                 *rendered = Some((self.text.len(), width, streaming, lines));
@@ -1608,27 +1624,46 @@ impl App {
     /// print once the terminal is restored.
     async fn run(mut self, terminal: &mut DefaultTerminal) -> Result<String, String> {
         self.start_setup();
+        let cwd = std::env::current_dir().ok().map(|d| d.display().to_string());
+        trace::start(&self.session, serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "cwd": cwd}));
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(TICK);
         while !self.quit {
             self.send_queued();
+            // A prompt and its rounds done, what they took.
+            if trace::chained()
+                && self.idle()
+                && let Some(summary) = trace::settled()
+            {
+                self.entries.push(Entry::Notice(summary));
+            }
+            let drawing = Instant::now();
             terminal
                 .draw(|frame| self.draw(frame))
                 .map_err(|e| format!("Failed to draw: {}", e))?;
+            trace::frame(drawing.elapsed(), self.entries.len());
             tokio::select! {
-                event = keys.next() => match event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => self.key(key),
-                    Some(Ok(Event::Mouse(mouse))) if matches!(self.overlay, Overlay::None) => self.mouse(mouse),
-                    // Pasting is typing too: it closes an open panel.
-                    Some(Ok(Event::Paste(text))) => {
-                        self.overlay = Overlay::None;
-                        self.paste(&text)
+                event = keys.next() => {
+                    trace::wake(match &event {
+                        Some(Ok(Event::Mouse(m))) if m.kind == MouseEventKind::Moved => trace::Wake::MouseMoved,
+                        Some(Ok(Event::Mouse(_))) => trace::Wake::Mouse,
+                        _ => trace::Wake::Key,
+                    });
+                    match event {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => self.key(key),
+                        Some(Ok(Event::Mouse(mouse))) if matches!(self.overlay, Overlay::None) => self.mouse(mouse),
+                        // Pasting is typing too: it closes an open panel.
+                        Some(Ok(Event::Paste(text))) => {
+                            self.overlay = Overlay::None;
+                            self.paste(&text)
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(format!("Failed to read input: {}", e)),
+                        None => break,
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(format!("Failed to read input: {}", e)),
-                    None => break,
-                },
+                }
                 Some(event) = self.rx.recv() => {
+                    trace::wake(trace::Wake::Channel);
                     self.apply(event);
                     // Take everything queued before drawing again, so a fast
                     // download doesn't redraw once per chunk.
@@ -1637,6 +1672,7 @@ impl App {
                     }
                 }
                 _ = tick.tick() => {
+                    trace::wake(trace::Wake::Tick);
                     self.ticks += 1;
                     self.poll_agent();
                 }
@@ -1924,8 +1960,12 @@ impl App {
     /// what the agent gets. Attached files are uploaded first. A turn that's
     /// `making` files works in the folder the chat was opened in, and the
     /// files its reply gives are written there.
-    fn send_turn(&mut self, shown: String, message: String, files: Vec<Attachment>, making: bool) {
+    /// `kind` names the request for `DOCENT_TRACE`: the user's prompt, or
+    /// the round after it that asks for it.
+    fn send_turn(&mut self, kind: &str, shown: String, message: String, files: Vec<Attachment>, making: bool) {
         let Some((project, _)) = self.project.clone() else { return };
+        let began = Instant::now();
+        trace::turn_begin(&self.session, kind, making, message.len());
         let files_dir = if making { chat::making_dir(&project) } else { None };
         // Asked to make something, the reply comes as files to write; in a
         // code project, as code that fits the files already there.
@@ -1953,6 +1993,9 @@ impl App {
                 files::HINT,
                 files::EDIT_EXAMPLE
             ));
+            if let Some(system) = &system {
+                trace::system_prompt(system);
+            }
             // Its language server starts now, indexing while the reply comes,
             // to be ready for the files it gives.
             if !cfg!(test)
@@ -1981,6 +2024,8 @@ impl App {
         // A turn with a working directory offers the `bash` tool, run there,
         // and its tool rounds start over: it's a new request, not one going on.
         self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
+        // How long the UI waited on the request being made.
+        trace::event("turn.dispatch", serde_json::json!({"ui_ms": trace::ms(began.elapsed())}));
         self.start_turn(project, sent, files, Vec::new());
     }
 
@@ -2004,7 +2049,9 @@ impl App {
             for file in files {
                 on(ChatEvent::Status { step: "upload".to_string(), message: format!("Uploading {}", file.name()) });
                 let client = client.clone();
+                let (uploading, bytes) = (Instant::now(), std::fs::metadata(&file.path).map_or(0, |m| m.len()));
                 let uploaded = tokio::task::spawn_blocking(move || crate::upload_asset(&client, &file.path)).await;
+                trace::event("upload", serde_json::json!({"bytes": bytes, "ms": trace::ms(uploading.elapsed())}));
                 match uploaded {
                     Ok(Ok(id)) => ids.push(id),
                     Ok(Err(e)) => return drop(tx.send(AppEvent::TurnDone(Err(e)))),
@@ -2076,14 +2123,15 @@ impl App {
                 paths.join(", ")
             )));
         }
-        // Each file's lines added and removed, against what's there now.
-        let changes: Vec<(&files::File, bool, (usize, usize))> = plan
+        // Each file's lines added and removed, against what's there now,
+        // and its size before.
+        let changes: Vec<(&files::File, bool, (usize, usize), usize)> = plan
             .new
             .iter()
-            .map(|f| (f, true, files::line_changes("", &f.content)))
+            .map(|f| (f, true, files::line_changes("", &f.content), 0))
             .chain(plan.changed.iter().map(|f| {
                 let old = std::fs::read_to_string(root.join(&f.path)).unwrap_or_default();
-                (f, false, files::line_changes(&old, &f.content))
+                (f, false, files::line_changes(&old, &f.content), old.len())
             }))
             .collect();
         let (mut written, failed) = files::write(root, &[plan.new.as_slice(), plan.changed.as_slice()].concat());
@@ -2101,11 +2149,27 @@ impl App {
                 changes
                     .iter()
                     .filter(|(f, ..)| written.contains(&f.path) && !mine(&f.path))
-                    .map(|(f, created, (added, removed))| (f.path.as_str(), *created, *added, *removed)),
+                    .map(|(f, created, (added, removed), _)| (f.path.as_str(), *created, *added, *removed)),
             );
+        let mut traced = Vec::new();
         for (path, created, added, removed) in reported {
             let what = if created { "created" } else { "updated" };
             self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, path, added, removed)));
+            traced.push((path.to_string(), added + removed));
+        }
+        // What the reply gave for each file, against what it changed.
+        if trace::on() {
+            let given = |path: &str| {
+                let early = early.iter().find(|e| e.path == path).map(|e| (e.new.len(), e.old.as_ref().map_or(0, String::len)));
+                early.or_else(|| changes.iter().find(|(f, ..)| f.path == path).map(|(f, _, _, old)| (f.content.len(), *old)))
+            };
+            let (mut bytes, mut lines, mut list) = (0, 0, Vec::new());
+            for (path, changed) in &traced {
+                let (given, old) = given(path).unwrap_or_default();
+                (bytes, lines) = (bytes + given, lines + changed);
+                list.push(serde_json::json!({"path": path, "bytes": given, "old_bytes": old, "lines_changed": changed}));
+            }
+            trace::reply_files(bytes, lines, list);
         }
         for e in &early {
             if !written.contains(&e.path) {
@@ -2253,7 +2317,10 @@ impl App {
             self.check = Some(Check { id, project, command: "the language server".to_string(), servers });
             let (lsp, dir, written) = (self.lsp.clone(), root.to_path_buf(), written.to_vec());
             self.spawn(move |_, tx| {
+                let checking = Instant::now();
                 let (asked, problems) = lsp.errors(&dir, &written);
+                let fields = serde_json::json!({"servers": asked, "files": written.len(), "errors": problems.len()});
+                trace::spent(trace::Part::Check, checking.elapsed(), "check.lsp", fields);
                 let _ = tx.send(AppEvent::Diagnostics(id, asked, problems));
             });
             return;
@@ -2273,7 +2340,10 @@ impl App {
         }
         let dir = root.to_path_buf();
         self.spawn(move |_, tx| {
+            let checking = Instant::now();
             let (output, ended) = run_command(&command, Some(&dir), false, report);
+            let fields = serde_json::json!({"command": command, "code": ended.and_then(|e| e.code())});
+            trace::spent(trace::Part::Check, checking.elapsed(), "check.build", fields);
             let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
         });
     }
@@ -2351,7 +2421,7 @@ impl App {
                      change given again whole, every line of it, as a heredoc.",
                     head(&output, SHELL_KEPT)
                 );
-                self.send_turn(shown, message, Vec::new(), true);
+                self.send_turn("fix", shown, message, Vec::new(), true);
             }
             AfterCheck::Stalled => {
                 self.last_failure = None;
@@ -2459,7 +2529,7 @@ impl App {
              every dependency the code uses, then `EOF` alone on its line.{layout}",
             wrote.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ")
         );
-        self.send_turn(format!("Add {manifest}"), message, Vec::new(), true);
+        self.send_turn("manifest", format!("Add {manifest}"), message, Vec::new(), true);
     }
 
     /// Ask the agent for the files its last reply described but didn't give;
@@ -2472,7 +2542,7 @@ impl App {
              the file's complete contents, then `EOF` alone on its line.\n\n{}",
             files::EMPTY_FOLDER
         );
-        self.send_turn("Write the files".to_string(), message, Vec::new(), true);
+        self.send_turn("write_files", "Write the files".to_string(), message, Vec::new(), true);
     }
 
     /// Ask the agent again for the edits that `failed` in `root`, with
@@ -2497,7 +2567,7 @@ impl App {
             files.join("\n\n"),
             files::EDIT_EXAMPLE
         );
-        self.send_turn(format!("Redo the edits to {}", paths.join(", ")), message, Vec::new(), true);
+        self.send_turn("edit_retry", format!("Redo the edits to {}", paths.join(", ")), message, Vec::new(), true);
     }
 
     /// The last reply's shell commands, checked, are shown and asked
@@ -2591,7 +2661,10 @@ impl App {
         self.spawn(move |_, tx| {
             let mut runs = runs.into_iter();
             while let Some((id, command, background, report)) = runs.next() {
+                let running = Instant::now();
                 let (output, ended) = run_command(&command, Some(&root), background, report);
+                let fields = serde_json::json!({"command": command, "background": background, "code": ended.and_then(|e| e.code())});
+                trace::spent(trace::Part::Commands, running.elapsed(), "command", fields);
                 let _ = tx.send(AppEvent::Ran(id, project.clone(), output, ended));
                 // The rest would build on what this one didn't do, or on
                 // what the user cut short; they're listed as running from
@@ -2669,7 +2742,7 @@ impl App {
              Don't repeat a command that already did its part.",
             ran
         );
-        self.send_turn(shown, message, Vec::new(), true);
+        self.send_turn("command_fix", shown, message, Vec::new(), true);
     }
 
     /// Tool call run `id` ended: its result is kept for the agent, and once
@@ -2740,6 +2813,9 @@ impl App {
         }
         tooling.round += 1;
         let (sent, rounds) = (tooling.sent.clone(), tooling.rounds.clone());
+        if trace::on() {
+            trace::turn_begin(&self.session, "tool_round", true, rounds.iter().map(|r| r.to_string().len()).sum());
+        }
         self.tooling = Some(tooling);
         self.start_turn(project, sent, Vec::new(), rounds);
     }
@@ -2811,6 +2887,7 @@ impl App {
             AppEvent::Chat(event) => self.chat_event(event),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
+                trace::turn_done();
                 self.busy.store(false, Ordering::Relaxed);
                 // A turn can add a skill ("save this as a skill"); read the
                 // list again so `/` hints it without reopening the project.
@@ -3052,7 +3129,7 @@ impl App {
                 self.load_account();
                 if let Some(prompt) = self.pending_prompt.take() {
                     let making = self.making(&prompt);
-                    self.send_turn(prompt.clone(), prompt, Vec::new(), making);
+                    self.send_turn("user", prompt.clone(), prompt, Vec::new(), making);
                 }
             }
             None => self.entries.push(Entry::Error("No projects found; create one with /project new <name>".to_string())),
@@ -3172,7 +3249,7 @@ impl App {
         // for the folder.
         if let Some(prompt) = self.pending_prompt.take() {
             let making = self.making(&prompt);
-            self.send_turn(prompt.clone(), prompt, Vec::new(), making);
+            self.send_turn("user", prompt.clone(), prompt, Vec::new(), making);
         }
         if cfg!(test) {
             return;
@@ -3189,6 +3266,8 @@ impl App {
         let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) else { return };
         match event {
             ChatEvent::Content(content) => {
+                let taking = Instant::now();
+                let mut writing = Duration::ZERO;
                 turn.tokens += 1;
                 reply.text.push_str(&content);
                 // A tool call the model wrote as text runs as a shell
@@ -3201,8 +3280,11 @@ impl App {
                 if content.contains('\n')
                     && let Some(root) = &turn.files_dir
                 {
+                    let started = Instant::now();
                     reply.write_done(root);
+                    writing = started.elapsed();
                 }
+                trace::chunk(taking.elapsed(), writing);
             }
             ChatEvent::Citations(list) => {
                 reply.citations = chat::references(&list, self.project.as_ref().map(|(id, _)| id.as_str()));
@@ -4182,7 +4264,7 @@ impl App {
         self.manifest_asked = false;
         self.command_round = 0;
         self.last_failure = None;
-        self.send_turn(input, message, files, making);
+        self.send_turn("user", input, message, files, making);
     }
 
     /// A reply's commands are asked about, and the prompt answers: no
@@ -7479,7 +7561,7 @@ mod tests {
 
         // A reply with no tool calls is as before: its fenced commands run.
         app.shell_context.clear();
-        app.send_turn("go".into(), "go".into(), Vec::new(), false);
+        app.send_turn("user", "go".into(), "go".into(), Vec::new(), false);
         let entry = app.entries.len() - 1;
         let turn = app.turn.as_mut().unwrap();
         (turn.files_dir, turn.entry) = (Some(dir.path().to_path_buf()), entry);

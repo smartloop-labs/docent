@@ -304,6 +304,7 @@ pub async fn stream_turn(
     match stream_turn_once(client, request, on).await {
         Ok(stats) => Ok(stats),
         Err((e, 0)) => {
+            crate::trace::event("stream.retry", serde_json::json!({"error": e}));
             on(ChatEvent::Retrying(e));
             stream_turn_once(client, request, on).await.map_err(|(e, _)| e)
         }
@@ -329,6 +330,9 @@ async fn stream_turn_once(
     // though they count in the turn's size.
     let (mut tokens, mut shown): (u64, u64) = (0, 0);
     let mut calls = ToolCalls::default();
+    // For `DOCENT_TRACE`: when content began, how much came, and why it
+    // stopped.
+    let (mut first, mut bytes, mut finish) = (None, 0, None);
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| (format!("Failed to read stream: {}", e), shown))?;
 
@@ -336,6 +340,11 @@ async fn stream_turn_once(
             Some("chat.completion.chunk") => {
                 let delta = &event["choices"][0]["delta"];
                 if let Some(content) = delta["content"].as_str() {
+                    if first.is_none() {
+                        first = Some(started.elapsed());
+                        crate::trace::first_token(started.elapsed());
+                    }
+                    bytes += content.len();
                     tokens += 1;
                     shown += 1;
                     on(ChatEvent::Content(content.to_string()));
@@ -344,7 +353,8 @@ async fn stream_turn_once(
                     tokens += 1;
                     calls.push(&delta["tool_calls"]);
                 }
-                if event["choices"][0]["finish_reason"].is_string() {
+                if let Some(reason) = event["choices"][0]["finish_reason"].as_str() {
+                    finish = Some(reason.to_string());
                     break;
                 }
             }
@@ -354,13 +364,25 @@ async fn stream_turn_once(
                     on(ChatEvent::Citations(citations));
                 }
             }
-            Some("chat.status") => match event["message"].as_str() {
-                Some(message) if !message.trim().is_empty() => on(ChatEvent::Status {
-                    step: event["step"].as_str().unwrap_or_default().to_string(),
-                    message: message.trim().to_string(),
-                }),
-                _ => {}
-            },
+            Some("chat.status") => {
+                // Traced whether it's shown or not: the agent's own steps,
+                // such as indexing, ahead of the first token.
+                if crate::trace::on() {
+                    let fields = serde_json::json!({
+                        "step": event["step"],
+                        "message": event["message"],
+                        "ms": crate::trace::ms(started.elapsed()),
+                    });
+                    crate::trace::event("server.status", fields);
+                }
+                match event["message"].as_str() {
+                    Some(message) if !message.trim().is_empty() => on(ChatEvent::Status {
+                        step: event["step"].as_str().unwrap_or_default().to_string(),
+                        message: message.trim().to_string(),
+                    }),
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -369,6 +391,7 @@ async fn stream_turn_once(
     if !calls.is_empty() {
         on(ChatEvent::ToolCalls(calls.finish()));
     }
+    crate::trace::stream_end(started.elapsed(), first, tokens, bytes, finish.as_deref());
 
     Ok(TurnStats { tokens, elapsed: started.elapsed() })
 }

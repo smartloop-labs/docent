@@ -147,6 +147,7 @@ pub struct Context {
 /// after, and the request with `HINT` closes the message.
 pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> Context {
     let shown_each = budget / 2;
+    let began = std::time::Instant::now();
     let mut paths: Vec<String> = ignore::WalkBuilder::new(root)
         .require_git(false)
         .filter_entry(|e| e.depth() == 0 || !SKIPPED.contains(&e.file_name().to_string_lossy().as_ref()))
@@ -155,6 +156,7 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .filter_map(|e| e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
         .collect();
+    let walked = began.elapsed();
     let is_manifest = |p: &str| MARKERS.iter().any(|(m, _)| *m == p);
     // The manifests first, then by path.
     paths.sort_by_key(|p| (!is_manifest(p), p.clone()));
@@ -193,6 +195,7 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
     let mut room = budget;
     let mut shown = String::new();
     let mut whole = Vec::new();
+    let (reading, mut inlined) = (std::time::Instant::now(), 0);
     for path in order {
         if room < EXCERPT_MIN {
             break;
@@ -214,7 +217,9 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
         let fence = if body.contains("```") { "````" } else { "```" };
         let lang = path.rsplit_once('.').map_or("", |(_, ext)| ext);
         shown.push_str(&format!("\n`{}`{}\n{}{}\n{}\n{}\n", path, note, fence, lang, body, fence));
+        inlined += 1;
     }
+    let (read, gitting) = (reading.elapsed(), std::time::Instant::now());
     // Ahead of the contents: a model whose window the prompt outruns gets
     // its head and tail, and loses the middle.
     if let Some(git) = git_state(root) {
@@ -226,6 +231,18 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
         text.push_str("\nTheir contents now:\n");
         text.push_str(&shown);
     }
+    let fields = serde_json::json!({
+        "ms": crate::trace::ms(began.elapsed()),
+        "walk_ms": crate::trace::ms(walked),
+        "paths": paths.len(),
+        "read_ms": crate::trace::ms(read),
+        "files_inlined": inlined,
+        "files_whole": whole.len(),
+        "git_ms": crate::trace::ms(gitting.elapsed()),
+        "chars": text.len(),
+        "budget": budget,
+    });
+    crate::trace::context_built(began.elapsed(), text.len(), fields);
     Context { text, whole }
 }
 
