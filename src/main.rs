@@ -16,6 +16,7 @@ mod framework;
 mod links;
 mod lsp;
 mod mcp;
+mod prerun;
 mod progress;
 mod skills;
 mod tui;
