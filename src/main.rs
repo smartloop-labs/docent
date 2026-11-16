@@ -431,9 +431,15 @@ pub struct ModelRow {
     /// Served both ways and the plan (pro) covers the cloud copy: it can
     /// run in the cloud instead of being downloaded (the catalog's `cloud`).
     pub cloud_ready: bool,
+    /// The catalog also lists it to run in the cloud, whether or not the
+    /// plan covers that (`cloud_ready`): its cloud copy shows, locked.
+    pub cloud_variant: bool,
     /// Its local copy fits this machine's memory, as far as its size is
     /// known; one of unknown size is taken to fit.
     pub fits: bool,
+    /// The models panel's Cloud entry of a model served both ways, which
+    /// also has a Local entry: Enter runs it in the cloud.
+    pub cloud_copy: bool,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -481,7 +487,9 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
         local,
         recommended: model["recommended"].as_bool().unwrap_or_default(),
         cloud_ready: local && model["cloud"].as_bool().unwrap_or_default(),
+        cloud_variant: local && model["cloud_variant"].as_bool().unwrap_or_default(),
         fits: fits(model["param_size_b"].as_f64(), total_gb),
+        cloud_copy: false,
         name,
     }
 }
