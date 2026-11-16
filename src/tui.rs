@@ -41,7 +41,7 @@ use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use reqwest::blocking::Client;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -2789,6 +2789,7 @@ impl App {
                     }
                 }
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
+                    let result = result.map(panel_models);
                     if let Ok(list) = &result {
                         *selected = (*selected).min(list.len().saturating_sub(1));
                     }
@@ -3239,6 +3240,13 @@ impl App {
     fn mouse(&mut self, mouse: MouseEvent) {
         let at = (mouse.column, mouse.row);
         match mouse.kind {
+            // Over the models panel, the wheel moves through the models.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if matches!(self.overlay, Overlay::Models { .. }) && self.shown.borrow().footer.contains(at.into()) =>
+            {
+                let code = if mouse.kind == MouseEventKind::ScrollUp { KeyCode::Up } else { KeyCode::Down };
+                self.key_models(KeyEvent::new(code, KeyModifiers::NONE));
+            }
             MouseEventKind::ScrollUp => self.scroll(WHEEL_LINES as i32),
             MouseEventKind::ScrollDown => self.scroll(-(WHEEL_LINES as i32)),
             MouseEventKind::Down(MouseButton::Left) => {
@@ -4228,6 +4236,10 @@ impl App {
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Down => *selected = (*selected + 1).min(count.saturating_sub(1)),
+            KeyCode::PageUp => *selected = selected.saturating_sub(MODELS_PAGE),
+            KeyCode::PageDown => *selected = (*selected + MODELS_PAGE).min(count.saturating_sub(1)),
+            KeyCode::Home => *selected = 0,
+            KeyCode::End => *selected = count.saturating_sub(1),
             KeyCode::Char('r') if ctrl => self.load_models(),
             KeyCode::Enter => {
                 let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)) else {
@@ -4244,8 +4256,8 @@ impl App {
                     } else {
                         format!("{} needs a sign-in; /login first", row.name)
                     }));
-                } else if cloud_instead(&row) {
-                    // Too big to run here: the cloud copy, not a download.
+                } else if row.cloud_copy || cloud_instead(&row) {
+                    // The cloud copy, not a download.
                     self.enable_model(row.name, true);
                 } else if needs_download(&row) {
                     // Enter never downloads: a model is fetched only when
@@ -5144,7 +5156,8 @@ impl App {
             Some(Ok(list)) => list.get(selected),
             _ => None,
         };
-        let downloading = chosen.is_some_and(|m| self.downloads.iter().any(|d| d.model == m.name && !d.finished));
+        let downloading =
+            chosen.is_some_and(|m| !m.cloud_copy && self.downloads.iter().any(|d| d.model == m.name && !d.finished));
         let signed_out = self.account == Some(None);
         let block = panel(&models_footer(chosen, downloading, signed_out));
         frame.render_widget(Clear, area);
@@ -5153,8 +5166,11 @@ impl App {
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        let label = |m: &ModelRow| if m.cloud || cloud_instead(m) { format!("{} ☁", m.name) } else { m.name.clone() };
+        // In columns: the name, its state, what it can do, then a note; the
+        // local models first, then those that run in the cloud, marked ☁.
+        let label = |m: &ModelRow| if in_cloud(m) { format!("{} ☁", m.name) } else { m.name.clone() };
         let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
+        let caps_width = list.iter().map(|m| m.capabilities.chars().count()).max().unwrap_or(0) + 2;
         let lines: Vec<Line> = list
             .iter()
             .enumerate()
@@ -5167,7 +5183,7 @@ impl App {
                         if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
                     ),
                 ];
-                let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
+                let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished && !m.cloud_copy);
                 let state = match downloading.and_then(|d| d.list.active()) {
                     Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => {
                         Span::styled(format!("downloading {}%", done * 100 / total), Style::new().fg(pink()))
@@ -5182,25 +5198,45 @@ impl App {
                 let state_width = state.width();
                 spans.push(state);
                 spans.push(Span::raw(" ".repeat(18usize.saturating_sub(state_width))));
-                spans.push(Span::styled(m.capabilities.clone(), dim()));
-                if m.overridden {
-                    spans.push(Span::styled(" · set here", dim()));
-                }
-                if m.recommended && !m.cloud {
-                    spans.push(Span::styled("  · recommended", Style::new().fg(Color::Green)));
-                }
-                if !m.fits && !m.cloud && !m.downloaded {
-                    spans.push(Span::styled("  · too big for this machine", Style::new().fg(Color::Yellow)));
-                }
-                if locked(m, signed_out) {
+                spans.push(Span::styled(format!("{:<w$}", m.capabilities, w = caps_width), dim()));
+                // One note at most, the one that matters most.
+                let note = if locked(m, signed_out) {
                     // Signed in but still locked: the plan, not the sign-in, is what's missing.
-                    let why = if self.search.is_some() { "  · pro plan" } else { "  · sign in to use" };
-                    spans.push(Span::styled(why, Style::new().fg(Color::Yellow)));
+                    Some((if self.search.is_some() { "(pro plan)" } else { "(sign in to use)" }, Style::new().fg(Color::Yellow)))
+                } else if !m.fits && !m.cloud && !m.downloaded {
+                    Some(("(too big)", Style::new().fg(Color::Yellow)))
+                } else if m.recommended && !m.cloud {
+                    Some(("(recommended)", Style::new().fg(Color::Green)))
+                } else if m.fits && !m.cloud {
+                    Some(("(fits)", dim()))
+                } else {
+                    None
+                };
+                if let Some((note, style)) = note {
+                    spans.push(Span::styled(note, style));
+                }
+                if m.overridden {
+                    spans.push(Span::styled(if note.is_some() { " (capabilities set here)" } else { "(capabilities set here)" }, dim()));
                 }
                 Line::from(spans)
             })
             .collect();
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        // More than fits the room under the prompt scrolls, keeping the
+        // selected model in view, with a scrollbar to say there's more.
+        let inner = block.inner(area);
+        let total = lines.len();
+        let skip = (selected + 1).saturating_sub(inner.height as usize);
+        frame.render_widget(Paragraph::new(lines).block(block).scroll((skip.min(u16::MAX as usize) as u16, 0)), area);
+        if total > inner.height as usize {
+            let mut state = ScrollbarState::new(total.saturating_sub(inner.height as usize)).position(skip);
+            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .style(dim());
+            frame.render_stateful_widget(bar, inner, &mut state);
+        }
     }
 
     fn draw_mcp(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<mcp::Server>, String>>, selected: usize) {
@@ -5626,6 +5662,9 @@ fn selected_model(message: &str) -> Option<String> {
 
 /// Lines of output a `!command` shows, from its end; the agent gets more.
 const SHELL_SHOWN: usize = 20;
+
+/// Models PageUp and PageDown move by in the models panel.
+const MODELS_PAGE: usize = 5;
 /// How many times a reply's failed command is sent back to be fixed.
 const COMMAND_ROUNDS: u32 = 3;
 /// How many times a reply's tool calls go back with their results, per
@@ -6575,6 +6614,47 @@ fn downloadable(m: &ModelRow) -> bool {
 /// needs a sign-in.  Shown disabled, and Enter asks for the sign-in.
 fn locked(m: &ModelRow, signed_out: bool) -> bool {
     !m.accessible || (signed_out && m.cloud)
+}
+
+/// Whether `m` shows with the cloud models, after the local ones, marked
+/// ☁: a cloud model, or one that would run there as it's too big for this
+/// machine.
+fn in_cloud(m: &ModelRow) -> bool {
+    m.cloud || cloud_instead(m)
+}
+
+/// The models panel's entries: a model served both ways once with the local
+/// models, to download and run here, and once with the cloud ones, to run
+/// there, each on only when it runs that way, the cloud one locked when the
+/// plan doesn't cover it; then
+/// grouped, local then cloud, each otherwise in the catalog's order. The
+/// selection indexes this list.
+fn panel_models(list: Vec<ModelRow>) -> Vec<ModelRow> {
+    let mut entries: Vec<ModelRow> = list
+        .into_iter()
+        .flat_map(|m| {
+            if !(m.local && (m.cloud_ready || m.cloud || m.cloud_variant)) {
+                return vec![m];
+            }
+            let covered = m.cloud_ready || m.cloud;
+            let local = ModelRow { enabled: m.enabled && !m.cloud, cloud: false, cloud_ready: false, ..m.clone() };
+            let cloud = ModelRow {
+                enabled: m.cloud,
+                cloud: true,
+                local: false,
+                downloaded: false,
+                recommended: false,
+                cloud_copy: true,
+                accessible: m.accessible && covered,
+                ..m
+            };
+            vec![local, cloud]
+        })
+        .collect();
+    // Local: the recommended first, then the rest, those too big for this
+    // machine to download last.
+    entries.sort_by_key(|m| (in_cloud(m), !in_cloud(m) && !m.recommended, !in_cloud(m) && !m.fits && !m.downloaded));
+    entries
 }
 
 /// Whether `m` is too big for this machine but the plan covers its cloud
@@ -7591,11 +7671,13 @@ mod tests {
             local: false,
             recommended: false,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: true,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
-        assert!(text.contains("general, coding · set here"), "{}", text);
+        assert!(text.contains("general, coding") && text.contains("(capabilities set here)"), "{}", text);
     }
 
     #[test]
@@ -8517,6 +8599,8 @@ mod tests {
             local: false,
             recommended,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: true,
         };
         let list = vec![
@@ -8550,6 +8634,8 @@ mod tests {
             local: false,
             recommended,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: true,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -8597,6 +8683,94 @@ mod tests {
     }
 
     #[test]
+    fn the_models_panel_lists_local_models_then_cloud_ones_marked() {
+        let row = |name: &str, cloud: bool| ModelRow {
+            name: name.into(),
+            capabilities: "general".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: !cloud,
+            enabled: false,
+            cloud,
+            local: !cloud,
+            recommended: false,
+            cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
+            fits: true,
+        };
+        // Served both ways, too big here, the plan covering its cloud copy.
+        let both = ModelRow { cloud_ready: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.overlay = Overlay::Models { rows: None, selected: 0 };
+        app.apply(AppEvent::Models(Ok(vec![row("big", true), row("small", false), both, row("huge", true)])));
+        let Overlay::Models { rows: Some(Ok(list)), .. } = &app.overlay else { panic!("no models") };
+        let names: Vec<&str> = list.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["small", "qwen-27b", "big", "qwen-27b", "huge"]);
+        // Its Local entry is a download, marked too big; its Cloud one runs there.
+        let (local, cloud) = (&list[1], &list[3]);
+        assert!(!local.cloud && !local.cloud_copy && downloadable(local) && !cloud_instead(local));
+        assert!(cloud.cloud && cloud.cloud_copy && !downloadable(cloud) && !cloud.enabled);
+        let text = screen(&app, 120, 24);
+        assert!(!text.contains(" Local\n") && !text.contains(" Cloud\n"), "no headings: {}", text);
+        assert!(text.contains("qwen-27b    ↓ not downloaded"), "{}", text);
+        assert!(text.contains("(too big)"), "{}", text);
+        assert!(text.contains("qwen-27b ☁  disabled"), "{}", text);
+        assert!(text.contains("big ☁       disabled"), "{}", text);
+
+        // In a short pane the list scrolls to keep the selected model in view.
+        if let Overlay::Models { selected, .. } = &mut app.overlay {
+            *selected = 4;
+        }
+        let text = screen(&app, 120, 16);
+        assert!(text.contains("› huge ☁"), "{}", text);
+        assert!(text.contains('↑') && text.contains('┃'), "a scrollbar says there's more: {}", text);
+        let at = |app: &App| match &app.overlay {
+            Overlay::Models { selected, .. } => *selected,
+            _ => usize::MAX,
+        };
+        app.key_models(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(at(&app), 0);
+        app.key_models(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(at(&app), 4, "a page down stops at the last");
+        app.key_models(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(at(&app), 0);
+        app.key_models(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(at(&app), 4);
+        // With room for all of them, no scrollbar.
+        let text = screen(&app, 120, 30);
+        assert!(!text.contains('┃'), "{}", text);
+
+        // On in the cloud, only its Cloud entry reads enabled.
+        let on = ModelRow { cloud: true, enabled: true, cloud_ready: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
+        let split = panel_models(vec![on]);
+        assert_eq!((split[0].enabled, split[1].enabled), (false, true));
+
+        // Signed out, or off the plan: the catalog still says there's a cloud
+        // copy, which shows locked, asking for a sign-in.
+        let locked_copy = ModelRow { cloud_variant: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
+        let mut out = super::tests::app();
+        out.phase = Phase::Ready;
+        out.account = Some(None);
+        out.project = Some(("p1".into(), "Default".into()));
+        out.overlay = Overlay::Models { rows: None, selected: 0 };
+        out.apply(AppEvent::Models(Ok(vec![locked_copy])));
+        let text = screen(&out, 120, 24);
+        assert!(text.contains("qwen-27b    ↓ not downloaded"), "{}", text);
+        assert!(text.contains("qwen-27b ☁  disabled"), "{}", text);
+        assert!(text.contains("(sign in to use)"), "{}", text);
+        if let Overlay::Models { selected, .. } = &mut out.overlay {
+            *selected = 1;
+        }
+        out.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(out.entries.last(), Some(Entry::Error(e)) if e.contains("/login")), "Enter asks for a sign-in");
+    }
+
+    #[test]
     fn a_model_too_big_for_the_machine_is_offered_in_the_cloud_not_as_a_download() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8614,6 +8788,8 @@ mod tests {
             local: true,
             recommended: false,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: false,
         };
         let ready = ModelRow { cloud_ready: true, ..big("qwen-ready") };
@@ -8635,7 +8811,7 @@ mod tests {
         select(&mut app, 1);
         let text = screen(&app, 120, 24);
         assert!(text.contains("llama-big     ↓ not downloaded"), "{}", text);
-        assert!(text.contains("· too big for this machine"), "{}", text);
+        assert!(text.contains("(too big)"), "{}", text);
         assert!(text.contains("[ctrl+d] download & enable"), "{}", text);
     }
 
@@ -8658,12 +8834,14 @@ mod tests {
             local: true,
             recommended: false,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: true,
         };
         app.overlay = Overlay::Models { rows: Some(Ok(vec![row])), selected: 0 };
         let text = screen(&app, 120, 24);
         assert!(text.contains("qwen3.8-27b ☁  disabled"), "{}", text);
-        assert!(text.contains("· sign in to use"), "{}", text);
+        assert!(text.contains("(sign in to use)"), "{}", text);
         assert!(!text.contains("[enter]"), "{}", text);
         assert!(text.contains("[ctrl+d] download & enable"), "its local copy can still come: {}", text);
         app.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -8693,6 +8871,8 @@ mod tests {
             local: false,
             recommended: false,
             cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
             fits: true,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
@@ -9505,3 +9685,4 @@ mod tests {
     }
 
 }
+
