@@ -7129,8 +7129,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_command_has_no_terminal_to_hang_on() {
-        // The shell leads a session of its own, which has no terminal.
-        let (output, ended) = run_command("[ \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo own session", None, false, report());
+        // The shell leads a session of its own, which has no terminal. A
+        // session's leader leads its process group too, which `ps` tells on
+        // Linux and macOS alike; macOS's has no `sid`.
+        let (output, ended) = run_command("[ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo own session", None, false, report());
         assert!(output.ends_with("own session"), "{}", output);
         assert_eq!(ended, Some(Ended::Exited(0)));
         let (output, _) = run_command("exec 3</dev/tty || echo no terminal", None, false, report());
