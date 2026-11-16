@@ -17,6 +17,7 @@ mod links;
 mod lsp;
 mod mcp;
 mod progress;
+mod skills;
 mod tui;
 mod update;
 mod usage;
