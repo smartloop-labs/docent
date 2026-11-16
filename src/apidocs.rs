@@ -33,6 +33,7 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
         }
         "JavaScript/TypeScript" => npm(&root.join("node_modules"), &dep.name),
         "Python" => python(&site_packages(root)?, &dep.name),
+        "Go" => go(&go_modules()?, &dep.name, dep.version.as_deref()?),
         _ => None,
     }
 }
@@ -615,6 +616,128 @@ fn docstring(lines: &[&str]) -> Option<String> {
     clean(&doc)
 }
 
+/// Where Go keeps the modules it downloads.
+fn go_modules() -> Option<PathBuf> {
+    if let Some(cache) = std::env::var_os("GOMODCACHE").filter(|c| !c.is_empty()) {
+        return Some(PathBuf::from(cache));
+    }
+    let gopath = match std::env::var_os("GOPATH").filter(|p| !p.is_empty()) {
+        Some(paths) => std::env::split_paths(&paths).next()?,
+        None => home()?.join("go"),
+    };
+    Some(gopath.join("pkg").join("mod"))
+}
+
+/// A Go module's API from its source in the module cache `modules`: each
+/// package's doc comment, and its exported declarations with theirs.
+fn go(modules: &Path, module: &str, version: &str) -> Option<Vec<Section>> {
+    // The cache spells a capital as `!` and the letter in lower case.
+    let escaped: String = module.chars().flat_map(|c| if c.is_uppercase() { vec!['!', c.to_ascii_lowercase()] } else { vec![c] }).collect();
+    let dir = modules.join(format!("{escaped}@{version}"));
+    let mut files = Vec::new();
+    go_files(&dir, &mut files);
+    // The module's root package first: its docs say what it is.
+    files.sort_by_key(|f| (f.parent() != Some(dir.as_path()), f.clone()));
+    let mut sections = Vec::new();
+    for file in files.into_iter().take(FILES) {
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let rel = file.parent().and_then(|p| p.strip_prefix(&dir).ok()).map(|p| p.to_string_lossy().replace('\\', "/"));
+        let package = match rel.as_deref() {
+            Some("") | None => module.to_string(),
+            Some(rel) => format!("{module}/{rel}"),
+        };
+        sections.extend(go_sections(&text, &package));
+    }
+    // Its doc comment first, in whichever file it is.
+    if let Some(at) = sections.iter().position(|s| s.title == module) {
+        let doc = sections.remove(at);
+        sections.insert(0, doc);
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The `.go` files of the packages under `dir` others can import: no
+/// tests, nor `internal`, `testdata` or `vendor` ones.
+fn go_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for path in entries.flatten().map(|e| e.path()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.starts_with(['.', '_']) || ["internal", "testdata", "vendor"].contains(&name.as_str()) {
+            continue;
+        }
+        if path.is_dir() {
+            go_files(&path, files);
+        } else if name.ends_with(".go") && !name.ends_with("_test.go") {
+            files.push(path);
+        }
+    }
+}
+
+/// What a Go file of `package` declares: the package's doc comment, and
+/// each exported declaration with its own, a method named after its type.
+fn go_sections(text: &str, package: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let mut doc: Vec<String> = Vec::new();
+    // In a `const (`, `var (` or `type (` group.
+    let mut group = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if let Some(text) = item.strip_prefix("//") {
+            doc.push(text.strip_prefix(' ').unwrap_or(text).to_string());
+            continue;
+        }
+        let docs = clean(&doc);
+        doc.clear();
+        if group {
+            group = item != ")";
+            if let (Some(name), Some(docs)) = (go_exported(item), docs) {
+                sections.push(Section { title: name, text: format!("`{item}`\n\n{docs}") });
+            }
+            continue;
+        }
+        if item.starts_with("package ") {
+            if let Some(docs) = docs.filter(|d| d.starts_with("Package ")) {
+                sections.push(Section { title: package.to_string(), text: docs });
+            }
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if ["const (", "var (", "type ("].contains(&item) {
+            group = true;
+            continue;
+        }
+        let Some(title) = go_declared(item) else { continue };
+        let text = signature(&lines[i..]);
+        sections.push(Section { title, text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+    }
+    sections
+}
+
+/// The name an exported declaration line declares, as `Marshal` of `func
+/// Marshal(`, or `Decoder.Decode` of `func (d *Decoder) Decode(`.
+fn go_declared(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("func ") {
+        let Some(receiver) = rest.strip_prefix('(') else { return go_exported(rest) };
+        let (receiver, rest) = receiver.split_once(')')?;
+        let ty = receiver.split_whitespace().last()?.trim_start_matches('*');
+        let ty = ty.split('[').next().unwrap_or(ty);
+        return Some(format!("{ty}.{}", go_exported(rest.trim_start())?));
+    }
+    ["type ", "const ", "var "].iter().find_map(|k| line.strip_prefix(k)).and_then(go_exported)
+}
+
+/// The exported name `text` starts with: a capital's.
+fn go_exported(text: &str) -> Option<String> {
+    let name = ident(text);
+    name.starts_with(|c: char| c.is_uppercase()).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +897,50 @@ mod tests {
         assert_eq!(sections[3].text, "`async def fetch(url: str) -> str`");
         assert_eq!(sections[5].text, "`def text() -> str`\n\nThe text, typed.");
         assert_eq!(python(&site, "requests"), None);
+    }
+
+    #[test]
+    fn a_go_module_s_api_is_its_exported_declarations() {
+        let modules = tempfile::tempdir().unwrap();
+        let toml = modules.path().join("github.com/!burnt!sushi/toml@v1.3.2");
+        write(&toml.join("doc.go"), "// Package toml reads TOML.\n//\n// Decode it.\npackage toml\n");
+        let decode = [
+            "package toml",
+            "",
+            "// Decode reads data into v.",
+            "func Decode(data string, v any) (MetaData, error) {",
+            "\treturn MetaData{}, nil",
+            "}",
+            "",
+            "func decode() {}",
+            "",
+            "// A Decoder reads a stream.",
+            "type Decoder struct {",
+            "\tr io.Reader",
+            "}",
+            "",
+            "// Decode the stream.",
+            "func (dec *Decoder) Decode(v any) (MetaData, error) {",
+            "}",
+            "",
+            "const (",
+            "\t// Version of the spec.",
+            "\tVersion = \"1.0\"",
+            "\tundocumented = 1",
+            ")",
+        ];
+        write(&toml.join("decode.go"), &decode.join("\n"));
+        write(&toml.join("decode_test.go"), "// Test it.\nfunc TestDecode(t *testing.T) {}\n");
+        write(&toml.join("internal/tz.go"), "// Zone.\nfunc Zone() {}\n");
+        write(&toml.join("cmd/tomlv/main.go"), "// Package main checks TOML.\npackage main\n");
+        let sections = go(modules.path(), "github.com/BurntSushi/toml", "v1.3.2").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        // The package's doc comment first, wherever it is.
+        assert_eq!(titles, ["github.com/BurntSushi/toml", "Decode", "Decoder", "Decoder.Decode", "Version", "github.com/BurntSushi/toml/cmd/tomlv"]);
+        assert_eq!(sections[0].text, "Package toml reads TOML.\n\nDecode it.");
+        assert_eq!(sections[1].text, "`func Decode(data string, v any) (MetaData, error)`\n\nDecode reads data into v.");
+        assert_eq!(sections[4].text, "`Version = \"1.0\"`\n\nVersion of the spec.");
+        assert_eq!(go(modules.path(), "github.com/BurntSushi/toml", "v1.4.0"), None);
     }
 
     #[test]
