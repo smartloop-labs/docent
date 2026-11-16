@@ -3213,9 +3213,6 @@ impl App {
                 {
                     reply.model = Some(name);
                 }
-                // The agent's indexing for the turn isn't shown: the turn's
-                // line keeps what it was doing.
-                let indexing = step == "index";
                 if step == "streaming" {
                     // The agent's "Generating response" says nothing a
                     // reader needs; the model writing the answer does, or,
@@ -3224,8 +3221,11 @@ impl App {
                         Some(model) => format!("Generating with {}", model),
                         None => working_word(turn.started).to_string(),
                     });
-                } else if !indexing {
-                    turn.activity = Some(message.trim_end_matches(['.', '…']).to_string());
+                } else {
+                    // Indexing the folder shows too ("Checking documents in
+                    // ~/src", "Indexing README.md"): a turn waits on it before
+                    // it's answered, which in a large folder takes a while.
+                    turn.activity = Some(home_tilde(message.trim_end_matches(['.', '…'])));
                 }
             }
             ChatEvent::Retrying(e) => reply.warnings.push(format!("Connection dropped, retrying: {}", e)),
@@ -3419,6 +3419,28 @@ impl App {
                     AppEvent::Notice(format!("{} capabilities as the catalog has them: {}", name, now.join(", ")))
                 }
                 Ok(now) => AppEvent::Notice(format!("{} capabilities set here: {}", name, now.join(", "))),
+                Err(e) => AppEvent::Error(e),
+            });
+            if reload && let Some((id, _)) = project {
+                let _ = tx.send(AppEvent::Models(crate::model_rows(&client, &id)));
+            }
+        });
+    }
+
+    /// `/models <name> thinking on|off`, or ctrl+t in the models panel: turn
+    /// a model's reasoning on or off, for every project. Off, a reasoning
+    /// model answers without first thinking in a block the agent holds back,
+    /// which on a slow machine can be most of the wait.
+    fn set_thinking(&mut self, name: String, on: bool) {
+        if cfg!(test) {
+            return self.entries.push(Entry::Notice(format!("Turning {} reasoning {}", name, if on { "on" } else { "off" })));
+        }
+        let reload = matches!(self.overlay, Overlay::Models { .. });
+        let project = self.project.clone();
+        self.spawn(move |client, tx| {
+            let _ = tx.send(match crate::set_model_thinking(&client, &name, on) {
+                Ok(true) => AppEvent::Notice(format!("{} reasoning on: it thinks before it answers", name)),
+                Ok(false) => AppEvent::Notice(format!("{} reasoning off: it answers without thinking first, sooner", name)),
                 Err(e) => AppEvent::Error(e),
             });
             if reload && let Some((id, _)) = project {
@@ -4062,8 +4084,11 @@ impl App {
                     let rest: Vec<&str> = words.collect();
                     match rest.as_slice() {
                         ["caps" | "capabilities", list] => self.set_capabilities(name, list),
+                        ["thinking" | "reasoning", "on"] => self.set_thinking(name, true),
+                        ["thinking" | "reasoning", "off"] => self.set_thinking(name, false),
                         _ => self.entries.push(Entry::Error(
-                            "Try /models <name> caps <coding,dp,...> to set a model's capabilities here, or /models <name> caps auto"
+                            "Try /models <name> caps <coding,dp,...> to set a model's capabilities here, or /models <name> caps auto; \
+                             /models <name> thinking off to have it answer without reasoning first"
                                 .to_string(),
                         )),
                     }
@@ -4285,6 +4310,13 @@ impl App {
             KeyCode::Char('x') if ctrl => {
                 if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned() {
                     self.cancel_download(row.name);
+                }
+            }
+            KeyCode::Char('t') if ctrl => {
+                if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned()
+                    && let Some(on) = row.thinking
+                {
+                    self.set_thinking(row.name, !on);
                 }
             }
             _ => return false,
@@ -5215,8 +5247,16 @@ impl App {
                 if let Some((note, style)) = note {
                     spans.push(Span::styled(note, style));
                 }
+                let mut more = Vec::new();
+                if m.thinking == Some(false) {
+                    more.push("(reasoning off)");
+                }
                 if m.overridden {
-                    spans.push(Span::styled(if note.is_some() { " (capabilities set here)" } else { "(capabilities set here)" }, dim()));
+                    more.push("(capabilities set here)");
+                }
+                for (i, text) in more.into_iter().enumerate() {
+                    let gap = if note.is_some() || i > 0 { " " } else { "" };
+                    spans.push(Span::styled(format!("{}{}", gap, text), dim()));
                 }
                 Line::from(spans)
             })
@@ -6252,6 +6292,15 @@ fn cd_target(command: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// `text` with the home folder in it written `~`, as `shown_folder` writes
+/// a path: an agent status names a folder in full.
+fn home_tilde(text: &str) -> String {
+    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(home) if !home.is_empty() && home != "/" => text.replace(&home, "~"),
+        _ => text.to_string(),
+    }
+}
+
 fn shown_folder(path: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
     match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
@@ -6562,6 +6611,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/sync --move", "sync this folder instead of the project's other one"),
         ("/sync stop", "stop syncing the project's folder"),
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
+        ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
         ("/login", "sign in in the browser (--token to paste one)"),
         ("/logout", "log out"),
@@ -6697,6 +6747,9 @@ fn models_footer(selected: Option<&ModelRow>, downloading: bool, signed_out: boo
         }
         None => keys.extend([("↑↓", "select"), ("enter", "enable/disable")]),
     }
+    if let Some(on) = selected.and_then(|m| m.thinking) {
+        keys.push(("ctrl+t", if on { "reasoning off" } else { "reasoning on" }));
+    }
     keys.extend([("ctrl+r", "refresh"), ("esc", "close")]);
     bar_hints(&keys)
 }
@@ -6831,12 +6884,13 @@ mod tests {
         });
         app.chat_event(ChatEvent::Status { step: "index".into(), message: "Reading Testamento ejemplo.pdf".into() });
 
-        // The turn's row alone, with the agent indexing too: no file, no
-        // "Indexing".
+        // The turn waits on the folder's index, and says so.
         let shown = screen(&app, 80, 24);
-        assert!(shown.contains("Thinking…"), "{}", shown);
-        assert!(!shown.contains("Indexing"), "{}", shown);
-        assert!(!shown.contains("Reading Testamento ejemplo.pdf"), "{}", shown);
+        assert!(shown.contains("Reading Testamento ejemplo.pdf…"), "{}", shown);
+        let home = std::env::var("HOME").unwrap();
+        app.chat_event(ChatEvent::Status { step: "index".into(), message: format!("Checking documents in {}/src", home) });
+        let shown = screen(&app, 80, 24);
+        assert!(shown.contains("Checking documents in ~/src…"), "{}", shown);
 
         // Past indexing, the turn's row follows the agent.
         app.chat_event(ChatEvent::Status { step: "explore".into(), message: "Searching documents".into() });
@@ -7641,6 +7695,63 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_turns_on_and_off_by_command_and_in_the_panel() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let last = |app: &App| match app.entries.last() {
+            Some(Entry::Error(e) | Entry::Notice(e)) => e.clone(),
+            _ => String::new(),
+        };
+        app.input = "/models qwen3.5-2b thinking off".into();
+        app.submit();
+        assert_eq!(last(&app), "Turning qwen3.5-2b reasoning off");
+        app.input = "/models qwen3.5-2b reasoning on".into();
+        app.submit();
+        assert_eq!(last(&app), "Turning qwen3.5-2b reasoning on");
+        app.input = "/models qwen3.5-2b thinking maybe".into();
+        app.submit();
+        assert!(last(&app).contains("thinking off"), "{}", last(&app));
+
+        let row = |name: &str, thinking| ModelRow {
+            name: name.into(),
+            capabilities: "text, reasoning".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: true,
+            enabled: true,
+            cloud: false,
+            local: true,
+            recommended: false,
+            cloud_ready: false,
+            cloud_copy: false,
+            cloud_variant: false,
+            thinking,
+            fits: true,
+        };
+        app.overlay = Overlay::Models {
+            rows: Some(Ok(vec![row("thinker", Some(false)), row("plain", None)])),
+            selected: 0,
+        };
+        let text = screen(&app, 120, 24);
+        assert!(text.contains("(fits) (reasoning off)"), "{}", text);
+        assert!(text.contains("[ctrl+t] reasoning on"), "{}", text);
+        app.key_models(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(last(&app), "Turning thinker reasoning on");
+        // A model that can't reason has nothing to turn.
+        if let Overlay::Models { selected, .. } = &mut app.overlay {
+            *selected = 1;
+        }
+        let text = screen(&app, 120, 24);
+        assert!(!text.contains("ctrl+t"), "{}", text);
+        let before = app.entries.len();
+        app.key_models(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.entries.len(), before);
+    }
+
+    #[test]
     fn models_caps_sets_a_models_capabilities_here() {
         assert_eq!(capability_list("Vision, reasoning"), Ok(vec!["vision".to_string(), "reasoning".to_string()]));
         assert_eq!(capability_list("auto"), Ok(vec![]));
@@ -7673,6 +7784,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
@@ -8601,6 +8713,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         };
         let list = vec![
@@ -8636,6 +8749,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -8699,6 +8813,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         };
         // Served both ways, too big here, the plan covering its cloud copy.
@@ -8790,6 +8905,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: false,
         };
         let ready = ModelRow { cloud_ready: true, ..big("qwen-ready") };
@@ -8836,6 +8952,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         };
         app.overlay = Overlay::Models { rows: Some(Ok(vec![row])), selected: 0 };
@@ -8873,6 +8990,7 @@ mod tests {
             cloud_ready: false,
             cloud_copy: false,
             cloud_variant: false,
+            thinking: None,
             fits: true,
         };
         let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
