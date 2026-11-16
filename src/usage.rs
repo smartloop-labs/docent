@@ -14,6 +14,9 @@
 //! then developer token). Refreshing it stays the agent's job: on a 401 the
 //! agent's `/v1/auth/status` is asked once, which redeems the refresh token,
 //! and the file is read again.
+//!
+//! `platform_get` is how the rest of the CLI calls the platform under that
+//! token too, as the pre-run skill searches the web.
 
 use reqwest::blocking::Client;
 use std::time::Duration;
@@ -216,7 +219,7 @@ fn now_secs() -> i64 {
 /// signed in or the platform can't be reached — the footer then shows
 /// nothing.
 pub fn fetch(client: &Client) -> Option<SearchUsage> {
-    SearchUsage::from_status(&platform_status(client, "/v1/websearch/status")?)
+    SearchUsage::from_status(&platform_get(client, "/v1/websearch/status", &[], TIMEOUT)?)
 }
 
 /// The signed-in account's credits, read through the agent as Studio reads
@@ -230,26 +233,28 @@ pub fn fetch_credits(client: &Client) -> Option<CreditUsage> {
     CreditUsage::from_quota(&response.json().ok()?)
 }
 
-/// A status reply from the platform under the agent's token, had again
-/// with a fresh one after a 401.
-fn platform_status(client: &Client, path: &str) -> Option<serde_json::Value> {
+/// The platform's JSON reply to `GET path?query` under the agent's token,
+/// had again with a fresh one after a 401; `None` signed out, or when the
+/// platform refuses or is out of reach within `timeout`.
+pub fn platform_get(client: &Client, path: &str, query: &[(&str, &str)], timeout: Duration) -> Option<serde_json::Value> {
     let token = stored_token()?;
-    match status(client, &token, path) {
+    match get(client, &token, path, query, timeout) {
         Err(401) => {
             // Have the agent refresh the token, then try the new one.
             let _ = client.get(format!("{}/auth/status", crate::api_url())).timeout(TIMEOUT).send();
             let token = stored_token()?;
-            status(client, &token, path).ok()
+            get(client, &token, path, query, timeout).ok()
         }
         result => result.ok(),
     }
 }
 
-fn status(client: &Client, token: &str, path: &str) -> Result<serde_json::Value, u16> {
+fn get(client: &Client, token: &str, path: &str, query: &[(&str, &str)], timeout: Duration) -> Result<serde_json::Value, u16> {
     let response = client
         .get(format!("{}{}", platform_url(), path))
+        .query(query)
         .bearer_auth(token)
-        .timeout(TIMEOUT)
+        .timeout(timeout)
         .send()
         .map_err(|_| 0u16)?;
     if !response.status().is_success() {
