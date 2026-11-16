@@ -8,9 +8,6 @@
 //! - `post-run`, once it's written and checks: the project's tests, and the
 //!   notes the user asked to remember, kept in `.docent/memory.md`.
 
-// Wired into the turn by the steps that use them.
-#![cfg_attr(not(test), allow(dead_code))]
-
 pub const PRE_RUN: &str = include_str!("skills/pre-run/SKILL.md");
 pub const POST_RUN: &str = include_str!("skills/post-run/SKILL.md");
 

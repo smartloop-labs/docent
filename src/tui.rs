@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, lsp, mcp, skills};
+use crate::{ModelRow, docent, files, framework, lsp, mcp, prerun, skills};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -191,6 +191,8 @@ enum AppEvent {
     /// The language servers' errors in the files written: the check's id,
     /// the servers asked, and what they report.
     Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
+    /// The pre-run skill's lookup is done: the turn it held goes now.
+    PreRun(Box<PreRun>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -1178,6 +1180,17 @@ struct Sent {
     web_search: bool,
 }
 
+/// A turn held for the pre-run skill to look up the `deps` it uses, and
+/// what it `found`.
+struct PreRun {
+    id: usize,
+    project: String,
+    sent: Sent,
+    files: Vec<Attachment>,
+    deps: Vec<prerun::Dep>,
+    found: Vec<(prerun::Dep, String)>,
+}
+
 /// A turn's native tool calling: the reply asks for `bash` calls, they run
 /// as a reply's fenced commands do, asked about first unless auto-approve
 /// is on, and their results go back in a turn of their own so the agent
@@ -1565,6 +1578,16 @@ struct App {
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
+    /// Whether the next turn's the user's prompt, for the pre-run skill
+    /// to look up the libraries it uses; its fix rounds aren't.
+    look_up: bool,
+    /// The pre-run lookup the turn waits on, by its id.
+    pre_run: Option<usize>,
+    /// Lookups started, for their ids.
+    pre_runs: usize,
+    /// The current API the pre-run skill found for the user's prompt, told
+    /// in its every round.
+    reference: Option<String>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
     /// The project's skills as `(name, description)`, hinted and run as
@@ -1652,6 +1675,10 @@ impl App {
             always_run: false,
             tooling: None,
             command_round: 0,
+            look_up: false,
+            pre_run: None,
+            pre_runs: 0,
+            reference: None,
             failures: Vec::new(),
             hint_at: 0,
             skills: Vec::new(),
@@ -1876,9 +1903,16 @@ impl App {
         // user's message in its prompt and reads what's around it as data,
         // and a small model then describes files instead of giving them.
         let mut system = None;
+        let mut deps = Vec::new();
         if let Some(root) = &files_dir {
             let context = match code_kind(root) {
-                Some(kind) => format!("{}\n\n", files::project_brief(root, kind)),
+                Some(kind) => {
+                    // The pre-run skill looks up the libraries the user's
+                    // prompt names.
+                    let libraries = if std::mem::take(&mut self.look_up) { prerun::dependencies(root, kind) } else { Vec::new() };
+                    deps = prerun::relevant(&libraries, &message, &[]);
+                    format!("{}\n\n", files::project_brief(root, kind))
+                }
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
                 None => String::new(),
             };
@@ -1895,6 +1929,9 @@ impl App {
                 skills::body(skills::POST_RUN),
                 files::EDIT_EXAMPLE
             ));
+            if let Some(reference) = &self.reference {
+                system = system.map(|system| format!("{system}\n\n{reference}"));
+            }
             // Its language server starts now, indexing while the reply comes,
             // to be ready for the files it gives.
             if !cfg!(test)
@@ -1922,10 +1959,70 @@ impl App {
         let budget = files::budget_for(self.window);
         let web_search = self.web_search != Some(false);
         let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget, web_search };
+        if deps.is_empty() {
+            return self.start_sent(project, sent, files);
+        }
+        self.pre_run(project, sent, files, deps);
+    }
+
+    /// Start the turn `sent`, its tool rounds from none.
+    fn start_sent(&mut self, project: String, sent: Sent, files: Vec<Attachment>) {
         // A turn with a working directory offers the `bash` tool, run there,
         // and its tool rounds start over: it's a new request, not one going on.
         self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
+    }
+
+    /// The pre-run skill: the current API of the `deps` the turn `sent`
+    /// uses, told to the agent with it. Those kept from an earlier turn are
+    /// told straight away; with web search on, the rest are searched for
+    /// while the turn waits.
+    fn pre_run(&mut self, project: String, sent: Sent, files: Vec<Attachment>, deps: Vec<prerun::Dep>) {
+        let Some(root) = sent.files_dir.clone() else { return self.start_sent(project, sent, files) };
+        self.pre_runs += 1;
+        let id = self.pre_runs;
+        let kept = prerun::look_up(&self.client, &root, &deps, false);
+        let missing: Vec<prerun::Dep> = deps.into_iter().filter(|d| !kept.iter().any(|(k, _)| k == d)).collect();
+        if missing.is_empty() || self.web_search != Some(true) || cfg!(test) {
+            return self.pre_run_done(PreRun { id, project, sent, files, deps: Vec::new(), found: kept });
+        }
+        let names: Vec<String> = missing.iter().map(|d| d.to_string()).collect();
+        self.entries.push(Entry::Notice(format!("Looking up the current API of {} (esc stops)", names.join(", "))));
+        self.pre_run = Some(id);
+        self.spawn(move |client, tx| {
+            let mut found = kept;
+            found.extend(prerun::look_up(&client, &root, &missing, true));
+            let _ = tx.send(AppEvent::PreRun(Box::new(PreRun { id, project, sent, files, deps: missing, found })));
+        });
+    }
+
+    /// A pre-run lookup's end: what it found goes with the turn, which
+    /// starts, unless it was stopped or the project changed meanwhile.
+    /// Those `deps` searched for and not found are said.
+    fn pre_run_done(&mut self, done: PreRun) {
+        let PreRun { id, project, mut sent, files, deps, found } = done;
+        // One searched for in the background is waited on, unless it was
+        // stopped since; one only read from the cache never was.
+        if self.pre_run.take_if(|p| *p == id).is_none() && !deps.is_empty() {
+            return;
+        }
+        if self.project.as_ref().is_none_or(|(p, _)| *p != project) {
+            return;
+        }
+        let missed: Vec<String> =
+            deps.iter().filter(|d| !found.iter().any(|(f, _)| f == *d)).map(|d| d.to_string()).collect();
+        if !missed.is_empty() {
+            self.entries.push(Entry::Notice(format!("No current API found for {}; going on without it", missed.join(", "))));
+        }
+        if !found.is_empty() {
+            let names: Vec<String> = found.iter().map(|(d, _)| d.to_string()).collect();
+            self.entries.push(Entry::Notice(format!("Using the current API of {}", names.join(", "))));
+        }
+        self.reference = prerun::reference(&found);
+        if let Some(reference) = &self.reference {
+            sent.system = sent.system.map(|system| format!("{system}\n\n{reference}"));
+        }
+        self.start_sent(project, sent, files);
     }
 
     /// Stream the turn `sent`, with `files` uploaded first and the tool
@@ -2752,6 +2849,9 @@ impl App {
     fn stop_turn(&mut self) {
         self.commands = None;
         self.tooling = None;
+        if self.pre_run.take().is_some() {
+            self.entries.push(Entry::Notice("Stopped looking up the API; the prompt wasn't sent".to_string()));
+        }
         if let Some(turn) = self.turn.take() {
             turn.task.abort();
             if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
@@ -2924,6 +3024,7 @@ impl App {
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
+            AppEvent::PreRun(done) => self.pre_run_done(*done),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
             AppEvent::Searched(id, result) => self.searched(id, result),
             AppEvent::Uploaded(ids) => {
@@ -3832,7 +3933,7 @@ impl App {
                 self.cursor = 0;
             }
             // Esc interrupts the reply: the next queued prompt goes at once.
-            KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            KeyCode::Esc if self.turn.is_some() || self.pre_run.is_some() => self.stop_turn(),
             // Up on an empty prompt takes back the last queued one, to edit.
             KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
                 let last = self.queued.pop().expect("queued is not empty");
@@ -4198,6 +4299,8 @@ impl App {
         self.manifest_asked = false;
         self.command_round = 0;
         self.failures.clear();
+        self.look_up = true;
+        self.reference = None;
         self.send_turn(input, message, files, making);
     }
 
@@ -4218,6 +4321,7 @@ impl App {
     /// of its running (fix rounds start from those).
     fn idle(&self) -> bool {
         self.turn.is_none()
+            && self.pre_run.is_none()
             && self.ask.is_none()
             && self.commands.is_none()
             && self.check.is_none()
@@ -7723,6 +7827,58 @@ mod tests {
         assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
         assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Remembered"))));
         assert!(files::memory_note(dir.path()).contains("- Use pnpm, not npm"));
+    }
+
+    #[test]
+    fn the_api_the_pre_run_skill_found_goes_with_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let serde = prerun::Dep { name: "serde".into(), version: Some("1.0.219".into()) };
+        let sent = || Sent {
+            system: Some("system".into()),
+            cwd: Some(dir.path().to_path_buf()),
+            files_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let found = vec![(serde.clone(), "derive(Serialize)".to_string())];
+        // A lookup since stopped is dropped, and its turn with it.
+        app.pre_run = Some(1);
+        app.stop_turn();
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Stopped looking up")));
+        let done = |id, found| PreRun { id, project: "p1".into(), sent: sent(), files: Vec::new(), deps: vec![serde.clone()], found };
+        app.apply(AppEvent::PreRun(Box::new(done(1, found.clone()))));
+        assert!(app.turn.is_none() && app.reference.is_none());
+        // One waited on: what it found goes in the system message, and is
+        // kept for the prompt's fix rounds.
+        app.pre_run = Some(2);
+        assert!(!app.idle());
+        app.apply(AppEvent::PreRun(Box::new(done(2, found))));
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Using the current API of serde 1.0.219")));
+        let system = app.tooling.as_ref().and_then(|t| t.sent.system.clone()).unwrap();
+        assert!(system.starts_with("system\n\n") && system.ends_with("## serde 1.0.219\n\nderive(Serialize)"));
+        assert_eq!(app.reference.as_deref(), system.strip_prefix("system\n\n"));
+        // Nothing found: said, and the turn goes without.
+        app.stop_turn();
+        app.pre_run = Some(3);
+        app.apply(AppEvent::PreRun(Box::new(done(3, Vec::new()))));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "No current API found for serde 1.0.219; going on without it")));
+        assert!(app.turn.is_some() && app.reference.is_none());
+        // One kept from an earlier turn goes straight away, not looked up.
+        app.stop_turn();
+        let api = dir.path().join(".docent/cache/api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("serde@1.0.219.md"), "derive(Deserialize)").unwrap();
+        app.web_search = Some(true);
+        let told = app.entries.len();
+        app.pre_run("p1".into(), sent(), Vec::new(), vec![serde.clone()]);
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Looking up"))));
+        assert!(app.reference.as_deref().is_some_and(|r| r.ends_with("derive(Deserialize)")));
     }
 
     #[test]

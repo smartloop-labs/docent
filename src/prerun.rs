@@ -10,9 +10,6 @@
 //! search again. The cache is the project's own and never committed: it
 //! gets a `.gitignore` of its own when it's made.
 
-// Wired into the turn by the step that runs it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -300,6 +297,19 @@ fn head(text: &str, n: usize) -> String {
     text.chars().take(n).collect()
 }
 
+/// The most the reference for `n` of a project's libraries takes of the
+/// system message, `LOOKED_UP` of them at most: kept out of the budget
+/// for the project's files, so they and it fit the model's window.
+pub fn room(n: usize) -> usize {
+    match n.min(LOOKED_UP) {
+        0 => 0,
+        n => crate::skills::body(crate::skills::PRE_RUN).len() + n * (KEPT + HEADING),
+    }
+}
+
+/// A reference's heading for one library, its name and version, at most.
+const HEADING: usize = 100;
+
 /// What `found` adds to the agent's system message: the pre-run skill's
 /// text and each library's reference; nothing when nothing was found.
 pub fn reference(found: &[(Dep, String)]) -> Option<String> {
@@ -425,6 +435,9 @@ mod tests {
         );
         // A name inside another word isn't its use.
         assert!(relevant(&deps, "deserialize the clapping", &[]).is_empty());
+        // Room is kept for the reference of those that can be looked up.
+        assert_eq!(room(0), 0);
+        assert!(room(1) > KEPT && room(5) == room(LOOKED_UP));
     }
 
     #[test]
