@@ -440,6 +440,9 @@ pub struct ModelRow {
     /// The models panel's Cloud entry of a model served both ways, which
     /// also has a Local entry: Enter runs it in the cloud.
     pub cloud_copy: bool,
+    /// Whether it reasons before it answers: `None` for a model that can't,
+    /// so it has nothing to turn on or off.
+    pub thinking: Option<bool>,
 }
 
 /// The catalog (`/v1/models`) joined with the project's state. A model the
@@ -490,6 +493,7 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
         cloud_variant: local && model["cloud_variant"].as_bool().unwrap_or_default(),
         fits: fits(model["param_size_b"].as_f64(), total_gb),
         cloud_copy: false,
+        thinking: model["thinking"].as_bool(),
         name,
     }
 }
@@ -519,6 +523,23 @@ pub fn set_model_capabilities(client: &Client, name: &str, capabilities: &[Strin
     }
     let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
     Ok(reply["capabilities"].as_array().map_or_else(Vec::new, |c| c.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()))
+}
+
+/// Turn a model's reasoning on or off, for every project: off, it answers
+/// without first thinking in a hidden block, so the answer starts sooner.
+/// Whether it reasons, as it stands after.
+pub fn set_model_thinking(client: &Client, name: &str, on: bool) -> Result<bool, String> {
+    let action = if on { "turn reasoning on" } else { "turn reasoning off" };
+    let response = client
+        .patch(format!("{}/models/workspace/{}", api_url(), name))
+        .json(&serde_json::json!({ "thinking": on }))
+        .send()
+        .map_err(|e| format!("Failed to {}: {}", action, e))?;
+    if !response.status().is_success() {
+        return Err(error_message(action, response));
+    }
+    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
+    Ok(reply["thinking"].as_bool().unwrap_or(on))
 }
 
 /// PATCH a project's model entry; the server canonicalizes the name.
