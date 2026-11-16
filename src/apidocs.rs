@@ -31,6 +31,7 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
             let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
             rust(&cargo_registry()?, &lock, dep)
         }
+        "JavaScript/TypeScript" => npm(&root.join("node_modules"), &dep.name),
         _ => None,
     }
 }
@@ -41,6 +42,16 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
 /// virtualenv is whatever version that holds.
 pub fn readable(kind: &str, dep: &Dep) -> bool {
     dep.version.is_some() || !matches!(kind, "Rust" | "Go" | "Java" | "Java/Kotlin" | "Kotlin")
+}
+
+/// Whether `dep` is an npm package installed for `root` without types to
+/// read its API from, of its own or from `@types`: told by their manifests
+/// alone, so it's never read for nothing.
+pub fn untyped(root: &Path, dep: &Dep) -> bool {
+    let node_modules = root.join("node_modules");
+    let typed = format!("@types/{}", dep.name.trim_start_matches('@').replace('/', "__"));
+    node_modules.join(&dep.name).join("package.json").is_file()
+        && [dep.name.as_str(), typed.as_str()].iter().all(|name| types_entry(&node_modules.join(name)).is_none())
 }
 
 /// The user's home folder.
@@ -299,6 +310,155 @@ fn clean(lines: &[String]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// A package's API from its type declarations under `node_modules`, or
+/// those `@types` has for it: its README, then each declaration file its
+/// types entry exports from, the exported declarations and the documented
+/// members of its classes and interfaces.
+fn npm(node_modules: &Path, name: &str) -> Option<Vec<Section>> {
+    // `@types/scope__name` for `@scope/name`.
+    let typed = format!("@types/{}", name.trim_start_matches('@').replace('/', "__"));
+    let (dir, entry) = [name, typed.as_str()].iter().find_map(|name| {
+        let dir = node_modules.join(name);
+        Some((dir.clone(), types_entry(&dir)?))
+    })?;
+    let mut sections = Vec::new();
+    if let Some(readme) = ["README.md", "readme.md", "Readme.md"].iter().find_map(|f| fs::read_to_string(dir.join(f)).ok()) {
+        sections.extend(clean(&readme.lines().map(str::to_string).collect::<Vec<_>>()).map(|text| Section { title: name.to_string(), text }));
+    }
+    // Each file the entry exports from, each once.
+    let mut files = vec![entry];
+    let mut at = 0;
+    while at < files.len() && at < FILES {
+        let file = files[at].clone();
+        at += 1;
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let folder = file.parent().unwrap_or(&dir).to_path_buf();
+        for from in text.lines().filter_map(exported_from) {
+            if let Some(next) = declaration_file(&folder.join(from))
+                && !files.contains(&next)
+            {
+                files.push(next);
+            }
+        }
+        sections.extend(ts_sections(&text));
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The declaration file a package in `dir` gives its types in.
+fn types_entry(dir: &Path) -> Option<PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("package.json")).ok()?).ok()?;
+    let exported = &manifest["exports"]["."];
+    let declared = [&manifest["types"], &manifest["typings"], &exported["types"], &exported["import"]["types"], &exported["require"]["types"]]
+        .into_iter()
+        .find_map(|v| v.as_str());
+    declared.and_then(|path| declaration_file(&dir.join(path))).or_else(|| declaration_file(&dir.join("index")))
+}
+
+/// The declaration file a module `path` names: as it is, or with its
+/// `.js` as `.d.ts`, or its folder's `index.d.ts`.
+fn declaration_file(path: &Path) -> Option<PathBuf> {
+    let text = path.to_string_lossy();
+    let stem = text.trim_end_matches(".js").trim_end_matches(".mjs").trim_end_matches(".cjs");
+    let stem = [".d.ts", ".d.mts", ".d.cts"].iter().find_map(|d| stem.strip_suffix(d)).unwrap_or(stem);
+    [format!("{stem}.d.ts"), format!("{stem}.d.mts"), format!("{stem}.d.cts"), format!("{stem}/index.d.ts")]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// The module an `export … from './x'` line exports from, when it's one
+/// of the package's own.
+fn exported_from(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if !line.starts_with("export ") {
+        return None;
+    }
+    let from = line.rsplit_once(" from ")?.1.trim().trim_end_matches(';');
+    let from = from.trim_matches(|c| c == '"' || c == '\'');
+    from.starts_with('.').then_some(from)
+}
+
+/// What a declaration file declares: each declaration at its top or in a
+/// namespace, with its JSDoc when it has one, and each documented member
+/// of its classes and interfaces, named after them.
+fn ts_sections(text: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    // The blocks a line is in: each one's depth, and the class or
+    // interface name when its members are what's declared there.
+    let mut blocks: Vec<(usize, Option<String>)> = Vec::new();
+    let mut depth = 0;
+    let mut doc: Vec<String> = Vec::new();
+    let mut in_doc = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if in_doc || item.starts_with("/**") {
+            in_doc = !item.ends_with("*/");
+            let text = item.trim_start_matches("/**").trim_end_matches("*/").trim();
+            let text = text.strip_prefix('*').map_or(text, |t| t.strip_prefix(' ').unwrap_or(t));
+            if !text.starts_with('@') || ["@example", "@param", "@returns"].iter().any(|t| text.starts_with(t)) {
+                doc.push(text.to_string());
+            }
+            continue;
+        }
+        if item.is_empty() || item.starts_with("//") {
+            continue;
+        }
+        let owner = blocks.last().and_then(|(_, owner)| owner.clone());
+        let docs = clean(&doc);
+        doc.clear();
+        let opens = item.matches('{').count();
+        let closes = item.matches('}').count();
+        let declared = if owner.is_none() { ts_declared(item) } else { None };
+        if let Some(name) = &declared {
+            let text = signature(&lines[i..]);
+            sections.push(Section { title: name.clone(), text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+        } else if let (Some(owner), Some(name), Some(docs)) = (&owner, ts_member(item), docs) {
+            let title = format!("{owner}.{name}");
+            sections.push(Section { title, text: format!("`{}`\n\n{docs}", signature(&lines[i..])) });
+        }
+        if opens > closes {
+            let members = match declared {
+                Some(name) => [" class ", " interface "].iter().any(|k| format!(" {item}").contains(k)).then_some(name),
+                None => owner,
+            };
+            blocks.push((depth, members));
+        }
+        depth = (depth + opens).saturating_sub(closes);
+        blocks.retain(|(at, _)| *at < depth);
+    }
+    sections
+}
+
+/// The name a declaration line declares, as `parse` of `export declare
+/// function parse(`, or of `function parse(` in a namespace.
+fn ts_declared(line: &str) -> Option<String> {
+    let mut rest = line;
+    for word in ["export ", "declare ", "default ", "abstract ", "async "] {
+        rest = rest.strip_prefix(word).unwrap_or(rest);
+    }
+    let (keyword, name) = rest.split_once(' ')?;
+    let kinds = ["function", "class", "interface", "type", "const", "let", "var", "enum", "namespace", "module"];
+    let name: String = name.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    (kinds.contains(&keyword) && !name.is_empty()).then_some(name)
+}
+
+/// The name a class or interface member line declares, as `parse` of
+/// `parse(data: unknown): T;` or `static create(`.
+fn ts_member(line: &str) -> Option<String> {
+    let mut rest = line;
+    for word in ["public ", "static ", "readonly ", "abstract ", "get ", "set ", "async "] {
+        rest = rest.strip_prefix(word).unwrap_or(rest);
+    }
+    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    let after = rest[name.len()..].trim_start_matches('?');
+    (!name.is_empty() && (after.starts_with('(') || after.starts_with(':') || after.starts_with('<'))).then_some(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +516,55 @@ mod tests {
         // Not installed at the version the project builds with: nothing.
         assert_eq!(rust(registry.path(), lock, &Dep { name: "app".into(), version: Some("1.3.0".into()) }), None);
         assert_eq!(rust(registry.path(), lock, &Dep { name: "app".into(), version: None }), None);
+    }
+
+    #[test]
+    fn a_package_s_api_is_its_types() {
+        let modules = tempfile::tempdir().unwrap();
+        let pkg = modules.path().join("greet");
+        write(&pkg.join("package.json"), r#"{"name": "greet", "types": "./dist/index.d.ts"}"#);
+        write(&pkg.join("README.md"), "# greet\n\nSays hello.");
+        write(
+            &pkg.join("dist/index.d.ts"),
+            "export * from './options';\nexport { Greeter } from \"./greeter.js\";\n\n\
+             /**\n * Greet someone.\n * @param name - who\n * @internal\n */\nexport declare function greet(name: string): string;\n\n\
+             export declare const VERSION: string;\n",
+        );
+        write(&pkg.join("dist/options.d.ts"), "/** How to greet. */\nexport interface Options {\n    /** Shout it. */\n    loud?: boolean;\n    quiet: boolean;\n}\n");
+        write(
+            &pkg.join("dist/greeter/index.d.ts"),
+            "export declare class Greeter {\n    /** Make one. */\n    static create(options?: Options): Greeter;\n    private secret;\n}\n",
+        );
+        let sections = npm(modules.path(), "greet").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["greet", "greet", "VERSION", "Options", "Options.loud", "Greeter", "Greeter.create"]);
+        assert_eq!(sections[0].text, "# greet\n\nSays hello.");
+        assert_eq!(sections[1].text, "`export declare function greet(name: string): string`\n\nGreet someone.\n@param name - who");
+        assert_eq!(sections[4].text, "`loud?: boolean`\n\nShout it.");
+        // No types of its own: those `@types` has for it.
+        let scoped = modules.path().join("@types/scope__lib");
+        write(&scoped.join("package.json"), r#"{"name": "@types/scope__lib", "types": "index.d.ts"}"#);
+        write(&scoped.join("index.d.ts"), "export type Id = string;\n");
+        assert_eq!(npm(modules.path(), "@scope/lib").unwrap()[0].title, "Id");
+        assert_eq!(npm(modules.path(), "missing"), None);
+    }
+
+    #[test]
+    fn a_package_installed_without_types_is_told_by_its_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let modules = root.path().join("node_modules");
+        let dep = |name: &str| Dep { name: name.into(), version: Some("1.0.0".into()) };
+        write(&modules.join("native/package.json"), r#"{"name": "native", "main": "lib/index.js"}"#);
+        assert!(untyped(root.path(), &dep("native")));
+        write(&modules.join("greet/package.json"), r#"{"name": "greet", "types": "index.d.ts"}"#);
+        write(&modules.join("greet/index.d.ts"), "export type Id = string;\n");
+        assert!(!untyped(root.path(), &dep("greet")));
+        // Typed by `@types`, or not installed at all, isn't.
+        write(&modules.join("@scope/lib/package.json"), r#"{"name": "@scope/lib"}"#);
+        write(&modules.join("@types/scope__lib/package.json"), r#"{"types": "index.d.ts"}"#);
+        write(&modules.join("@types/scope__lib/index.d.ts"), "export type Id = string;\n");
+        assert!(!untyped(root.path(), &dep("@scope/lib")));
+        assert!(!untyped(root.path(), &dep("missing")));
     }
 
     #[test]

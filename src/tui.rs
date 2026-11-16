@@ -2004,9 +2004,11 @@ impl App {
         self.pre_runs += 1;
         let id = self.pre_runs;
         // Those not kept are read, if they can be: one not locked yet isn't
-        // installed either, and is said so without a read.
-        let (deps, unread): (Vec<prerun::Dep>, Vec<prerun::Dep>) =
-            deps.into_iter().partition(|d| prerun::kept(&root, d) || apidocs::readable(kind, d));
+        // installed either, nor has a package without types any API to
+        // read, and each is said so without a read.
+        let (deps, unread): (Vec<prerun::Dep>, Vec<prerun::Dep>) = deps
+            .into_iter()
+            .partition(|d| prerun::kept(&root, d) || (apidocs::readable(kind, d) && !apidocs::untyped(&root, d)));
         let missing: Vec<prerun::Dep> = deps.iter().filter(|d| !prerun::kept(&root, d)).cloned().collect();
         let said = [missing.clone(), unread].concat();
         // A few named and kept are told straight away; scoring the many a
@@ -2042,16 +2044,32 @@ impl App {
         if self.project.as_ref().is_none_or(|(p, _)| *p != project) {
             return;
         }
-        let missed: Vec<prerun::Dep> =
-            deps.into_iter().filter(|d| !found.iter().any(|f| f.dep == *d) && !self.not_installed.contains(d)).collect();
-        if !missed.is_empty() {
-            let names: Vec<String> = missed.iter().map(|d| d.to_string()).collect();
+        // Only for those the prompt names: a guess weighs many, most of
+        // which it was never going to tell.
+        let missed: Vec<prerun::Dep> = deps
+            .into_iter()
+            .filter(|d| !guessed && !found.iter().any(|f| f.dep == *d) && !self.not_installed.contains(d))
+            .collect();
+        // A package installed without types has no API to read, and
+        // building won't give it one.
+        let root = sent.files_dir.clone().unwrap_or_default();
+        let (untyped, absent): (Vec<&prerun::Dep>, Vec<&prerun::Dep>) =
+            missed.iter().partition(|d| apidocs::untyped(&root, d));
+        let names = |deps: Vec<&prerun::Dep>| deps.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
+        if !absent.is_empty() {
             self.entries.push(Entry::Notice(format!(
-                "{} isn't installed here, so the agent goes without its API; build the project to give it",
-                names.join(", ")
+                "Found no installed API for {}, so the agent goes without it; building the project installs it",
+                names(absent)
             )));
-            self.not_installed.extend(missed);
         }
+        if !untyped.is_empty() {
+            let ships = if untyped.len() == 1 { "ships" } else { "ship" };
+            self.entries.push(Entry::Notice(format!(
+                "{} {ships} no types, so the agent goes without its API",
+                names(untyped)
+            )));
+        }
+        self.not_installed.extend(missed);
         let found = if guessed { prerun::guess(found) } else { found };
         if !found.is_empty() {
             let names: Vec<String> = found.iter().map(|f| f.dep.to_string()).collect();
@@ -7916,7 +7934,7 @@ mod tests {
         app.stop_turn();
         app.pre_run = Some(3);
         app.apply(AppEvent::PreRun(Box::new(done(3, Vec::new()))));
-        let not_installed = |e: &Entry| matches!(e, Entry::Notice(n) if n.starts_with("serde 1.0.219 isn't installed here"));
+        let not_installed = |e: &Entry| matches!(e, Entry::Notice(n) if n.starts_with("Found no installed API for serde 1.0.219"));
         assert_eq!(app.entries.iter().filter(|e| not_installed(e)).count(), 1);
         assert!(app.turn.is_some() && app.reference.is_none());
         // Said once a session.
@@ -7950,7 +7968,22 @@ mod tests {
         let regex = prerun::Dep { name: "regex".into(), version: None };
         app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![regex], false, ""), "Rust");
         assert!(app.turn.is_some() && app.pre_run.is_none());
-        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n.contains("regex") && !n.contains("regex 1")));
+        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n.starts_with("Found no installed API for regex,")));
+        // One only a guess weighed isn't said.
+        app.stop_turn();
+        let told = app.entries.len();
+        let anyhow = prerun::Dep { name: "anyhow".into(), version: None };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![anyhow], true, "add a flag"), "Rust");
+        assert!(app.turn.is_some());
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Found no"))));
+        // A package installed without types is said to ship none.
+        app.stop_turn();
+        let package = dir.path().join("node_modules/better-sqlite3");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        let sqlite = prerun::Dep { name: "better-sqlite3".into(), version: Some("12.11.1".into()) };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![sqlite], false, ""), "JavaScript/TypeScript");
+        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n == "better-sqlite3 12.11.1 ships no types, so the agent goes without its API"));
     }
 
     #[test]
