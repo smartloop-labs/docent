@@ -32,6 +32,7 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
             rust(&cargo_registry()?, &lock, dep)
         }
         "JavaScript/TypeScript" => npm(&root.join("node_modules"), &dep.name),
+        "Python" => python(&site_packages(root)?, &dep.name),
         _ => None,
     }
 }
@@ -459,6 +460,161 @@ fn ts_member(line: &str) -> Option<String> {
     (!name.is_empty() && (after.starts_with('(') || after.starts_with(':') || after.starts_with('<'))).then_some(name)
 }
 
+/// Where the project's virtualenv installs packages: the active one's, or
+/// one in `root`'s `.venv` or `venv`.
+fn site_packages(root: &Path) -> Option<PathBuf> {
+    let active = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+    let venvs = active.into_iter().chain([root.join(".venv"), root.join("venv")]);
+    venvs.filter(|v| v.is_dir()).find_map(|venv| {
+        // `lib/python3.12/site-packages`, or `Lib/site-packages` on Windows.
+        let windows = venv.join("Lib").join("site-packages");
+        let lib = fs::read_dir(venv.join("lib")).ok().into_iter().flatten().flatten().map(|e| e.path().join("site-packages"));
+        lib.chain([windows]).find(|site| site.is_dir())
+    })
+}
+
+/// A distribution's API from its installed modules in `site`: each
+/// module's docstring, its public functions and classes, and the
+/// documented methods of those classes.
+fn python(site: &Path, name: &str) -> Option<Vec<Section>> {
+    let mut files = Vec::new();
+    for module in import_names(site, name) {
+        let package = site.join(&module);
+        if package.is_dir() {
+            python_files(&package, &mut files);
+        } else if let Some(file) = ["pyi", "py"].iter().map(|e| site.join(format!("{module}.{e}"))).find(|f| f.is_file()) {
+            files.push(file);
+        }
+    }
+    let mut sections = Vec::new();
+    for file in files.into_iter().take(FILES) {
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let rel = file.strip_prefix(site).unwrap_or(&file).with_extension("");
+        let parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().into_owned()).filter(|p| p != "__init__").collect();
+        sections.extend(python_sections(&text, &parts.join(".")));
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The modules distribution `name` installs in `site`: as its
+/// `top_level.txt` says, else its name as a module's.
+fn import_names(site: &Path, name: &str) -> Vec<String> {
+    let normal = |n: &str| n.to_lowercase().replace(['-', '.'], "_");
+    let info = fs::read_dir(site).ok().into_iter().flatten().flatten().map(|e| e.path()).find(|p| {
+        let file = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        file.strip_suffix(".dist-info").and_then(|f| f.rsplit_once('-')).is_some_and(|(dist, _)| normal(dist) == normal(name))
+    });
+    let listed: Vec<String> = info
+        .and_then(|info| fs::read_to_string(info.join("top_level.txt")).ok())
+        .map(|top| top.lines().map(str::trim).filter(|m| !m.is_empty() && !m.starts_with('_')).map(str::to_string).collect())
+        .unwrap_or_default();
+    if listed.is_empty() { vec![normal(name)] } else { listed }
+}
+
+/// A package's public module files under `dir`, at any depth: a stub in
+/// place of its source when it has one, and no test modules, nor private
+/// ones its `__init__` doesn't import from, as httpx's does `._client`.
+fn python_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let init = ["__init__.pyi", "__init__.py"].iter().find_map(|f| fs::read_to_string(dir.join(f)).ok()).unwrap_or_default();
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = name.split('.').next().unwrap_or_default();
+        let imported = init.contains(&format!("from .{stem} import")) || init.contains(&format!("from .{stem}."));
+        let private = name.starts_with('_') && !name.starts_with("__init__") && !imported;
+        if private || name == "tests" || name == "test" {
+            continue;
+        }
+        if path.is_dir() {
+            python_files(&path, files);
+        } else if path.extension().is_some_and(|e| e == "pyi")
+            || path.extension().is_some_and(|e| e == "py") && !path.with_extension("pyi").is_file()
+        {
+            files.push(path);
+        }
+    }
+}
+
+/// What a Python `module` file documents: its docstring, its public
+/// functions and classes with their docstrings, and the documented
+/// methods of its classes, named after them.
+fn python_sections(text: &str, module: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let first = lines.iter().position(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
+    if let Some(doc) = first.and_then(|at| docstring(&lines[at..])) {
+        sections.push(Section { title: module.to_string(), text: doc });
+    }
+    let mut class: Option<String> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim_start();
+        let top = item.len() == line.len();
+        if top && !item.is_empty() && !item.starts_with('#') && !item.starts_with('@') {
+            class = None;
+        }
+        let Some(name) = py_defined(item) else { continue };
+        if name.starts_with('_') && name != "__init__" {
+            continue;
+        }
+        // Its body's first line, past a signature over several lines.
+        let end = (i..lines.len().min(i + SIGNATURE_LINES)).find(|j| lines[*j].trim_end().ends_with(':')).unwrap_or(i);
+        let signature = lines[i..=end].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ").trim_end_matches(':').to_string();
+        let doc = docstring(&lines[end + 1..]);
+        let indent = line.len() - item.len();
+        match (&class, indent) {
+            (_, 0) => {
+                if item.starts_with("class ") {
+                    class = Some(name.clone());
+                }
+                let text = doc.map_or(format!("`{signature}`"), |d| format!("`{signature}`\n\n{d}"));
+                sections.push(Section { title: name, text });
+            }
+            (Some(class), 1..=4) if doc.is_some() => {
+                sections.push(Section { title: format!("{class}.{name}"), text: format!("`{signature}`\n\n{}", doc.unwrap_or_default()) });
+            }
+            _ => {}
+        }
+    }
+    sections
+}
+
+/// The name a `def` or `class` line defines.
+fn py_defined(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("async ").unwrap_or(line);
+    let rest = rest.strip_prefix("def ").or_else(|| rest.strip_prefix("class "))?;
+    let name = ident(rest);
+    (!name.is_empty()).then_some(name)
+}
+
+/// The docstring `lines` start with, past blank lines, unindented.
+fn docstring(lines: &[&str]) -> Option<String> {
+    let at = lines.iter().position(|l| !l.trim().is_empty())?;
+    let first = lines[at].trim();
+    let first = first.trim_start_matches(['r', 'u', 'R', 'U']);
+    let quote = ["\"\"\"", "'''"].into_iter().find(|q| first.starts_with(q))?;
+    let rest = &first[3..];
+    if let Some((doc, _)) = rest.split_once(quote) {
+        return clean(&[doc.to_string()]);
+    }
+    let mut doc = vec![rest.to_string()];
+    for line in &lines[at + 1..] {
+        if let Some((last, _)) = line.split_once(quote) {
+            doc.push(last.to_string());
+            break;
+        }
+        doc.push(line.to_string());
+    }
+    // Indented as the code is: as much as its least indented line.
+    let indent = doc[1..].iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let doc: Vec<String> = doc.iter().enumerate().map(|(i, l)| if i == 0 { l.clone() } else { l.get(indent..).unwrap_or("").to_string() }).collect();
+    clean(&doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +721,59 @@ mod tests {
         write(&modules.join("@types/scope__lib/index.d.ts"), "export type Id = string;\n");
         assert!(!untyped(root.path(), &dep("@scope/lib")));
         assert!(!untyped(root.path(), &dep("missing")));
+    }
+
+    #[test]
+    fn a_python_package_s_api_is_its_docstrings() {
+        let venv = tempfile::tempdir().unwrap();
+        let site = venv.path().join(".venv/lib/python3.12/site-packages");
+        write(&site.join("Beautiful_Soup-4.12.0.dist-info/top_level.txt"), "bs4\n");
+        let init = [
+            "\"\"\"Beautiful Soup parses HTML.\"\"\"",
+            "",
+            "import re",
+            "",
+            "class BeautifulSoup(Tag):",
+            "    \"\"\"A document.",
+            "",
+            "    Parse it:",
+            "        soup = BeautifulSoup(html)",
+            "    \"\"\"",
+            "",
+            "    def find_all(self, name=None,",
+            "                 limit=None):",
+            "        \"\"\"Every tag named `name`.\"\"\"",
+            "        pass",
+            "",
+            "    def undocumented(self):",
+            "        pass",
+            "",
+            "    def _private(self):",
+            "        \"\"\"Hidden.\"\"\"",
+            "",
+            "def _helper():",
+            "    pass",
+            "",
+            "async def fetch(url: str) -> str:",
+            "    ...",
+            "",
+            "from ._api import get",
+        ];
+        write(&site.join("bs4/__init__.py"), &init.join("\n"));
+        write(&site.join("bs4/_internal.py"), "def hidden():\n    pass\n");
+        write(&site.join("bs4/_api.py"), "def get(url):\n    \"\"\"Fetch it.\"\"\"\n");
+        write(&site.join("bs4/element.py"), "def text(): ...\n");
+        write(&site.join("bs4/element.pyi"), "def text() -> str:\n    \"\"\"The text, typed.\"\"\"\n");
+        let site = site_packages(venv.path()).unwrap();
+        let sections = python(&site, "beautiful-soup").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        // A private module its `__init__` imports from is read; not others.
+        assert_eq!(titles, ["bs4", "BeautifulSoup", "BeautifulSoup.find_all", "fetch", "get", "text"]);
+        assert_eq!(sections[1].text, "`class BeautifulSoup(Tag)`\n\nA document.\n\nParse it:\n    soup = BeautifulSoup(html)");
+        assert_eq!(sections[2].text, "`def find_all(self, name=None, limit=None)`\n\nEvery tag named `name`.");
+        assert_eq!(sections[3].text, "`async def fetch(url: str) -> str`");
+        assert_eq!(sections[5].text, "`def text() -> str`\n\nThe text, typed.");
+        assert_eq!(python(&site, "requests"), None);
     }
 
     #[test]
