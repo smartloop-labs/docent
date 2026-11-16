@@ -1987,12 +1987,54 @@ fn each_file(written: &[String]) -> Option<String> {
     (!checks.is_empty()).then(|| checks.join(" && "))
 }
 
-/// Whether the package.json at `root` has a `build` script.
-fn build_script(root: &Path) -> bool {
+/// The command that runs `root`'s tests once a change builds, for the
+/// post-run skill: its end-to-end tests when it has some, else all of them;
+/// none when it has no tests to run.
+pub fn test_command(root: &Path, kind: Option<&str>) -> Option<String> {
+    let scripts = package_scripts(root);
+    if let Some(name) = ["test:e2e", "e2e"].into_iter().find(|name| scripts[*name].is_string()) {
+        return Some(format!("npm run --silent {name}"));
+    }
+    if let Some(target) = make_target(root, &["e2e", "test-e2e"]) {
+        return Some(format!("make {target}"));
+    }
+    match kind {
+        Some("Rust") => Some("cargo test --quiet".to_string()),
+        Some("Go") => Some("go test ./...".to_string()),
+        Some("Elixir") => Some("mix test".to_string()),
+        Some("Swift") => Some("swift test".to_string()),
+        // `npm init`'s placeholder only fails.
+        Some("JavaScript/TypeScript") => scripts["test"]
+            .as_str()
+            .filter(|script| !script.contains("no test specified"))
+            .map(|_| "npm test --silent".to_string()),
+        Some("Python") => ["pytest.ini", "conftest.py", "tests"]
+            .iter()
+            .any(|name| root.join(name).exists())
+            .then(|| "python3 -m pytest -q".to_string()),
+        Some("Java") => Some("mvn -q test".to_string()),
+        Some("Java/Kotlin" | "Kotlin") => root.join("gradlew").is_file().then(|| "./gradlew -q test".to_string()),
+        _ => None,
+    }
+}
+
+/// `root`'s `package.json` scripts; null when there are none.
+fn package_scripts(root: &Path) -> serde_json::Value {
     fs::read_to_string(root.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .is_some_and(|pkg| pkg["scripts"]["build"].is_string())
+        .map_or(serde_json::Value::Null, |pkg| pkg["scripts"].clone())
+}
+
+/// The first of `targets` that `root`'s Makefile has.
+fn make_target<'a>(root: &Path, targets: &[&'a str]) -> Option<&'a str> {
+    let makefile = fs::read_to_string(root.join("Makefile")).ok()?;
+    targets.iter().copied().find(|target| makefile.lines().any(|line| line.starts_with(&format!("{target}:"))))
+}
+
+/// Whether the package.json at `root` has a `build` script.
+fn build_script(root: &Path) -> bool {
+    package_scripts(root)["build"].is_string()
 }
 
 #[cfg(test)]
@@ -2771,5 +2813,26 @@ mod tests {
         assert!(wants_memory("from now on use tabs"));
         assert!(wants_memory("don't forget the changelog"));
         assert!(!wants_memory("why does the build fail?"));
+    }
+
+    #[test]
+    fn tests_run_end_to_end_first_and_only_when_there_are_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(test_command(root, Some("Rust")).as_deref(), Some("cargo test --quiet"));
+        assert_eq!(test_command(root, Some("Go")).as_deref(), Some("go test ./..."));
+        assert_eq!(test_command(root, Some("Python")), None);
+        assert_eq!(test_command(root, Some("C/C++")), None);
+        fs::create_dir(root.join("tests")).unwrap();
+        assert_eq!(test_command(root, Some("Python")).as_deref(), Some("python3 -m pytest -q"));
+        let package = |scripts: &str| fs::write(root.join("package.json"), format!("{{\"scripts\": {{{scripts}}}}}")).unwrap();
+        package(r#""test": "echo \"Error: no test specified\" && exit 1""#);
+        assert_eq!(test_command(root, Some("JavaScript/TypeScript")), None);
+        package(r#""test": "vitest run""#);
+        assert_eq!(test_command(root, Some("JavaScript/TypeScript")).as_deref(), Some("npm test --silent"));
+        fs::write(root.join("Makefile"), "build:\n\tcc main.c\ntest-e2e: build\n\t./e2e.sh\n").unwrap();
+        assert_eq!(test_command(root, Some("JavaScript/TypeScript")).as_deref(), Some("make test-e2e"));
+        package(r#""test": "vitest run", "test:e2e": "playwright test""#);
+        assert_eq!(test_command(root, Some("JavaScript/TypeScript")).as_deref(), Some("npm run --silent test:e2e"));
     }
 }

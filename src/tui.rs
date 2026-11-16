@@ -1374,6 +1374,10 @@ struct Check {
     /// Asked of the language servers, not run: the folder and the files,
     /// to check with the build once they're clean.
     servers: Option<(std::path::PathBuf, Vec<String>)>,
+    /// The project's folder, where its tests run once it builds.
+    root: std::path::PathBuf,
+    /// The project's tests, run by the post-run skill once it builds.
+    tests: bool,
 }
 
 /// What a check's end calls for, by its exit code and whether the round
@@ -1427,6 +1431,9 @@ const EDIT_SHOWN: usize = 40_000;
 /// Rounds of fixes for one prompt's failing check, before it's left to
 /// the user.
 const FIX_ROUNDS: u32 = 5;
+/// Of those, the rounds for failing tests: a test can want more than the
+/// code changed, and that's for the user to say.
+const TEST_ROUNDS: u32 = 3;
 
 /// The loop goes on as long as the errors are not fixed, round after round,
 /// and stops when the check's `output` is one it gave earlier in the turn,
@@ -1519,6 +1526,8 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// Of those, the rounds of fixing failed tests.
+    test_round: u32,
     /// The files the last reply wrote as it streamed, each with whether
     /// it made it and the lines added and removed: reported and checked
     /// with the rest once it's in.
@@ -1631,6 +1640,7 @@ impl App {
             jobs: Vec::new(),
             check: None,
             fix_round: 0,
+            test_round: 0,
             edit_round: 0,
             files_asked: false,
             manifest_asked: false,
@@ -2170,8 +2180,9 @@ impl App {
             self.lsp_runs += 1;
             let id = self.lsp_runs;
             let servers = Some((root.to_path_buf(), written.to_vec()));
-            self.check = Some(Check { id, project, command: "the language server".to_string(), servers });
             let (lsp, dir, written) = (self.lsp.clone(), root.to_path_buf(), written.to_vec());
+            let command = "the language server".to_string();
+            self.check = Some(Check { id, project, command, servers, root: dir.clone(), tests: false });
             self.spawn(move |_, tx| {
                 let (asked, problems) = lsp.errors(&dir, &written);
                 let _ = tx.send(AppEvent::Diagnostics(id, asked, problems));
@@ -2184,18 +2195,36 @@ impl App {
     /// Check that the project at `root` still builds after `written`
     /// changed, by its build command or each file's own.
     fn run_build_check(&mut self, root: &std::path::Path, written: &[String]) {
-        let Some((project, _)) = self.project.clone() else { return };
-        let Some(command) = files::check_command(root, code_kind(root), written) else { return };
-        let (id, report) = self.shell_entry(command.clone(), false);
-        self.check = Some(Check { id, project, command: command.clone(), servers: None });
-        if cfg!(test) {
-            return;
+        if let Some(command) = files::check_command(root, code_kind(root), written) {
+            self.run_check_command(root, command, false);
         }
-        let dir = root.to_path_buf();
-        self.spawn(move |_, tx| {
-            let (output, ended) = run_command(&command, Some(&dir), false, report);
-            let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
-        });
+    }
+
+    /// The checks passed, or none applied, for the files written in
+    /// `root`: the post-run skill runs the project's tests, if it has
+    /// any, and then the reply's commands run.
+    fn checks_passed(&mut self, root: &std::path::Path) {
+        let tests = files::test_command(root, code_kind(root));
+        if !tests.is_some_and(|command| self.run_check_command(root, command, true)) {
+            self.run_commands();
+        }
+    }
+
+    /// Run `command` in `root` as the check, the project's `tests` or its
+    /// build, in a shell entry of its own; whether it runs, as it needs a
+    /// project.
+    fn run_check_command(&mut self, root: &std::path::Path, command: String, tests: bool) -> bool {
+        let Some((project, _)) = self.project.clone() else { return false };
+        let (id, report) = self.shell_entry(command.clone(), false);
+        let root = root.to_path_buf();
+        self.check = Some(Check { id, project, command: command.clone(), servers: None, root: root.clone(), tests });
+        if !cfg!(test) {
+            self.spawn(move |_, tx| {
+                let (output, ended) = run_command(&command, Some(&root), false, report);
+                let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
+            });
+        }
+        true
     }
 
     /// A check ended: passed, it's said; failed, the agent is asked to fix
@@ -2224,8 +2253,7 @@ impl App {
                 self.entries.push(Entry::Notice(format!("{}: no errors in {}", check.command, files)));
                 self.run_build_check(&root, &written);
                 if self.check.is_none() {
-                    self.failures.clear();
-                    self.run_commands();
+                    self.checks_passed(&root);
                 }
             }
             return;
@@ -2240,9 +2268,10 @@ impl App {
         self.check_outcome(check, Some(1), output);
     }
 
-    /// What a check that ended with `code` and `output` calls for: passed,
-    /// the reply's commands; failed, a round of fixes, unless the last one
-    /// changed nothing.
+    /// What a check that ended with `code` and `output` calls for: a
+    /// build passed, the project's tests; they passed, the reply's
+    /// commands; failed, a round of fixes, unless the rounds go in circles
+    /// or have run out.
     fn check_outcome(&mut self, check: Check, code: Option<i32>, output: String) {
         // The project switched meanwhile: its errors aren't this one's.
         if self.project.as_ref().is_none_or(|(p, _)| *p != check.project) {
@@ -2250,20 +2279,36 @@ impl App {
             self.answer_ask(false, false);
             return;
         }
-        match after_check(code, &output, self.fix_round, &self.failures) {
+        // The failures seen are kept through a pass: tests that fail as
+        // they did before a build was fixed go round in circles too.
+        let outcome = match after_check(code, &output, self.fix_round, &self.failures) {
+            AfterCheck::Fix(_) if check.tests && self.test_round >= TEST_ROUNDS => AfterCheck::OutOfRounds,
+            outcome => outcome,
+        };
+        match outcome {
             AfterCheck::Passed => {
-                self.failures.clear();
                 let fixed = if self.fix_round > 0 { format!(" after {} fix(es)", self.fix_round) } else { String::new() };
                 self.entries.push(Entry::Notice(format!("{} passed{}", check.command, fixed)));
-                self.run_commands();
+                if check.tests {
+                    self.run_commands();
+                } else {
+                    self.checks_passed(&check.root);
+                }
             }
             AfterCheck::Fix(round) => {
                 self.fix_round = round;
+                if check.tests {
+                    self.test_round += 1;
+                }
                 self.failures.push(output.clone());
                 self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", round)));
-                let shown = format!("Fix the errors from `{}`", check.command);
+                let shown = match check.tests {
+                    true => format!("Fix the failing tests from `{}`", check.command),
+                    false => format!("Fix the errors from `{}`", check.command),
+                };
                 let what = match check.servers {
                     Some(_) => format!("The language server ({}) reports these errors in the files after your change", check.command),
+                    None if check.tests => format!("Your change builds, but I ran the tests with `{}` and they failed", check.command),
                     None => format!("I ran `{}` in the project after your change; it failed", check.command),
                 };
                 let message = format!(
@@ -2275,9 +2320,9 @@ impl App {
             }
             outcome @ (AfterCheck::Stalled | AfterCheck::OutOfRounds) => {
                 self.failures.clear();
-                let how = if outcome == AfterCheck::Stalled { "with errors it gave before" } else { "still" };
+                let how = if outcome == AfterCheck::Stalled { "fails with errors it gave before" } else { "still fails" };
                 self.entries.push(Entry::Warning(format!(
-                    "{} fails {} after {} fix(es); the errors are above",
+                    "{} {} after {} fix(es); the errors are above",
                     check.command,
                     how,
                     self.fix_round
@@ -2367,14 +2412,17 @@ impl App {
         }
         if !written.is_empty() {
             self.run_check(&root, &written);
-        } else if self.fix_round > 0 && !runs {
-            // A fix that's a command to run may yet change them: said only
-            // of one that's neither.
+            if self.check.is_none() {
+                self.checks_passed(&root);
+            }
+            return;
+        }
+        // A fix that's a command to run may yet change them: said only of
+        // one that's neither.
+        if self.fix_round > 0 && !runs {
             self.entries.push(Entry::Warning("The fix changed no file, so the errors stand; see them above".to_string()));
         }
-        if self.check.is_none() {
-            self.run_commands();
-        }
+        self.run_commands();
     }
 
     /// Ask the agent for the `manifest` the `lang` files it `wrote` need.
@@ -4144,6 +4192,7 @@ impl App {
         }
         let making = self.making(&input);
         self.fix_round = 0;
+        self.test_round = 0;
         self.edit_round = 0;
         self.files_asked = false;
         self.manifest_asked = false;
@@ -7539,6 +7588,10 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet"));
         let id = check.id;
         app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
+        // It builds: the tests, and then the question.
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo test --quiet"));
+        let id = app.check.as_ref().expect("the tests run").id;
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
         assert!(matches!(app.entries.last(), Some(Entry::Ask(_, c)) if c == &["git commit -am \"main\""]));
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Tab);
@@ -7685,11 +7738,43 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet" && s.ended.is_none()));
         let id = check.id;
         app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
-        assert!(app.check.is_none());
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "cargo check --quiet passed"), "{:?}", app.entries.len());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "cargo check --quiet passed")));
+        // It builds, so its tests run.
+        let tests = app.check.as_ref().expect("the tests run");
+        assert!(tests.tests && tests.command == "cargo test --quiet");
+        let tests = tests.id;
         // A stale result, from a check since replaced, is dropped.
         app.apply(AppEvent::Check(id, "late".into(), Ended::Exited(1)));
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(_))));
+        assert!(app.check.is_some() && app.fix_round == 0);
+        app.apply(AppEvent::Check(tests, String::new(), Ended::Exited(0)));
+        assert!(app.check.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "cargo test --quiet passed"));
+    }
+
+    #[test]
+    fn failing_tests_are_fixed_for_a_few_rounds_then_left_to_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let tests_fail = |app: &mut App, output: &str| {
+            app.stop_turn();
+            app.checks_passed(dir.path());
+            let id = app.check.as_ref().expect("the tests run").id;
+            app.apply(AppEvent::Check(id, output.into(), Ended::Exited(101)));
+        };
+        tests_fail(&mut app, "test a ... FAILED");
+        assert_eq!((app.fix_round, app.test_round), (1, 1));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Fix the failing tests from `cargo test --quiet`")));
+        tests_fail(&mut app, "test b ... FAILED");
+        tests_fail(&mut app, "test c ... FAILED");
+        assert_eq!(app.test_round, TEST_ROUNDS);
+        tests_fail(&mut app, "test d ... FAILED");
+        assert_eq!(app.fix_round, TEST_ROUNDS, "no fourth round");
+        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("cargo test --quiet still fails after 3 fix(es)")));
     }
 
     #[test]
@@ -7953,7 +8038,8 @@ mod tests {
         app.project = Some(("p1".into(), "app".into()));
         let asked = |app: &mut App, id: usize| {
             let servers = Some((dir.path().to_path_buf(), vec!["main.c".to_string()]));
-            app.check = Some(Check { id, project: "p1".into(), command: "the language server".into(), servers });
+            let root = dir.path().to_path_buf();
+            app.check = Some(Check { id, project: "p1".into(), command: "the language server".into(), servers, root, tests: false });
         };
         // Errors: shown, and sent to be fixed.
         asked(&mut app, 1);
@@ -8131,8 +8217,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
         assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "  updated main.rs (+1 −1)")));
-        // Checked first in a code folder, then the commands are asked about.
-        if let Some(check) = app.check.as_ref().map(|c| c.id) {
+        // Checked first in a code folder, and tested, then the commands are
+        // asked about.
+        while let Some(check) = app.check.as_ref().map(|c| c.id) {
             app.apply(AppEvent::Check(check, String::new(), Ended::Exited(0)));
         }
         assert!(app.ask.is_some());
