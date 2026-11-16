@@ -2,7 +2,7 @@
 
 The private coding agent for your terminal. Frontier quality, local first.
 
-Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. Before it writes, it looks up the current API of the libraries the change uses. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd), your build and your tests, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent. What you ask it to remember, it keeps for the project.
+Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. Before it writes, it reads the current API of the libraries the change uses from their installed packages. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd), your build and your tests, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent. What you ask it to remember, it keeps for the project.
 
 It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
@@ -309,15 +309,20 @@ What happens on each prompt:
    the machine (OS and version, shell, the package managers and toolchains on
    `PATH`, active virtualenvs), so commands use `apt-get` on Ubuntu and `brew`
    on a Mac. It's also told what you asked it to remember here (see below).
-2. **It looks up the current API.** With web search on (`Ctrl+S`), the
-   libraries the prompt names, or if it names none, those the files it's
-   about use (three at most,
-   at the versions your lockfile pins) are searched on the web first, and
-   their API reference goes to the agent with the prompt, so it doesn't
-   write against an API it remembers from an older version. Each is kept in
-   `.docent/cache/` for a week, which has a `.gitignore` of its own, so the
-   next prompts don't search again; with search off, only those kept are
-   told. `Esc` stops the lookup.
+2. **It reads the current API.** The libraries the prompt names (three at
+   most), or if it names none, the one whose package name has a word of the
+   prompt in it that best fits what it asks ("yaml" for `js-yaml`, "MUI"
+   for `@mui/material`), at the versions your lockfile pins, have their
+   API read from the packages
+   installed for the project: a crate's source in cargo's registry,
+   `node_modules`' type declarations, the project's virtualenv, Go's module
+   cache, or a Maven or Gradle jar. The parts the prompt uses
+   go to the agent with it, so it doesn't write against an API it remembers
+   from an older version. It's offline and costs nothing; a library that
+   isn't installed yet goes without (building the project installs it), and
+   with web search on (`Ctrl+S`) the agent can look it up itself. Each is
+   kept in `.docent/cache/api/` as markdown you can read, which has a
+   `.gitignore` of its own, so it's read once a version. `Esc` stops it.
 3. **You see diffs as they stream in.** Each file shows as numbered hunks,
    additions in green and removals in red. Then it's written into the folder.
 4. **It checks the build and fixes it.** It runs a fast check for the kind of
