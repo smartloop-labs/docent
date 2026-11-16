@@ -25,7 +25,6 @@ const SIGNATURE_LINES: usize = 8;
 
 /// `dep`'s API, from the package installed for `root`, a project of
 /// `kind`; `None` when it isn't installed, or documents nothing.
-#[allow(dead_code)] // The pre-run lookup reads it next.
 pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
     match kind {
         "Rust" => {
@@ -34,6 +33,14 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
         }
         _ => None,
     }
+}
+
+/// Whether `dep`, of a project of `kind`, can be read at all: a crate, a
+/// Go module or a jar is installed by the version it's locked at, so one
+/// with none isn't, while a package in the project's own `node_modules` or
+/// virtualenv is whatever version that holds.
+pub fn readable(kind: &str, dep: &Dep) -> bool {
+    dep.version.is_some() || !matches!(kind, "Rust" | "Go" | "Java" | "Java/Kotlin" | "Kotlin")
 }
 
 /// The user's home folder.
@@ -299,6 +306,14 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_library_locked_at_no_version_is_only_read_where_its_installed_for_the_project() {
+        let unlocked = Dep { name: "regex".into(), version: None };
+        assert!(!readable("Rust", &unlocked) && !readable("Go", &unlocked) && !readable("Java", &unlocked));
+        assert!(readable("Python", &unlocked) && readable("JavaScript/TypeScript", &unlocked));
+        assert!(readable("Rust", &Dep { version: Some("1.13.1".into()), ..unlocked }));
     }
 
     #[test]

@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, lsp, mcp, prerun, skills};
+use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -1180,15 +1180,26 @@ struct Sent {
     web_search: bool,
 }
 
-/// A turn held for the pre-run skill to look up the `deps` it uses, and
-/// what it `found`.
+/// What the pre-run skill looks up for a turn: the `deps` its `prompt`,
+/// as typed, names, or `guessed` of a scope it names.
+struct Lookup {
+    deps: Vec<prerun::Dep>,
+    guessed: bool,
+    prompt: String,
+}
+
+/// A turn held for the pre-run skill to read the API of the `deps` it
+/// uses, `guessed` of a scope its prompt names, and what it `found`;
+/// `waited` on when they were read in the background.
 struct PreRun {
     id: usize,
     project: String,
     sent: Sent,
     files: Vec<Attachment>,
     deps: Vec<prerun::Dep>,
-    found: Vec<(prerun::Dep, String)>,
+    guessed: bool,
+    found: Vec<prerun::Api>,
+    waited: bool,
 }
 
 /// A turn's native tool calling: the reply asks for `bash` calls, they run
@@ -1585,6 +1596,9 @@ struct App {
     pre_run: Option<usize>,
     /// Lookups started, for their ids.
     pre_runs: usize,
+    /// Libraries the pre-run skill found no installed package of, said
+    /// once a session.
+    not_installed: Vec<prerun::Dep>,
     /// The current API the pre-run skill found for the user's prompt, told
     /// in its every round.
     reference: Option<String>,
@@ -1678,6 +1692,7 @@ impl App {
             look_up: false,
             pre_run: None,
             pre_runs: 0,
+            not_installed: Vec::new(),
             reference: None,
             failures: Vec::new(),
             hint_at: 0,
@@ -1903,14 +1918,18 @@ impl App {
         // user's message in its prompt and reads what's around it as data,
         // and a small model then describes files instead of giving them.
         let mut system = None;
-        let mut deps = Vec::new();
+        let (mut deps, mut guessed) = (Vec::new(), false);
+        let mut kind = "";
         if let Some(root) = &files_dir {
             let context = match code_kind(root) {
-                Some(kind) => {
+                Some(project_kind) => {
+                    kind = project_kind;
                     // The pre-run skill looks up the libraries the user's
-                    // prompt names.
+                    // prompt names, as typed, not with the output of
+                    // commands run since, which names libraries it doesn't
+                    // use.
                     let libraries = if std::mem::take(&mut self.look_up) { prerun::dependencies(root, kind) } else { Vec::new() };
-                    deps = prerun::relevant(&libraries, &message, &[]);
+                    (deps, guessed) = prerun::relevant(&libraries, &shown);
                     format!("{}\n\n", files::project_brief(root, kind))
                 }
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
@@ -1945,7 +1964,7 @@ impl App {
         // model and decides whether to search the web, for coding as for
         // anything else. Docent is the harness around its answer.
         let cwd = files_dir.clone().or_else(|| chat::turn_dir(&project));
-        self.entries.push(Entry::User(shown));
+        self.entries.push(Entry::User(shown.clone()));
         if making && files_dir.is_none() {
             let warning = match docent::folder(&project) {
                 Some(folder) => format!(
@@ -1962,7 +1981,8 @@ impl App {
         if deps.is_empty() {
             return self.start_sent(project, sent, files);
         }
-        self.pre_run(project, sent, files, deps);
+        let lookup = Lookup { deps, guessed, prompt: shown };
+        self.pre_run(project, sent, files, lookup, kind);
     }
 
     /// Start the turn `sent`, its tool rounds from none.
@@ -1973,49 +1993,68 @@ impl App {
         self.start_turn(project, sent, files, Vec::new());
     }
 
-    /// The pre-run skill: the current API of the `deps` the turn `sent`
-    /// uses, told to the agent with it. Those kept from an earlier turn are
-    /// told straight away; with web search on, the rest are searched for
-    /// while the turn waits.
-    fn pre_run(&mut self, project: String, sent: Sent, files: Vec<Attachment>, deps: Vec<prerun::Dep>) {
+    /// The pre-run skill: the current API of the libraries the turn `sent`
+    /// uses, by its `lookup`, told to the agent with it. Those kept from an
+    /// earlier turn are told straight away; the rest are read from the
+    /// packages installed for the project, a `kind` of it, and a guess
+    /// weighed, while the turn waits.
+    fn pre_run(&mut self, project: String, sent: Sent, files: Vec<Attachment>, lookup: Lookup, kind: &str) {
+        let Lookup { deps, guessed, prompt } = lookup;
         let Some(root) = sent.files_dir.clone() else { return self.start_sent(project, sent, files) };
         self.pre_runs += 1;
         let id = self.pre_runs;
-        let kept = prerun::look_up(&self.client, &root, &deps, false);
-        let missing: Vec<prerun::Dep> = deps.into_iter().filter(|d| !kept.iter().any(|(k, _)| k == d)).collect();
-        if missing.is_empty() || self.web_search != Some(true) || cfg!(test) {
-            return self.pre_run_done(PreRun { id, project, sent, files, deps: Vec::new(), found: kept });
+        // Those not kept are read, if they can be: one not locked yet isn't
+        // installed either, and is said so without a read.
+        let (deps, unread): (Vec<prerun::Dep>, Vec<prerun::Dep>) =
+            deps.into_iter().partition(|d| prerun::kept(&root, d) || apidocs::readable(kind, d));
+        let missing: Vec<prerun::Dep> = deps.iter().filter(|d| !prerun::kept(&root, d)).cloned().collect();
+        let said = [missing.clone(), unread].concat();
+        // A few named and kept are told straight away; scoring the many a
+        // guess weighs is too long a wait at the prompt, so it's done with
+        // any reading, in the background.
+        if (missing.is_empty() && !guessed) || cfg!(test) {
+            let found = prerun::look_up(&root, kind, &deps, &prompt, false);
+            return self.pre_run_done(PreRun { id, project, sent, files, deps: said, guessed, found, waited: false });
         }
-        let names: Vec<String> = missing.iter().map(|d| d.to_string()).collect();
-        self.entries.push(Entry::Notice(format!("Looking up the current API of {} (esc stops)", names.join(", "))));
+        if !missing.is_empty() {
+            let names: Vec<String> = missing.iter().map(|d| d.to_string()).collect();
+            let from = if names.len() == 1 { "its installed package" } else { "their installed packages" };
+            self.entries.push(Entry::Notice(format!("Reading the API of {} from {from} (esc stops)", names.join(", "))));
+        }
         self.pre_run = Some(id);
-        self.spawn(move |client, tx| {
-            let mut found = kept;
-            found.extend(prerun::look_up(&client, &root, &missing, true));
-            let _ = tx.send(AppEvent::PreRun(Box::new(PreRun { id, project, sent, files, deps: missing, found })));
+        let kind = kind.to_string();
+        self.spawn(move |_, tx| {
+            let found = prerun::look_up(&root, &kind, &deps, &prompt, true);
+            let _ = tx.send(AppEvent::PreRun(Box::new(PreRun { id, project, sent, files, deps: said, guessed, found, waited: true })));
         });
     }
 
     /// A pre-run lookup's end: what it found goes with the turn, which
     /// starts, unless it was stopped or the project changed meanwhile.
-    /// Those `deps` searched for and not found are said.
+    /// Those `deps` read for and not installed are said, once a session.
     fn pre_run_done(&mut self, done: PreRun) {
-        let PreRun { id, project, mut sent, files, deps, found } = done;
-        // One searched for in the background is waited on, unless it was
-        // stopped since; one only read from the cache never was.
-        if self.pre_run.take_if(|p| *p == id).is_none() && !deps.is_empty() {
+        let PreRun { id, project, mut sent, files, deps, guessed, found, waited } = done;
+        // One read in the background is waited on, unless it was stopped
+        // since; one only read from the cache never was.
+        if waited && self.pre_run.take_if(|p| *p == id).is_none() {
             return;
         }
         if self.project.as_ref().is_none_or(|(p, _)| *p != project) {
             return;
         }
-        let missed: Vec<String> =
-            deps.iter().filter(|d| !found.iter().any(|(f, _)| f == *d)).map(|d| d.to_string()).collect();
+        let missed: Vec<prerun::Dep> =
+            deps.into_iter().filter(|d| !found.iter().any(|f| f.dep == *d) && !self.not_installed.contains(d)).collect();
         if !missed.is_empty() {
-            self.entries.push(Entry::Notice(format!("No current API found for {}; going on without it", missed.join(", "))));
+            let names: Vec<String> = missed.iter().map(|d| d.to_string()).collect();
+            self.entries.push(Entry::Notice(format!(
+                "{} isn't installed here, so the agent goes without its API; build the project to give it",
+                names.join(", ")
+            )));
+            self.not_installed.extend(missed);
         }
+        let found = if guessed { prerun::guess(found) } else { found };
         if !found.is_empty() {
-            let names: Vec<String> = found.iter().map(|(d, _)| d.to_string()).collect();
+            let names: Vec<String> = found.iter().map(|f| f.dep.to_string()).collect();
             self.entries.push(Entry::Notice(format!("Using the current API of {}", names.join(", "))));
         }
         self.reference = prerun::reference(&found);
@@ -2850,7 +2889,7 @@ impl App {
         self.commands = None;
         self.tooling = None;
         if self.pre_run.take().is_some() {
-            self.entries.push(Entry::Notice("Stopped looking up the API; the prompt wasn't sent".to_string()));
+            self.entries.push(Entry::Notice("Stopped reading the API; the prompt wasn't sent".to_string()));
         }
         if let Some(turn) = self.turn.take() {
             turn.task.abort();
@@ -7846,12 +7885,21 @@ mod tests {
             files_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let found = vec![(serde.clone(), "derive(Serialize)".to_string())];
+        let found = vec![prerun::Api { dep: serde.clone(), told: "derive(Serialize)".into(), fit: 0.0 }];
         // A lookup since stopped is dropped, and its turn with it.
         app.pre_run = Some(1);
         app.stop_turn();
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Stopped looking up")));
-        let done = |id, found| PreRun { id, project: "p1".into(), sent: sent(), files: Vec::new(), deps: vec![serde.clone()], found };
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Stopped reading")));
+        let done = |id, found| PreRun {
+            id,
+            project: "p1".into(),
+            sent: sent(),
+            files: Vec::new(),
+            deps: vec![serde.clone()],
+            guessed: false,
+            found,
+            waited: true,
+        };
         app.apply(AppEvent::PreRun(Box::new(done(1, found.clone()))));
         assert!(app.turn.is_none() && app.reference.is_none());
         // One waited on: what it found goes in the system message, and is
@@ -7868,19 +7916,41 @@ mod tests {
         app.stop_turn();
         app.pre_run = Some(3);
         app.apply(AppEvent::PreRun(Box::new(done(3, Vec::new()))));
-        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "No current API found for serde 1.0.219; going on without it")));
+        let not_installed = |e: &Entry| matches!(e, Entry::Notice(n) if n.starts_with("serde 1.0.219 isn't installed here"));
+        assert_eq!(app.entries.iter().filter(|e| not_installed(e)).count(), 1);
         assert!(app.turn.is_some() && app.reference.is_none());
+        // Said once a session.
+        app.stop_turn();
+        app.pre_run = Some(4);
+        app.apply(AppEvent::PreRun(Box::new(done(4, Vec::new()))));
+        assert_eq!(app.entries.iter().filter(|e| not_installed(e)).count(), 1);
         // One kept from an earlier turn goes straight away, not looked up.
         app.stop_turn();
         let api = dir.path().join(".docent/cache/api");
         std::fs::create_dir_all(&api).unwrap();
-        std::fs::write(api.join("serde@1.0.219.md"), "derive(Deserialize)").unwrap();
-        app.web_search = Some(true);
+        std::fs::write(api.join("serde@1.0.219.md"), "<!-- section: serde -->\nderive(Deserialize)\n").unwrap();
         let told = app.entries.len();
-        app.pre_run("p1".into(), sent(), Vec::new(), vec![serde.clone()]);
+        let lookup = |deps, guessed, prompt: &str| Lookup { deps, guessed, prompt: prompt.into() };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![serde.clone()], false, "derive"), "Rust");
         assert!(app.turn.is_some() && app.pre_run.is_none());
-        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Looking up"))));
-        assert!(app.reference.as_deref().is_some_and(|r| r.ends_with("derive(Deserialize)")));
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Reading"))));
+        assert!(app.reference.as_deref().is_some_and(|r| r.ends_with("### serde\n\nderive(Deserialize)")));
+        // Guessed by part of their names, only the one that fits the
+        // prompt best is told.
+        app.stop_turn();
+        std::fs::write(api.join("serde_json@1.0.0.md"), "<!-- section: serde_json -->\nJSON.\n<!-- section: to_string -->\nSerialize it to a string.\n").unwrap();
+        let json = prerun::Dep { name: "serde_json".into(), version: Some("1.0.0".into()) };
+        let told = app.entries.len();
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![serde.clone(), json], true, "write it to a string"), "Rust");
+        assert!(app.reference.as_deref().is_some_and(|r| r.contains("to_string") && !r.contains("derive(Deserialize)")));
+        let using: Vec<&Entry> = app.entries[told..].iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("Using"))).collect();
+        assert!(matches!(using[..], [Entry::Notice(n)] if n == "Using the current API of serde_json 1.0.0"), "{:?}", using.len());
+        // One not locked yet is said not to be installed, by name alone.
+        app.stop_turn();
+        let regex = prerun::Dep { name: "regex".into(), version: None };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![regex], false, ""), "Rust");
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n.contains("regex") && !n.contains("regex 1")));
     }
 
     #[test]

@@ -3,18 +3,29 @@
 //! the project builds with rather than the ones it remembers.
 //!
 //! The libraries are the project's dependencies, from its manifest, at the
-//! versions its lockfile pins, that the prompt names or the files the agent
-//! is shown use; a few at most. Each is searched on the web through the
-//! platform (a credit a search) and its top pages read as text, then kept
-//! in `.docent/cache/api/` for a week, so the next turns that use it don't
-//! search again. The cache is the project's own and never committed: it
-//! gets a `.gitignore` of its own when it's made.
+//! versions its lockfile pins, that the prompt names, a few at most; or
+//! when it names only a scope several are of, `mui` of `@mui/material`,
+//! the one of those that fits the prompt best, if any fits it well. Each
+//! one's API is read from the package installed for the project
+//! (`apidocs`), offline, and kept in `.docent/cache/api/` as markdown, so
+//! the next turns that use it don't read it again; of that, each turn is
+//! told the parts its prompt uses. The cache is the project's own and never committed: it gets a
+//! `.gitignore` of its own when it's made.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use reqwest::blocking::Client;
+use crate::apidocs::Section;
+
+/// The API of a `dep` a turn is `told`, and how well it `fit` the turn's
+/// prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Api {
+    pub dep: Dep,
+    pub told: String,
+    pub fit: f64,
+}
 
 /// A library the project depends on, at the version it builds with when
 /// that's known.
@@ -33,16 +44,18 @@ impl std::fmt::Display for Dep {
     }
 }
 
-/// Libraries looked up for one turn, at most: each is a search.
+/// Libraries looked up for one turn, at most.
 const LOOKED_UP: usize = 3;
-/// Pages read for each library.
-const PAGES: usize = 2;
-/// Characters of reference kept for each library.
+/// Libraries of a scope a prompt names that are looked up for the one
+/// that fits it, at most: only that one is told.
+const GUESSED: usize = 15;
+/// Characters of API told for each library.
 const KEPT: usize = 6_000;
-/// How long a library's reference is good for before it's searched again.
-const FRESH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// A search, or a page, that takes longer is given up on.
-const TIMEOUT: Duration = Duration::from_secs(15);
+/// A section told longer than this is cut, at a line's end.
+const SECTION: usize = 2_000;
+/// The fewest sections a library's fit is the mean over: one of only a
+/// few, which share a word or two with any prompt, is no fit for that.
+const FITTING: usize = 30;
 /// Where the references are kept, under the project's root.
 const CACHE: &str = ".docent/cache";
 
@@ -67,14 +80,11 @@ fn cargo(manifest: &str, lock: &str) -> Vec<Dep> {
             listing = matches!(line, "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]");
             continue;
         }
-        let Some((name, spec)) = line.split_once('=').filter(|_| listing) else { continue };
+        let Some((name, _)) = line.split_once('=').filter(|_| listing) else { continue };
         let name = name.trim().trim_matches('"').to_string();
-        // `"1.0"`, or `{ version = "1.0", … }`.
-        let wanted = match spec.trim() {
-            spec if spec.starts_with('"') => quoted(spec),
-            spec => spec.split_once("version").and_then(|(_, rest)| quoted(rest.trim_start_matches([' ', '=']))),
-        };
-        let version = locked(lock, &name).or(wanted);
+        // Not the manifest's `"1"`: a crate is installed, and read, at the
+        // version it's locked at, and one not locked yet isn't installed.
+        let version = locked(lock, &name);
         if !name.is_empty() && !deps.iter().any(|d: &Dep| d.name == name) {
             deps.push(Dep { name, version });
         }
@@ -187,24 +197,57 @@ fn python(requirements: &str, pyproject: &str) -> Vec<Dep> {
 }
 
 /// Of `deps`, those the turn uses: the ones the `prompt` names, or when
-/// it names none, those the files it's `shown` use, in their order. Every
-/// library a shown file imports isn't one the change needs, so they're
-/// only a guess. `LOOKED_UP` at most.
-pub fn relevant(deps: &[Dep], prompt: &str, shown: &[&str]) -> Vec<Dep> {
-    let named = used_in(deps, &[prompt]);
+/// it names none, those a word of it is part of the name of, as `yaml` of
+/// `js-yaml` and `mui` of `@mui/material`, and whether they're that guess:
+/// of a guess, only the one that fits the prompt is told, by `guess`.
+/// `LOOKED_UP` named at most, `GUESSED` guessed.
+pub fn relevant(deps: &[Dep], prompt: &str) -> (Vec<Dep>, bool) {
+    let named = used_in(deps, &[prompt], LOOKED_UP);
     if !named.is_empty() {
-        return named;
+        return (named, false);
     }
-    used_in(deps, shown)
+    let asked: HashSet<String> = prompt.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(|w| singular(w.to_string())).collect();
+    // Not `@types`' packages, which only type another.
+    let partly = deps
+        .iter()
+        .filter(|d| !d.name.starts_with("@types/") && name_parts(&d.name).iter().any(|part| asked.contains(part)))
+        .take(GUESSED)
+        .cloned()
+        .collect();
+    (partly, true)
 }
 
-/// Of `deps`, those `texts` use, in their order; `LOOKED_UP` at most.
-fn used_in(deps: &[Dep], texts: &[&str]) -> Vec<Dep> {
+/// Words of a package's name that say what it's for, `yaml` of `js-yaml`
+/// and `mui` and `material` of `@mui/material`: not a short one, nor one
+/// that names its language, host or kind rather than its use.
+fn name_parts(name: &str) -> Vec<String> {
+    const VAGUE: [&str; 16] = [
+        "api", "com", "core", "github", "gitlab", "golang", "google", "lib", "node", "org", "plugin", "rust", "sdk", "type", "util",
+        "utils",
+    ];
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|part| singular(part.to_string()))
+        .filter(|part| part.len() >= 3 && !part.chars().all(|c| c.is_ascii_digit()) && !VAGUE.contains(&part.as_str()))
+        .collect()
+}
+
+/// Of the APIs `found` for libraries a prompt only names part of, the one
+/// that fits it best, the first of those that fit it as well. Part of its
+/// name in the prompt is a strong sign already, so how well it fits picks
+/// between them rather than ruling one out: `js-yaml` for a prompt about
+/// yaml whose words its docs don't use.
+pub fn guess(found: Vec<Api>) -> Vec<Api> {
+    found.into_iter().rev().max_by(|a, b| a.fit.total_cmp(&b.fit)).into_iter().collect()
+}
+
+/// Of `deps`, those `texts` use, in their order; `most` at most.
+fn used_in(deps: &[Dep], texts: &[&str], most: usize) -> Vec<Dep> {
     let mut found: Vec<Dep> = Vec::new();
     for text in texts {
         let text = text.to_lowercase();
         for dep in deps {
-            if found.len() < LOOKED_UP && !found.contains(dep) && uses(&text, &dep.name.to_lowercase()) {
+            if found.len() < most && !found.contains(dep) && uses(&text, &dep.name.to_lowercase()) {
                 found.push(dep.clone());
             }
         }
@@ -225,23 +268,41 @@ fn uses(text: &str, name: &str) -> bool {
     })
 }
 
-/// Where `dep`'s reference is kept in `root`.
+/// Whether `dep`'s API is kept in `root`, read from its package before.
+pub fn kept(root: &Path, dep: &Dep) -> bool {
+    cached_at(root, dep).is_file()
+}
+
+/// Where `dep`'s API is kept in `root`.
 fn cached_at(root: &Path, dep: &Dep) -> PathBuf {
     let version = dep.version.as_deref().unwrap_or("latest");
     let file = format!("{}@{}.md", dep.name, version).replace(['/', '\\', ':'], "_");
     root.join(CACHE).join("api").join(file)
 }
 
-/// `dep`'s reference kept in `root`, while it's fresh.
-fn cached(root: &Path, dep: &Dep) -> Option<String> {
-    let path = cached_at(root, dep);
-    let age = fs::metadata(&path).ok()?.modified().ok()?.elapsed().ok()?;
-    (age < FRESH).then(|| fs::read_to_string(&path).ok()).flatten().filter(|text| !text.trim().is_empty())
+/// The line a kept section starts with, its title after it: a comment, as
+/// a library's docs have headings of their own.
+const MARK: &str = "<!-- section: ";
+
+/// `dep`'s API kept in `root`, read from its package before. A version's
+/// API doesn't change, so it's kept for good.
+fn cached(root: &Path, dep: &Dep) -> Option<Vec<Section>> {
+    let mut sections: Vec<Section> = Vec::new();
+    for line in fs::read_to_string(cached_at(root, dep)).ok()?.lines() {
+        if let Some(title) = line.strip_prefix(MARK).and_then(|l| l.strip_suffix(" -->")) {
+            sections.push(Section { title: title.to_string(), text: String::new() });
+        } else if let Some(section) = sections.last_mut() {
+            section.text.push_str(line);
+            section.text.push('\n');
+        }
+    }
+    sections.iter_mut().for_each(|s| s.text = s.text.trim().to_string());
+    (!sections.is_empty()).then_some(sections)
 }
 
-/// Keep `dep`'s `reference` in `root`, the cache made with a `.gitignore`
-/// of its own if need be, so it's never committed.
-fn keep(root: &Path, dep: &Dep, reference: &str) -> std::io::Result<()> {
+/// Keep `dep`'s API `sections` in `root`, as markdown to read, the cache
+/// made with a `.gitignore` of its own if need be, so it's never committed.
+fn keep(root: &Path, dep: &Dep, sections: &[Section]) -> std::io::Result<()> {
     let cache = root.join(CACHE);
     let path = cached_at(root, dep);
     if let Some(dir) = path.parent() {
@@ -251,139 +312,201 @@ fn keep(root: &Path, dep: &Dep, reference: &str) -> std::io::Result<()> {
     if !ignore.exists() {
         fs::write(ignore, "*\n")?;
     }
-    fs::write(path, reference)
+    let text: String = sections.iter().map(|s| format!("{MARK}{} -->\n{}\n\n", s.title, s.text)).collect();
+    fs::write(path, text)
 }
 
-/// The current API reference for each of `deps` in `root`: kept from an
-/// earlier turn, else, when `search` is on, searched for and read from the
-/// web, and kept. Those with none are left out.
-pub fn look_up(client: &Client, root: &Path, deps: &[Dep], search: bool) -> Vec<(Dep, String)> {
+/// The API of each of `deps` in `root`, a project of `kind`, the parts
+/// the `prompt` uses: kept from an earlier turn,
+/// else, when `read`, read from its installed package and kept. Those
+/// with none are left out.
+pub fn look_up(root: &Path, kind: &str, deps: &[Dep], prompt: &str, read: bool) -> Vec<Api> {
     deps.iter()
         .filter_map(|dep| {
-            if let Some(reference) = cached(root, dep) {
-                return Some((dep.clone(), reference));
-            }
-            if !search {
-                return None;
-            }
-            let reference = search_for(client, dep)?;
-            let _ = keep(root, dep, &reference);
-            Some((dep.clone(), reference))
+            let sections = match cached(root, dep) {
+                Some(sections) => sections,
+                None if read => {
+                    let sections = crate::apidocs::collect(root, kind, dep)?;
+                    let _ = keep(root, dep, &sections);
+                    sections
+                }
+                None => return None,
+            };
+            let (told, fit) = select(&sections, &dep.name, prompt);
+            Some(Api { dep: dep.clone(), told, fit })
         })
         .collect()
 }
 
-/// `dep`'s API reference from the web: its top pages, as text.
-fn search_for(client: &Client, dep: &Dep) -> Option<String> {
-    let query = format!("{dep} API reference documentation");
-    let count = PAGES.to_string();
-    let found = crate::usage::platform_get(client, "/v1/websearch", &[("q", &query), ("count", &count)], TIMEOUT)?;
-    // A list of URLs, or of results with one each.
-    let urls: Vec<String> = found
-        .as_array()
-        .or_else(|| found["results"].as_array())?
+/// Of a library's `sections`, what a `prompt` uses, `KEPT` at most: its
+/// top-level docs, then the sections with most of its words, a rare word
+/// counting for more than one most sections have, and one in a section's
+/// title for more than in its text; told in the library's order. With how
+/// well the library, `name`d, fits the prompt: the mean score of its
+/// sections, over `FITTING` at least.
+fn select(sections: &[Section], name: &str, prompt: &str) -> (String, f64) {
+    let parts: Vec<Section> = sections.iter().flat_map(split).collect();
+    // An item's own name is its title, not the type it's of, which every
+    // other method of that type has too: `opts` of `Command.opts`.
+    let titles: Vec<HashSet<String>> = parts.iter().map(|p| words(item(&p.title))).collect();
+    let texts: Vec<HashSet<String>> = parts.iter().map(|p| words(&format!("{}\n{}", p.title, p.text))).collect();
+    let named: HashSet<&String> = titles.iter().flatten().collect();
+    // Not the library's own name, or a word of it, which its docs have all
+    // over; and a word the API names things with as the end of one asked,
+    // `command` of `subcommand`, too.
+    let own = singular(name.rsplit(['/', ':']).next().unwrap_or(name).to_lowercase().replace(['-', '_'], ""));
+    let mut asked = words(prompt);
+    asked.remove(&own);
+    for part in name_parts(name) {
+        asked.remove(&part);
+    }
+    let ends: Vec<String> = asked.iter().filter_map(|w| ending(w, &named)).collect();
+    asked.extend(ends);
+    let rarity: HashMap<&String, f64> = asked
         .iter()
-        .filter_map(|r| r.as_str().or_else(|| r["url"].as_str()).map(str::to_string))
-        .take(PAGES)
+        .map(|word| {
+            let used = titles.iter().zip(&texts).filter(|(t, x)| t.contains(word) || x.contains(word)).count();
+            (word, (1.0 + parts.len() as f64 / used.max(1) as f64).ln())
+        })
         .collect();
-    let mut reference = String::new();
-    for url in urls {
-        let Some(page) = client.get(&url).timeout(TIMEOUT).send().ok().filter(|r| r.status().is_success()) else {
-            continue;
-        };
-        let text = text_of(&page.text().unwrap_or_default());
-        if !text.is_empty() {
-            reference.push_str(&format!("From {url}:\n{text}\n\n"));
+    let score = |i: usize| -> f64 {
+        let hits: f64 = rarity
+            .iter()
+            .map(|(word, rare)| match () {
+                _ if titles[i].contains(*word) => 3.0 * rare,
+                _ if texts[i].contains(*word) => *rare,
+                _ => 0.0,
+            })
+            .sum();
+        // A long section has more words by being long.
+        hits / (1.0 + parts[i].text.len() as f64 / SECTION as f64)
+    };
+    let fit = (0..parts.len()).map(score).sum::<f64>() / parts.len().max(FITTING) as f64;
+    let mut ranked: Vec<(usize, f64)> = (1..parts.len()).map(|i| (i, score(i))).filter(|(_, s)| *s > 0.0).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let told = |i: usize| format!("### {}\n\n{}", parts[i].title, cut(&parts[i].text, SECTION));
+    let mut chosen = vec![0];
+    let mut used = told(0).len();
+    for (i, _) in ranked {
+        let size = told(i).len() + 2;
+        if used + size <= KEPT {
+            chosen.push(i);
+            used += size;
         }
-        if reference.len() >= KEPT {
+    }
+    chosen.sort();
+    (chosen.into_iter().filter(|i| *i < parts.len()).map(told).collect::<Vec<_>>().join("\n\n"), fit)
+}
+
+/// A section's `title` without the type it's of: `opts` of `Command.opts`
+/// and of `Command::opts`, but `clap::_derive` whole.
+fn item(title: &str) -> &str {
+    match title.split_once("::").or_else(|| title.split_once('.')) {
+        Some((owner, name)) if owner.starts_with(char::is_uppercase) && !owner.contains(' ') => name,
+        _ => title,
+    }
+}
+
+/// The longest end of `word` that's a word of its own, `known`, four
+/// letters or more: `command` of `subcommand`.
+fn ending(word: &str, known: &HashSet<&String>) -> Option<String> {
+    (1..word.len().saturating_sub(3))
+        .filter(|at| word.is_char_boundary(*at))
+        .map(|at| &word[at..])
+        .find(|end| known.contains(&end.to_string()))
+        .map(str::to_string)
+}
+
+/// `section` in parts a turn can be told some of: a long one at each of
+/// its own headings, each part titled with the heading it's under.
+fn split(section: &Section) -> Vec<Section> {
+    if section.text.len() <= SECTION {
+        return vec![section.clone()];
+    }
+    let mut parts = vec![Section { title: section.title.clone(), text: String::new() }];
+    let mut fenced = false;
+    for line in section.text.lines() {
+        fenced ^= line.trim_start().starts_with("```");
+        if let Some(heading) = line.strip_prefix('#').filter(|_| !fenced).map(|h| h.trim_start_matches('#').trim()) {
+            parts.push(Section { title: format!("{} › {heading}", section.title), text: String::new() });
+        }
+        let part = parts.last_mut().expect("a part");
+        part.text.push_str(line);
+        part.text.push('\n');
+    }
+    parts.retain(|p| !p.text.trim().is_empty());
+    parts.iter_mut().for_each(|p| p.text = p.text.trim().to_string());
+    parts
+}
+
+/// The words of `text`, as code names things: lowercased, each name's
+/// parts too (`ArgAction` is `argaction`, `arg` and `action`; so is
+/// `arg_action`), three letters or more.
+fn words(text: &str) -> HashSet<String> {
+    let mut words = HashSet::new();
+    for name in text.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|n| !n.is_empty()) {
+        let mut part = String::new();
+        let mut parts = Vec::new();
+        for (i, c) in name.chars().enumerate() {
+            if c == '_' || (c.is_uppercase() && i > 0 && !part.chars().last().is_some_and(char::is_uppercase)) {
+                parts.push(std::mem::take(&mut part));
+            }
+            if c != '_' {
+                part.extend(c.to_lowercase());
+            }
+        }
+        parts.push(part);
+        parts.push(name.to_lowercase().replace('_', ""));
+        words.extend(parts.into_iter().filter(|p| p.chars().count() >= 3 && !ASKING.contains(&p.as_str())).map(singular));
+    }
+    words
+}
+
+/// Words a prompt asks with rather than about, in no API's terms.
+const ASKING: [&str; 22] = [
+    "add", "adds", "make", "makes", "use", "uses", "using", "with", "that", "this", "the", "and", "for", "from", "into",
+    "change", "update", "remove", "takes", "take", "please", "should",
+];
+
+/// `word` as one of a thing: `flags` as `flag`.
+fn singular(word: String) -> String {
+    match word.strip_suffix('s') {
+        Some(one) if one.len() >= 3 && !one.ends_with('s') => one.to_string(),
+        _ => word,
+    }
+}
+
+/// `text`'s lines up to `n` characters, said to go on when cut, with a
+/// code block it cuts into closed.
+fn cut(text: &str, n: usize) -> String {
+    if text.len() <= n {
+        return text.to_string();
+    }
+    let mut kept = String::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        if kept.len() + line.len() + 1 > n {
             break;
         }
+        fenced ^= line.trim_start().starts_with("```");
+        kept.push_str(line);
+        kept.push('\n');
     }
-    let reference = head(reference.trim(), KEPT);
-    (!reference.is_empty()).then_some(reference)
-}
-
-/// The first `n` characters of `text`.
-fn head(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
-}
-
-/// The most the reference for `n` of a project's libraries takes of the
-/// system message, `LOOKED_UP` of them at most: kept out of the budget
-/// for the project's files, so they and it fit the model's window.
-pub fn room(n: usize) -> usize {
-    match n.min(LOOKED_UP) {
-        0 => 0,
-        n => crate::skills::body(crate::skills::PRE_RUN).len() + n * (KEPT + HEADING),
+    if fenced {
+        kept.push_str("```\n");
     }
+    kept.push('…');
+    kept
 }
-
-/// A reference's heading for one library, its name and version, at most.
-const HEADING: usize = 100;
 
 /// What `found` adds to the agent's system message: the pre-run skill's
-/// text and each library's reference; nothing when nothing was found.
-pub fn reference(found: &[(Dep, String)]) -> Option<String> {
+/// text and each library's API; nothing when nothing was found.
+pub fn reference(found: &[Api]) -> Option<String> {
     if found.is_empty() {
         return None;
     }
-    let libraries: Vec<String> = found.iter().map(|(dep, text)| format!("## {dep}\n\n{text}")).collect();
+    let libraries: Vec<String> = found.iter().map(|api| format!("## {}\n\n{}", api.dep, api.told)).collect();
     Some(format!("{}\n\n{}", crate::skills::body(crate::skills::PRE_RUN), libraries.join("\n\n")))
-}
-
-/// Elements whose contents aren't the page's text.
-const SKIPPED: [&str; 8] = ["script", "style", "noscript", "svg", "nav", "header", "footer", "head"];
-/// Elements that start a line of their own.
-const BLOCKS: [&str; 17] =
-    ["p", "div", "br", "li", "tr", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "dt", "dd", "table"];
-
-/// The text of a web page `html`: its tags and scripts out, its entities
-/// decoded, a line for each block, and no blank runs.
-pub fn text_of(html: &str) -> String {
-    let lower = html.to_lowercase();
-    let mut text = String::new();
-    let mut at = 0;
-    while let Some(open) = html[at..].find('<').map(|i| at + i) {
-        text.push_str(&html[at..open]);
-        let Some(close) = html[open..].find('>').map(|i| open + i) else {
-            at = html.len();
-            break;
-        };
-        let tag = &lower[open + 1..close];
-        let closing = tag.starts_with('/');
-        let name: String = tag.trim_start_matches('/').chars().take_while(|c| c.is_alphanumeric()).collect();
-        at = close + 1;
-        if !closing && SKIPPED.contains(&name.as_str()) && !tag.ends_with('/') {
-            // On past its end tag, or the page's end without one.
-            at = lower[at..].find(&format!("</{name}")).map_or(html.len(), |i| {
-                let end = at + i;
-                lower[end..].find('>').map_or(html.len(), |j| end + j + 1)
-            });
-        } else if BLOCKS.contains(&name.as_str()) {
-            text.push('\n');
-        }
-    }
-    text.push_str(&html[at..]);
-    let text = decode(&text);
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !line.is_empty() {
-            lines.push(line);
-        }
-    }
-    lines.join("\n")
-}
-
-/// `text` with the entities a page's text most often has decoded.
-fn decode(text: &str) -> String {
-    text.replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -400,11 +523,11 @@ mod tests {
         let lock = "[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n\n[[package]]\nname = \"tokio\"\nversion = \"1.53.1\"\n";
         assert_eq!(
             cargo(manifest, lock),
-            [dep("serde", Some("1.0.219")), dep("tokio", Some("1.53.1")), dep("tempfile", Some("3"))]
+            [dep("serde", Some("1.0.219")), dep("tokio", Some("1.53.1")), dep("tempfile", None)]
         );
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
-        assert_eq!(dependencies(dir.path(), "Rust")[1], dep("tokio", Some("1.40")), "no lockfile: the manifest's");
+        assert_eq!(dependencies(dir.path(), "Rust")[1], dep("tokio", None), "no lockfile: no version");
         // Locked at several versions: the one the project's own package uses.
         let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"base64 0.23.1\",\n \"serde\",\n]\n\n\
                     [[package]]\nname = \"base64\"\nversion = \"0.13.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
@@ -440,37 +563,54 @@ mod tests {
     }
 
     #[test]
-    fn looks_up_what_the_prompt_names_else_what_the_files_use() {
+    fn looks_up_what_the_prompt_names_else_what_it_names_part_of() {
+        let mui = [dep("@mui/material", None), dep("@mui/icons-material", None), dep("@types/react", None), dep("react", None)];
         let deps = [dep("serde", None), dep("serde-json", None), dep("tokio", None), dep("clap", None), dep("anyhow", None)];
-        let shown = ["use serde_json::Value;\nuse anyhow::Result;", "tokio::spawn(clap)"];
-        // Named in the prompt, it's the one, whatever the files use.
-        assert_eq!(relevant(&deps, "Add a --verbose flag with clap", &shown), [dep("clap", None)]);
-        // Named nowhere, what the files use, in their order.
-        assert_eq!(
-            relevant(&deps, "Add a --verbose flag", &shown),
-            [dep("serde-json", None), dep("anyhow", None), dep("tokio", None)]
-        );
+        // Named in the prompt, it's the one.
+        assert_eq!(relevant(&deps, "Add a --verbose flag with clap"), (vec![dep("clap", None)], false));
+        assert_eq!(relevant(&deps, "Read it with serde_json and anyhow"), (vec![dep("serde-json", None), dep("anyhow", None)], false));
+        // Named nowhere, none.
+        assert_eq!(relevant(&deps, "Add a --verbose flag"), (Vec::new(), true));
         // A name inside another word isn't its use.
-        assert!(relevant(&deps, "deserialize the clapping", &[]).is_empty());
-        // Room is kept for the reference of those that can be looked up.
-        assert_eq!(room(0), 0);
-        assert!(room(1) > KEPT && room(5) == room(LOOKED_UP));
+        assert!(relevant(&deps, "deserialize the clapping").0.is_empty());
+        // Part of its name named, those it's part of, as a guess; never
+        // `@types`', nor by a vague part.
+        assert_eq!(relevant(&mui, "use MUI's Snackbar"), (vec![dep("@mui/material", None), dep("@mui/icons-material", None)], true));
+        assert_eq!(relevant(&mui, "type the props"), (Vec::new(), true));
+        let studio = [dep("js-yaml", None), dep("@types/js-yaml", None), dep("crypto-js", None), dep("electron-store", None)];
+        assert_eq!(relevant(&studio, "make the theme yaml loading safe"), (vec![dep("js-yaml", None)], true));
+        assert_eq!(relevant(&studio, "keep the settings in the store"), (vec![dep("electron-store", None)], true));
+        assert_eq!(relevant(&studio, "add a js helper for the api"), (Vec::new(), true));
+        // Of a guess, only the one that fits the prompt best, the first of
+        // those that fit it as well.
+        let api = |name: &str, fit| Api { dep: dep(name, None), told: String::new(), fit };
+        assert_eq!(guess(vec![api("serde", 0.3), api("clap", 0.6), api("anyhow", 0.0)]), [api("clap", 0.6)]);
+        assert_eq!(guess(vec![api("serde", 0.0), api("clap", 0.0)]), [api("serde", 0.0)]);
+        assert!(guess(Vec::new()).is_empty());
+    }
+
+    fn section(title: &str, text: &str) -> Section {
+        Section { title: title.into(), text: text.into() }
     }
 
     #[test]
-    fn a_kept_reference_is_used_and_the_cache_is_never_committed() {
+    fn a_kept_api_is_used_and_the_cache_is_never_committed() {
         let dir = tempfile::tempdir().unwrap();
         let serde = dep("serde", Some("1.0.219"));
         assert_eq!(cached(dir.path(), &serde), None);
-        keep(dir.path(), &serde, "Serialize, Deserialize").unwrap();
+        let sections = [section("serde", "Serialization.\n\n## Derive\n\nUse it."), section("Serialize", "`pub trait Serialize`")];
+        keep(dir.path(), &serde, &sections).unwrap();
         assert_eq!(fs::read_to_string(dir.path().join(".docent/cache/.gitignore")).unwrap(), "*\n");
-        assert!(dir.path().join(".docent/cache/api/serde@1.0.219.md").is_file());
-        // Kept, it's used with search off and nothing is fetched.
-        let found = look_up(&Client::new(), dir.path(), &[serde.clone(), dep("tokio", None)], false);
-        assert_eq!(found, [(serde.clone(), "Serialize, Deserialize".to_string())]);
+        // Kept as markdown, read back the same, its headings and all.
+        assert!(fs::read_to_string(dir.path().join(".docent/cache/api/serde@1.0.219.md")).unwrap().starts_with("<!-- section: serde -->\nSerialization."));
+        assert_eq!(cached(dir.path(), &serde).unwrap(), sections);
+        // Kept, it's used without reading the package again.
+        let found = look_up(dir.path(), "Rust", &[serde.clone(), dep("tokio", None)], "derive Serialize", false);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].told.starts_with("### serde\n\nSerialization.") && found[0].told.contains("### Serialize"));
         let told = reference(&found).unwrap();
         assert!(told.starts_with(crate::skills::body(crate::skills::PRE_RUN)));
-        assert!(told.ends_with("## serde 1.0.219\n\nSerialize, Deserialize"));
+        assert!(told.contains("## serde 1.0.219\n\n### serde"));
         assert_eq!(reference(&[]), None);
         assert_eq!(
             cached_at(dir.path(), &dep("@types/node", None)),
@@ -479,13 +619,45 @@ mod tests {
     }
 
     #[test]
-    fn a_page_is_read_as_its_text() {
-        let html = "<html><head><title>x</title><style>p{}</style></head><body><nav>Home | Docs</nav>\
-                    <h1>Module   fs</h1><p>Read a file with <code>fs::read_to_string</code>.</p>\
-                    <script>var a = '<p>';</script><pre>let s = fs::read_to_string(&amp;path)?;</pre>\
-                    <footer>©</footer></body></html>";
-        assert_eq!(text_of(html), "Module fs\nRead a file with fs::read_to_string.\nlet s = fs::read_to_string(&path)?;");
-        assert_eq!(text_of("no tags &lt;here&gt;"), "no tags <here>");
-        assert_eq!(text_of("cut <b"), "cut");
+    fn a_turn_is_told_the_parts_of_an_api_it_uses() {
+        let mut sections = vec![section("clap", "Command line argument parser.")];
+        for i in 0..40 {
+            sections.push(section(&format!("Thing{i}::other"), &format!("`pub fn other{i}()`\n\nUnrelated, {}.", "words ".repeat(40))));
+        }
+        sections.push(section("Arg::short", "`pub fn short(self, s: char) -> Self`\n\nSets the short flag."));
+        sections.push(section("ArgAction", "`pub enum ArgAction`\n\nWhat a flag does: SetTrue."));
+        let derive = format!("Derive reference.\n\n## Arg Attributes\n\n`#[arg(short, long)]`\n\n## Command Attributes\n\n{}", "about ".repeat(400));
+        sections.push(section("clap::_derive", &derive));
+        let (told, fit) = select(&sections, "clap", "add a --shout flag with #[arg(short)] and an action with clap");
+        // The top-level docs first, then what's used, in the library's order.
+        let titles: Vec<&str> = told.lines().filter_map(|l| l.strip_prefix("### ")).collect();
+        assert_eq!(titles[0], "clap");
+        assert!(titles.contains(&"Arg::short") && titles.contains(&"ArgAction"), "{titles:?}");
+        assert!(titles.contains(&"clap::_derive › Arg Attributes"), "{titles:?}");
+        assert!(!titles.iter().any(|t| t.starts_with("Thing")), "{titles:?}");
+        assert!(titles.iter().position(|t| *t == "Arg::short") < titles.iter().position(|t| *t == "ArgAction"));
+        assert!(told.len() <= KEPT);
+        // It fits a prompt that asks of it better than one that doesn't.
+        let (_, other) = select(&sections, "clap", "add a test for subtract with zeros");
+        assert!(fit > other * 5.0, "{fit} {other}");
+        // A library of a section or two that shares a word or two fits no
+        // better, nor does one by the words of its own name.
+        let readme = [section("@mui/icons-material", "Material icons for MUI, shown as an error or a request's state.")];
+        let (_, small) = select(&readme, "@mui/icons-material", "use MUI's Snackbar to show an error when the chat request fails");
+        assert!(small * 5.0 < fit, "{small} {fit}");
+        // Names in code are words in their parts.
+        assert!(words("ArgAction default_value_t").is_superset(&["argaction", "arg", "action", "default", "value", "defaultvaluet"].map(String::from).into()));
+        // Not for the library's own name, and a subcommand is a command.
+        let commands = [
+            section("commander", "Commander, the complete solution for command-line programs."),
+            section("Help.subcommandTerm", "`subcommandTerm(cmd: Command): string`\n\nThe term commander shows a subcommand by."),
+            section("Commands", "`.command()` adds a command; `{ isDefault: true }` runs it when no other is named."),
+            section("Option", "An option commander parses."),
+        ];
+        let (told, _) = select(&commands, "commander", "add a farewell subcommand with commander");
+        assert!(told.contains("### Commands") && !told.contains("### Option"), "{told}");
+        // A cut code block is closed.
+        assert_eq!(cut("```\nlet a = 1;\nlet b = 2;\n```", 16), "```\nlet a = 1;\n```\n…");
     }
 }
+
