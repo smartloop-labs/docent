@@ -294,11 +294,7 @@ pub fn system_context() -> &'static str {
     TEXT.get_or_init(|| {
         let os = sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
         let kernel = sysinfo::System::kernel_version().map(|k| format!(", kernel {}", k)).unwrap_or_default();
-        let shell = if cfg!(windows) {
-            "cmd /C".to_string()
-        } else {
-            format!("{} -c", std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()))
-        };
+        let shell = command_shell().join(" ");
         let mut text = format!(
             "The machine my commands run on:\n- OS: {} ({}{})\n- Shell: commands run with `{}`\n",
             os,
@@ -328,8 +324,27 @@ pub fn system_context() -> &'static str {
         text.push_str(
             "Give commands for this machine: its shell, and its package manager rather than another OS's.\n",
         );
+        if cfg!(windows) {
+            text.push_str(
+                "Commands are PowerShell, not bash: Get-ChildItem, Get-Content, Select-String, Remove-Item, \
+                 $env:NAME for a variable, and `;` between commands.\n",
+            );
+        }
         text
     })
+}
+
+/// The program and leading arguments commands run with; the command
+/// follows as one more argument. A login shell's `-c` on Unix; PowerShell
+/// on Windows, `pwsh` when it's installed, as `cmd /C` runs only the first
+/// line of a script and knows none of the commands models reach for.
+pub fn command_shell() -> Vec<String> {
+    if cfg!(windows) {
+        let program = if on_path("pwsh") { "pwsh" } else { "powershell" };
+        [program, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"].map(String::from).to_vec()
+    } else {
+        vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()), "-c".to_string()]
+    }
 }
 
 /// Whether `tool` is a program in a `PATH` directory.

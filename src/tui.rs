@@ -1261,8 +1261,9 @@ impl Tooling {
 /// The command a `bash` call runs, and what it says the command does; an
 /// error, for the agent, for a call of another tool or with no command.
 fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>), String> {
-    if name != "bash" {
-        return Err(format!("Error: there's no tool named `{}`; the only tool is `bash`.", name));
+    // `bash` by habit, on Windows too, runs as the tool offered there.
+    if name != chat::TOOL_NAME && name != "bash" {
+        return Err(format!("Error: there's no tool named `{}`; the only tool is `{}`.", name, chat::TOOL_NAME));
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|e| format!("Error: the arguments aren't valid JSON ({}); give {{\"command\": \"...\"}}.", e))?;
@@ -5680,15 +5681,9 @@ fn stream(
         let _ = settled.send((String::new(), Some(Ended::Stopped)));
         return;
     }
-    let mut shell = if cfg!(windows) {
-        let mut c = std::process::Command::new("cmd");
-        c.arg("/C");
-        c
-    } else {
-        let mut c = std::process::Command::new(std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()));
-        c.arg("-c");
-        c
-    };
+    let [program, args @ ..] = &files::command_shell()[..] else { unreachable!("a shell program") };
+    let mut shell = std::process::Command::new(program);
+    shell.args(args);
     if let Some(dir) = dir {
         shell.current_dir(dir);
     }
