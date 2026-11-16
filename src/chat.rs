@@ -159,6 +159,9 @@ impl ToolCall {
     }
 }
 
+/// The name of `bash_tool`, as offered on this OS.
+pub const TOOL_NAME: &str = if cfg!(windows) { "shell" } else { "bash" };
+
 /// The one tool docent offers: a shell command, run in the project folder
 /// through the same approval as a reply's fenced commands. Files are still
 /// written from the reply's text, so there's no tool for that, and the
@@ -167,12 +170,20 @@ impl ToolCall {
 /// call's arguments. A tool call isn't streamed, so that showed nothing for
 /// minutes and ran into the answer cap, cutting the call off. Written in the
 /// reply, files stream as diffs and are written as each block ends.
+///
+/// On Windows it's `shell`, and says it's PowerShell: named `bash`, models
+/// gave it bash, which PowerShell doesn't run.
 pub fn bash_tool() -> serde_json::Value {
+    let what = if cfg!(windows) {
+        "Run a PowerShell command (not bash) in the project folder"
+    } else {
+        "Run a shell command in the project folder"
+    };
     serde_json::json!({
         "type": "function",
         "function": {
-            "name": "bash",
-            "description": "Run a shell command in the project folder and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.",
+            "name": TOOL_NAME,
+            "description": format!("{} and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.", what),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -633,7 +644,7 @@ mod tests {
         let body = request_body(&request);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tools"][0]["function"]["name"], TOOL_NAME);
         assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
         let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
