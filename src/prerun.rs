@@ -67,6 +67,15 @@ pub fn dependencies(root: &Path, kind: &str) -> Vec<Dep> {
         "JavaScript/TypeScript" => npm(&read("package.json"), &read("package-lock.json")),
         "Go" => go(&read("go.mod")),
         "Python" => python(&read("requirements.txt"), &read("pyproject.toml")),
+        "Java" | "Java/Kotlin" | "Kotlin" => {
+            let mut deps = maven(&read("pom.xml"));
+            for dep in gradle(&format!("{}\n{}", read("build.gradle"), read("build.gradle.kts"))) {
+                if !deps.iter().any(|d| d.name == dep.name) {
+                    deps.push(dep);
+                }
+            }
+            deps
+        }
         _ => Vec::new(),
     }
 }
@@ -196,6 +205,49 @@ fn python(requirements: &str, pyproject: &str) -> Vec<Dep> {
     deps
 }
 
+/// A pom.xml's dependencies, as `group:artifact`, at their versions, a
+/// `${property}` one as its `<properties>` set it.
+fn maven(pom: &str) -> Vec<Dep> {
+    let tag = |text: &str, name: &str| -> Option<String> {
+        let (_, rest) = text.split_once(&format!("<{name}>"))?;
+        Some(rest.split_once(&format!("</{name}>"))?.0.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let properties = pom.split_once("<properties>").and_then(|(_, p)| p.split_once("</properties>")).map_or("", |(p, _)| p);
+    let mut deps = Vec::new();
+    for block in pom.split("<dependency>").skip(1) {
+        let block = block.split_once("</dependency>").map_or(block, |(b, _)| b);
+        let (Some(group), Some(artifact)) = (tag(block, "groupId"), tag(block, "artifactId")) else { continue };
+        let version = tag(block, "version").and_then(|v| match v.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+            Some(property) => tag(properties, property),
+            None => Some(v),
+        });
+        let name = format!("{group}:{artifact}");
+        if !deps.iter().any(|d: &Dep| d.name == name) {
+            deps.push(Dep { name, version });
+        }
+    }
+    deps
+}
+
+/// A Gradle build's dependencies: each quoted `group:artifact:version`, the
+/// version left out when it's a variable's.
+fn gradle(build: &str) -> Vec<Dep> {
+    let mut deps = Vec::new();
+    for quoted in build.split(['"', '\'']).skip(1).step_by(2) {
+        let parts: Vec<&str> = quoted.split(':').collect();
+        let coordinate = |p: &&str| !p.is_empty() && p.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'));
+        if !(2..=3).contains(&parts.len()) || !parts[..2].iter().all(coordinate) || !parts[0].contains('.') {
+            continue;
+        }
+        let name = format!("{}:{}", parts[0], parts[1]);
+        let version = parts.get(2).filter(|v| !v.contains('$') && !v.is_empty()).map(|v| v.to_string());
+        if !deps.iter().any(|d: &Dep| d.name == name) {
+            deps.push(Dep { name, version });
+        }
+    }
+    deps
+}
+
 /// Of `deps`, those the turn uses: the ones the `prompt` names, or when
 /// it names none, those a word of it is part of the name of, as `yaml` of
 /// `js-yaml` and `mui` of `@mui/material`, and whether they're that guess:
@@ -247,12 +299,29 @@ fn used_in(deps: &[Dep], texts: &[&str], most: usize) -> Vec<Dep> {
     for text in texts {
         let text = text.to_lowercase();
         for dep in deps {
-            if found.len() < most && !found.contains(dep) && uses(&text, &dep.name.to_lowercase()) {
+            if found.len() < most && !found.contains(dep) && called(dep).iter().any(|name| uses(&text, name)) {
                 found.push(dep.clone());
             }
         }
     }
     found
+}
+
+/// The names code calls `dep` by: its own, and for a Go module or a
+/// Java one, its last part, `cobra` of `github.com/spf13/cobra` and `gson`
+/// of `com.google.code.gson:gson`, and a Java one's group, as imported.
+fn called(dep: &Dep) -> Vec<String> {
+    let name = dep.name.to_lowercase();
+    let mut names = vec![name.clone()];
+    // Not a Go module's major version, as `v2` of `…/chi/v5`.
+    let version = |p: &&str| p.strip_prefix('v').is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+    if let Some(last) = name.rsplit(['/', ':']).find(|p| !version(p)).filter(|last| *last != name && last.len() > 1) {
+        names.push(last.to_string());
+    }
+    if let Some((group, _)) = name.split_once(':') {
+        names.push(group.to_string());
+    }
+    names
 }
 
 /// Whether `text` names the library `name` as a word of its own, as code
@@ -563,6 +632,18 @@ mod tests {
     }
 
     #[test]
+    fn reads_maven_and_gradle_dependencies() {
+        let pom = "<project><properties><gson.version>2.11.0</gson.version></properties><dependencies>\
+                   <dependency><groupId>com.google.code.gson</groupId><artifactId>gson</artifactId><version>${gson.version}</version></dependency>\
+                   <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>\
+                   </dependencies></project>";
+        assert_eq!(maven(pom), [dep("com.google.code.gson:gson", Some("2.11.0")), dep("org.slf4j:slf4j-api", None)]);
+        let build = "plugins { id 'java' }\ndependencies {\n    implementation 'com.squareup.okhttp3:okhttp:4.12.0'\n    \
+                     testImplementation(\"org.junit.jupiter:junit-jupiter:$junit\")\n    implementation \"not a:coordinate\"\n}\n";
+        assert_eq!(gradle(build), [dep("com.squareup.okhttp3:okhttp", Some("4.12.0")), dep("org.junit.jupiter:junit-jupiter", None)]);
+    }
+
+    #[test]
     fn looks_up_what_the_prompt_names_else_what_it_names_part_of() {
         let mui = [dep("@mui/material", None), dep("@mui/icons-material", None), dep("@types/react", None), dep("react", None)];
         let deps = [dep("serde", None), dep("serde-json", None), dep("tokio", None), dep("clap", None), dep("anyhow", None)];
@@ -581,6 +662,11 @@ mod tests {
         assert_eq!(relevant(&studio, "make the theme yaml loading safe"), (vec![dep("js-yaml", None)], true));
         assert_eq!(relevant(&studio, "keep the settings in the store"), (vec![dep("electron-store", None)], true));
         assert_eq!(relevant(&studio, "add a js helper for the api"), (Vec::new(), true));
+        // A Go or Java module by the names its code calls it.
+        let modules = [dep("github.com/go-chi/chi/v5", None), dep("com.google.code.gson:gson", None), dep("org.slf4j:slf4j-api", None)];
+        assert_eq!(relevant(&modules, "route it with chi").0, [modules[0].clone()]);
+        assert_eq!(relevant(&modules, "parse it with Gson").0, [modules[1].clone()]);
+        assert_eq!(relevant(&modules, "log it with org.slf4j").0, [modules[2].clone()]);
         // Of a guess, only the one that fits the prompt best, the first of
         // those that fit it as well.
         let api = |name: &str, fit| Api { dep: dep(name, None), told: String::new(), fit };

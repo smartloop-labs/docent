@@ -34,6 +34,10 @@ pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
         "JavaScript/TypeScript" => npm(&root.join("node_modules"), &dep.name),
         "Python" => python(&site_packages(root)?, &dep.name),
         "Go" => go(&go_modules()?, &dep.name, dep.version.as_deref()?),
+        "Java" | "Java/Kotlin" | "Kotlin" => {
+            let (group, artifact) = dep.name.split_once(':')?;
+            java(&java_jar(&home()?, group, artifact, dep.version.as_deref()?)?, artifact)
+        }
         _ => None,
     }
 }
@@ -738,6 +742,129 @@ fn go_exported(text: &str) -> Option<String> {
     name.starts_with(|c: char| c.is_uppercase()).then_some(name)
 }
 
+/// The jar Maven or Gradle downloaded `group:artifact` `version` as, under
+/// `home`: its sources jar when there's one.
+fn java_jar(home: &Path, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+    let gradle = std::env::var_os("GRADLE_USER_HOME").map_or_else(|| home.join(".gradle"), PathBuf::from);
+    let maven = home.join(".m2/repository").join(group.replace('.', "/")).join(artifact).join(version);
+    // Gradle keeps each file in a folder named for its hash.
+    let cached = gradle.join("caches/modules-2/files-2.1").join(group).join(artifact).join(version);
+    let hashed = fs::read_dir(&cached).ok().into_iter().flatten().flatten().map(|e| e.path());
+    let folders: Vec<PathBuf> = std::iter::once(maven).chain(hashed).collect();
+    let named = |file: String| folders.iter().map(|f| f.join(&file)).find(|f| f.is_file());
+    named(format!("{artifact}-{version}-sources.jar")).or_else(|| named(format!("{artifact}-{version}.jar")))
+}
+
+/// A Java library's API from its `jar`: from a sources jar, each package's
+/// docs and the public types and documented public members its Javadoc
+/// describes; from a jar of classes alone, the names of its classes.
+fn java(jar: &Path, artifact: &str) -> Option<Vec<Section>> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(jar).ok()?).ok()?;
+    let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    // Its top packages first, and each package's docs before its classes.
+    names.sort_by_key(|n| (n.matches('/').count(), !n.ends_with("package-info.java"), n.clone()));
+    let mut sections = Vec::new();
+    let sources: Vec<&String> = names.iter().filter(|n| n.ends_with(".java") && !n.ends_with("module-info.java")).collect();
+    for name in sources.iter().take(FILES) {
+        let Ok(mut file) = archive.by_name(name) else { continue };
+        if file.size() > FILE_BYTES {
+            continue;
+        }
+        let mut text = String::new();
+        if std::io::Read::read_to_string(&mut file, &mut text).is_ok() {
+            sections.extend(java_sections(&text));
+        }
+    }
+    if sources.is_empty() {
+        let classes: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.strip_suffix(".class"))
+            .filter(|n| !n.contains('$') && !n.ends_with("package-info") && !n.starts_with("META-INF"))
+            .map(|n| n.replace('/', "."))
+            .collect();
+        if !classes.is_empty() {
+            let text = format!("No sources installed; its classes:\n{}", classes.join("\n"));
+            sections.push(Section { title: artifact.to_string(), text });
+        }
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// What a Java source file declares: its package's docs in a
+/// `package-info.java`, each public type with its Javadoc, and each
+/// documented public member of its types, named after them.
+fn java_sections(text: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    // The types a line is in: each one's depth and name.
+    let mut types: Vec<(usize, String, bool)> = Vec::new();
+    let mut depth = 0;
+    let mut doc: Vec<String> = Vec::new();
+    let mut in_doc = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if in_doc || item.starts_with("/**") {
+            in_doc = !item.ends_with("*/");
+            let text = item.trim_start_matches("/**").trim_end_matches("*/").trim();
+            let text = text.strip_prefix('*').map_or(text, |t| t.strip_prefix(' ').unwrap_or(t));
+            if !text.starts_with('@') || ["@param", "@return", "@throws"].iter().any(|t| text.starts_with(t)) {
+                doc.push(text.to_string());
+            }
+            continue;
+        }
+        // Annotations and comments come between an item and its Javadoc.
+        if item.is_empty() || item.starts_with('@') || item.starts_with("//") {
+            continue;
+        }
+        let docs = clean(&doc);
+        doc.clear();
+        if let Some(package) = item.strip_prefix("package ") {
+            if let Some(docs) = docs {
+                sections.push(Section { title: package.trim_end_matches(';').to_string(), text: docs });
+            }
+            continue;
+        }
+        let owner = types.last().map(|(_, name, interface)| (name.clone(), *interface));
+        let public = item.starts_with("public ") || owner.as_ref().is_some_and(|(_, interface)| *interface);
+        let declared = java_type(item).filter(|_| public);
+        if let Some((name, _)) = &declared {
+            let text = signature(&lines[i..]);
+            sections.push(Section { title: name.clone(), text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+        } else if let (true, Some((owner, _)), Some(docs)) = (public, &owner, docs)
+            && let Some(name) = item.split_once('(').map(|(head, _)| ident_back(head)).filter(|n| !n.is_empty())
+        {
+            sections.push(Section { title: format!("{owner}.{name}"), text: format!("`{}`\n\n{docs}", signature(&lines[i..])) });
+        }
+        let opens = item.matches('{').count();
+        let closes = item.matches('}').count();
+        if let Some((name, interface)) = declared.filter(|_| opens > closes) {
+            types.push((depth, name, interface));
+        }
+        depth = (depth + opens).saturating_sub(closes);
+        types.retain(|(at, ..)| *at < depth);
+    }
+    sections
+}
+
+/// The type a line declares, and whether it's an interface, whose members
+/// are public: `Gson` of `public final class Gson {`.
+fn java_type(line: &str) -> Option<(String, bool)> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let at = words.iter().position(|w| ["class", "interface", "enum", "record", "@interface"].contains(w))?;
+    let modifiers = ["public", "protected", "private", "static", "final", "abstract", "sealed", "non-sealed", "strictfp"];
+    if !words[..at].iter().all(|w| modifiers.contains(w)) {
+        return None;
+    }
+    let name = ident(words.get(at + 1)?);
+    (!name.is_empty()).then(|| (name, words[at].ends_with("interface")))
+}
+
+/// The identifier `text` ends with.
+fn ident_back(text: &str) -> String {
+    let name: String = text.trim_end().chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    name.chars().rev().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +1068,65 @@ mod tests {
         assert_eq!(sections[1].text, "`func Decode(data string, v any) (MetaData, error)`\n\nDecode reads data into v.");
         assert_eq!(sections[4].text, "`Version = \"1.0\"`\n\nVersion of the spec.");
         assert_eq!(go(modules.path(), "github.com/BurntSushi/toml", "v1.4.0"), None);
+    }
+
+    /// A jar at `path` holding `files`, `(name, text)`.
+    fn jar(path: &Path, files: &[(&str, &str)]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for (name, text) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn a_java_library_s_api_is_its_javadoc() {
+        let home = tempfile::tempdir().unwrap();
+        let gson = [
+            "package com.google.gson;",
+            "",
+            "/**",
+            " * Converts Java objects to JSON.",
+            " * @author someone",
+            " */",
+            "public final class Gson {",
+            "  /**",
+            "   * Serializes {@code src} to JSON.",
+            "   * @param src the object",
+            "   */",
+            "  @Deprecated",
+            "  public String toJson(Object src) {",
+            "    return null;",
+            "  }",
+            "  /** Internal. */",
+            "  String helper() { return null; }",
+            "  public void undocumented() {}",
+            "}",
+            "",
+            "/** How a field is named. */",
+            "public interface FieldNamingStrategy {",
+            "  /** The name for {@code f}. */",
+            "  String translateName(Field f);",
+            "}",
+        ];
+        let info = "/** Gson's API. */\npackage com.google.gson;\n";
+        let sources = home.path().join(".m2/repository/com/google/code/gson/gson/2.11.0/gson-2.11.0-sources.jar");
+        jar(&sources, &[("com/google/gson/Gson.java", &gson.join("\n")), ("com/google/gson/package-info.java", info), ("module-info.java", "module x {}")]);
+        let found = java_jar(home.path(), "com.google.code.gson", "gson", "2.11.0").unwrap();
+        assert_eq!(found, sources);
+        let sections = java(&found, "gson").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["com.google.gson", "Gson", "Gson.toJson", "FieldNamingStrategy", "FieldNamingStrategy.translateName"]);
+        assert_eq!(sections[1].text, "`public final class Gson`\n\nConverts Java objects to JSON.");
+        assert_eq!(sections[2].text, "`public String toJson(Object src)`\n\nSerializes {@code src} to JSON.\n@param src the object");
+        // From Gradle's cache, without sources: its classes' names.
+        let classes = home.path().join(".gradle/caches/modules-2/files-2.1/org.slf4j/slf4j-api/2.0.13/0a1b2c/slf4j-api-2.0.13.jar");
+        jar(&classes, &[("org/slf4j/Logger.class", ""), ("org/slf4j/Logger$1.class", ""), ("META-INF/MANIFEST.MF", "")]);
+        let found = java_jar(home.path(), "org.slf4j", "slf4j-api", "2.0.13").unwrap();
+        assert_eq!(java(&found, "slf4j-api").unwrap(), [Section { title: "slf4j-api".into(), text: "No sources installed; its classes:\norg.slf4j.Logger".into() }]);
+        assert_eq!(java_jar(home.path(), "org.slf4j", "slf4j-api", "1.7.0"), None);
     }
 
     #[test]
