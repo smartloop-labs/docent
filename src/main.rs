@@ -8,6 +8,7 @@ use reqwest::blocking::{Client, Response, multipart};
 use progress::Steps;
 
 mod agent;
+mod apidocs;
 mod askpass;
 mod chat;
 mod docent;

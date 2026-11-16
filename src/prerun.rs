@@ -82,8 +82,19 @@ fn cargo(manifest: &str, lock: &str) -> Vec<Dep> {
     deps
 }
 
-/// The version Cargo.lock pins `name` at.
-fn locked(lock: &str, name: &str) -> Option<String> {
+/// The version Cargo.lock pins `name` at: of several, the one the
+/// project's own packages, those with no `source`, depend on, which Cargo
+/// lists with its version (`"base64 0.23.1"`); else its only one.
+pub fn locked(lock: &str, name: &str) -> Option<String> {
+    let listed = format!("\"{name} ");
+    let own = lock.split("[[package]]").filter(|package| !package.contains("\nsource = "));
+    if let Some(version) = own
+        .flat_map(str::lines)
+        .find_map(|line| line.trim().strip_prefix(listed.as_str()))
+        .and_then(|rest| rest.split(['"', ' ']).next())
+    {
+        return Some(version.to_string());
+    }
     let lines: Vec<&str> = lock.lines().map(str::trim).collect();
     let at = lines.iter().position(|line| *line == format!("name = \"{name}\""))?;
     lines.get(at + 1).and_then(|line| line.strip_prefix("version = ")).and_then(quoted)
@@ -394,6 +405,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
         assert_eq!(dependencies(dir.path(), "Rust")[1], dep("tokio", Some("1.40")), "no lockfile: the manifest's");
+        // Locked at several versions: the one the project's own package uses.
+        let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"base64 0.23.1\",\n \"serde\",\n]\n\n\
+                    [[package]]\nname = \"base64\"\nversion = \"0.13.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                    [[package]]\nname = \"base64\"\nversion = \"0.23.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        assert_eq!(locked(lock, "base64").as_deref(), Some("0.23.1"));
+        assert_eq!(locked(lock, "app").as_deref(), Some("0.1.0"));
         assert!(dependencies(dir.path(), "C/C++").is_empty());
     }
 
