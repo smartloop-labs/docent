@@ -1977,9 +1977,9 @@ impl App {
             self.entries.push(Entry::Warning(warning));
         }
         let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole };
-        // A turn in a folder of the user's offers the `bash` tool, and its
-        // tool rounds start over: it's a new request, not one going on.
-        self.tooling = sent.files_dir.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
+        // A turn with a working directory offers the `bash` tool, run there,
+        // and its tool rounds start over: it's a new request, not one going on.
+        self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
     }
 
@@ -2022,7 +2022,7 @@ impl App {
                 project_id: &project,
                 cwd: sent.cwd.as_deref(),
                 session_id: &session,
-                tools: sent.files_dir.is_some(),
+                tools: sent.cwd.is_some(),
                 rounds: &rounds,
             };
             let result = chat::stream_turn(&chat, &request, &mut on).await;
@@ -2132,12 +2132,29 @@ impl App {
         if command.is_empty() {
             return self.entries.push(Entry::Error("Give a command to run: !<command>".to_string()));
         }
+        // A `cd` run in a shell of its own would change nothing here: docent
+        // moves itself, so its folder, the agent's and its commands' follow.
+        if let Some(target) = cd_target(&command) {
+            return self.change_dir(target);
+        }
         let (command, background) = detached(&command);
         let (id, report) = self.shell_entry(command.clone(), background);
         self.spawn(move |_, tx| {
             let (output, ended) = run_command(&command, None, background, report);
             let _ = tx.send(AppEvent::Shell(id, output, ended));
         });
+    }
+
+    /// `!cd`: make `target` the working directory, as a shell would.
+    fn change_dir(&mut self, target: std::path::PathBuf) {
+        self.scroll_back = 0;
+        match std::env::set_current_dir(&target) {
+            Ok(()) => {
+                let here = std::env::current_dir().unwrap_or(target);
+                self.entries.push(Entry::Notice(format!("Now in {}", shown_folder(&here))));
+            }
+            Err(e) => self.entries.push(Entry::Error(format!("cd {}: {}", target.display(), e))),
+        }
     }
 
     /// A shell entry for `command`, and its run as a job: the entry's id,
@@ -2830,6 +2847,19 @@ impl App {
                                     .collect();
                                 self.reply_done(root, found, turn.whole, commands);
                                 self.tool_round_done();
+                            } else if !turn.calls.is_empty()
+                                && let Some(tooling) = &mut self.tooling
+                                && let Some(cwd) = tooling.sent.cwd.clone()
+                            {
+                                // A turn that makes no files still runs its
+                                // tool calls, in its working directory.
+                                let text = reply.text.clone();
+                                let (commands, shown) = tooling.called(&text, turn.calls);
+                                reply.text.push_str(&shown);
+                                if !commands.is_empty() {
+                                    self.commands = Some((cwd, commands));
+                                }
+                                self.run_commands();
                             }
                         }
                         Err(e) => reply.ended = Some(e),
@@ -6161,6 +6191,33 @@ fn one_line(commands: &[String]) -> String {
 }
 
 /// `path` with the home folder as `~`, as a shell prompt shows it.
+/// The folder a bare `cd` command goes to: home with no argument, else its
+/// one argument, unquoted, with `~` as home. None for anything more, as
+/// `cd app && make`, which runs in a shell as written.
+fn cd_target(command: &str) -> Option<std::path::PathBuf> {
+    let rest = command.trim().strip_prefix("cd")?;
+    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    let arg = rest.trim();
+    if arg.contains(|c: char| ";&|<>`$()".contains(c)) {
+        return None;
+    }
+    let arg = match arg.as_bytes() {
+        [q @ (b'"' | b'\''), .., e] if q == e && arg.len() >= 2 => &arg[1..arg.len() - 1],
+        _ if arg.contains(char::is_whitespace) => return None,
+        _ => arg,
+    };
+    let home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+    match arg {
+        "" | "~" => home(),
+        _ => match arg.strip_prefix("~/") {
+            Some(rest) => Some(home()?.join(rest)),
+            None => Some(std::path::PathBuf::from(arg)),
+        },
+    }
+}
+
 fn shown_folder(path: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
     match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
@@ -9331,6 +9388,19 @@ mod tests {
     #[test]
     fn a_long_path_is_shortened_from_the_middle() {
         assert_eq!(fit_path("~/src/app", 20), "~/src/app");
+    }
+
+    #[test]
+    fn a_bare_cd_moves_docent_and_anything_more_runs_in_a_shell() {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(cd_target("cd"), Some(home.clone()));
+        assert_eq!(cd_target("cd ~/src"), Some(home.join("src")));
+        assert_eq!(cd_target("cd ../app"), Some("../app".into()));
+        assert_eq!(cd_target("cd 'my app'"), Some("my app".into()));
+        assert_eq!(cd_target("cd app && make"), None);
+        assert_eq!(cd_target("cd a b"), None);
+        assert_eq!(cd_target("cdk deploy"), None);
+        assert_eq!(cd_target("cd $HOME"), None);
         assert_eq!(fit_path("~/src/.worktrees/docent/test_docent", 24), "~/…/docent/test_docent");
         assert_eq!(fit_path("/var/folders/x/T/tmp1", 10), "/…/T/tmp1");
         assert_eq!(fit_path("~/a/very_long_folder_name", 8), "very_lo…");

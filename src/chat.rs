@@ -129,8 +129,8 @@ pub struct Request<'a> {
     pub project_id: &'a str,
     pub cwd: Option<&'a std::path::Path>,
     pub session_id: &'a str,
-    /// Offer the `bash` tool: only on a turn that works in a folder of the
-    /// user's, where its commands can run. A server that won't give tools
+    /// Offer the `bash` tool: on any turn with a working directory, where
+    /// its commands run. A server that won't give tools
     /// to the model it picked ignores it and answers in text, as before.
     pub tools: bool,
     /// The turn's tool rounds so far, after the user's message: each
