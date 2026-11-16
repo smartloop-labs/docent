@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, lsp, mcp};
+use crate::{ModelRow, docent, files, framework, lsp, mcp, skills};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -1872,12 +1872,17 @@ impl App {
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
                 None => String::new(),
             };
+            // What the user asked to be remembered goes ahead of the
+            // project, and the post-run skill, on how to keep more, with
+            // the rest of how to reply.
             system = Some(format!(
-                "{}\n{}\n\n{}{}\n\n{}",
+                "{}\n{}\n\n{}{}{}\n\n{}\n\n{}",
                 files::system_context(),
                 files::folder_note(root),
+                files::memory_note(root),
                 context,
                 files::HINT,
+                skills::body(skills::POST_RUN),
                 files::EDIT_EXAMPLE
             ));
             // Its language server starts now, indexing while the reply comes,
@@ -1973,12 +1978,14 @@ impl App {
     /// Put the project's web search back on after a turn that had it off.
     /// Whether a turn of `prompt` makes files: always in a code project the
     /// chat was opened in, and elsewhere when the prompt asks for something
-    /// to be made or names a file of the folder, as a pasted error does.
+    /// to be made, names a file of the folder, as a pasted error does, or
+    /// asks for something to be remembered, which is kept in the folder.
     fn making(&self, prompt: &str) -> bool {
         let Some((project, _)) = &self.project else { return false };
         files::wants_files(prompt)
-            || chat::making_dir(project)
-                .is_some_and(|dir| code_kind(&dir).is_some() || files::mentions_file(&dir, prompt))
+            || chat::making_dir(project).is_some_and(|dir| {
+                code_kind(&dir).is_some() || files::mentions_file(&dir, prompt) || files::wants_memory(prompt)
+            })
     }
 
     /// Write the files a reply gave into the turn's folder, new and changed
@@ -2795,7 +2802,15 @@ impl App {
                                         new: found.files.iter().find(|f| f.path == *path).map_or(String::new(), |f| f.content.clone()),
                                     })
                                     .collect();
+                                // The post-run skill: what the reply gave to
+                                // remember is kept for the next sessions.
+                                let remembered = files::remembered(&reply.text);
                                 self.start_searches();
+                                match files::remember(&root, &remembered) {
+                                    Ok(added) if added.is_empty() => {}
+                                    Ok(added) => self.entries.push(Entry::Notice(format!("Remembered: {}", added.join("; ")))),
+                                    Err(e) => self.entries.push(Entry::Error(format!("Couldn't save to {}: {}", files::MEMORY, e))),
+                                }
                                 self.reply_done(root, found, turn.whole, commands);
                                 self.tool_round_done();
                             } else if !turn.calls.is_empty()
@@ -3570,6 +3585,36 @@ impl App {
         });
     }
 
+    /// `/memory`: the notes kept in this folder; `/memory clear` forgets
+    /// them.
+    fn memory_command(&mut self, action: Option<&str>) {
+        let Some(root) = self.project.as_ref().and_then(|(p, _)| chat::making_dir(p)) else {
+            return self.entries.push(Entry::Error(
+                "Notes are kept in the project's folder; open docent there, or /sync this one".to_string(),
+            ));
+        };
+        let entry = match action {
+            None => match files::memory(&root) {
+                notes if notes.is_empty() => {
+                    Entry::Notice("Nothing remembered here yet; ask, as \"remember we use pnpm\"".to_string())
+                }
+                // A notice a line, as a notice's own lines run together.
+                notes => {
+                    self.entries.push(Entry::Notice(format!("Remembered in {}:", files::MEMORY)));
+                    let lines = notes.iter().map(|n| Entry::Notice(format!("  - {n}")));
+                    return self.entries.extend(lines);
+                }
+            },
+            Some("clear") => match std::fs::remove_file(root.join(files::MEMORY)) {
+                Ok(()) => Entry::Notice("Forgot everything remembered here".to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Entry::Notice("Nothing remembered here".to_string()),
+                Err(e) => Entry::Error(format!("Couldn't remove {}: {}", files::MEMORY, e)),
+            },
+            Some(other) => Entry::Error(format!("Unknown /memory {}; try /memory or /memory clear", other)),
+        };
+        self.entries.push(entry);
+    }
+
     fn open_status(&mut self) {
         self.overlay = Overlay::Status(None);
         self.spawn(|client, tx| {
@@ -4036,6 +4081,7 @@ impl App {
             "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
+            "/memory" => self.memory_command(words.next()),
             "/usage" => self.open_usage(),
             "/upgrade" => {
                 crate::open_browser(crate::UPGRADE_URL);
@@ -6456,7 +6502,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -6464,6 +6510,7 @@ const COMMANDS: [(&str, &str); 12] = [
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
+    ("/memory", "what docent was asked to remember here; /memory clear forgets it"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/usage", "credits used this month"),
     ("/upgrade", "Pro or Plus plan: more credits a month"),
@@ -6545,6 +6592,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/project <name>", "switch to a project by its name or ID"),
         ("/project new <name>", "create a project and switch to it"),
         ("/project import <zip>", "import an exported project"),
+        ("/memory", "what docent was asked to remember in this folder"),
+        ("/memory clear", "forget it all"),
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
@@ -7588,6 +7637,39 @@ mod tests {
         app.apply(AppEvent::Check(id, "err".into(), Ended::Exited(1)));
         assert!(app.commands.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w == "Not run, as the check failed: git push"), "{:?}", app.entries.len());
+    }
+
+    #[test]
+    fn a_reply_keeps_what_it_was_asked_to_remember() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let turn = |app: &mut App, text: &str| {
+            app.entries.push(Entry::Reply(Reply { text: text.into(), ..Default::default() }));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        };
+        turn(&mut app, "Noted.\n\n```remember\nUse pnpm, not npm\n```\n");
+        assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Remembered: Use pnpm, not npm")));
+        // Said again, it's kept once and not told again.
+        let told = app.entries.len();
+        turn(&mut app, "```remember\nuse pnpm, not npm\n```\n");
+        assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Remembered"))));
+        assert!(files::memory_note(dir.path()).contains("- Use pnpm, not npm"));
     }
 
     #[test]
@@ -9184,7 +9266,7 @@ mod tests {
 
         app.input = "/m".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
-        assert_eq!(names, ["/mcp", "/Meeting_Notes", "/models", "/morning"]);
+        assert_eq!(names, ["/mcp", "/Meeting_Notes", "/memory", "/models", "/morning"]);
         app.input = "/".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
         assert_eq!(names.last().map(String::as_str), Some("/usage"));

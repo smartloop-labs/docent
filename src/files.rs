@@ -553,6 +553,95 @@ pub fn is_empty_folder(root: &Path) -> bool {
     })
 }
 
+/// Where a project keeps the notes the user asked docent to remember, one
+/// `- ` line each: told to the agent in every coding turn in the folder.
+pub const MEMORY: &str = ".docent/memory.md";
+
+/// The notes kept in `root`'s memory.
+pub fn memory(root: &Path) -> Vec<String> {
+    fs::read_to_string(root.join(MEMORY)).map_or_else(|_| Vec::new(), |text| notes(&text))
+}
+
+/// The notes in `text`, one a line, without their `- ` or `* `.
+fn notes(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).unwrap_or(line).trim().to_string()
+        })
+        .filter(|note| !note.is_empty() && !note.starts_with('#'))
+        .collect()
+}
+
+/// `root`'s memory as told to the agent, ahead of the request; nothing
+/// when there's none.
+pub fn memory_note(root: &Path) -> String {
+    let notes = memory(root);
+    if notes.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = notes.iter().map(|note| format!("- {note}")).collect();
+    format!("Notes I asked you to remember in this project, from earlier sessions:\n{}\n\n", lines.join("\n"))
+}
+
+/// The notes a reply gave to remember, in its `remember` blocks.
+pub fn remembered(reply: &str) -> Vec<String> {
+    let lines: Vec<&str> = reply.lines().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let at = i;
+        i += 1;
+        let Some((fence, info)) = opening_fence(lines[at]) else { continue };
+        let close = close_of(&lines, at, &fence, info);
+        i = close.map_or(lines.len(), |c| c + 1);
+        // A block still open is a note still being given.
+        if let Some(close) = close
+            && info.split_whitespace().next().is_some_and(|lang| lang.eq_ignore_ascii_case("remember"))
+        {
+            found.extend(notes(&lines[at + 1..close].join("\n")));
+        }
+    }
+    found
+}
+
+/// Add the `notes` that aren't there yet to `root`'s memory, making it if
+/// need be; the ones added.
+pub fn remember(root: &Path, notes: &[String]) -> std::io::Result<Vec<String>> {
+    let mut kept = memory(root);
+    let mut added = Vec::new();
+    for note in notes {
+        if !kept.iter().any(|k| k.eq_ignore_ascii_case(note)) {
+            kept.push(note.clone());
+            added.push(note.clone());
+        }
+    }
+    if !added.is_empty() {
+        let path = root.join(MEMORY);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        for note in &added {
+            text.push_str(&format!("- {note}\n"));
+        }
+        fs::write(&path, text)?;
+    }
+    Ok(added)
+}
+
+/// Whether `message` asks for something to be remembered, so the turn
+/// goes to the folder, where the reply's notes are kept.
+pub fn wants_memory(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    ["remember", "don't forget", "do not forget", "from now on", "keep in mind", "memorize", "memorise"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
 /// Whether `message` asks for something to be made, so the reply should
 /// come as files.
 pub fn wants_files(message: &str) -> bool {
@@ -2657,5 +2746,30 @@ mod tests {
         let reply = "a[0]<]b c [>[ d";
         assert!(!has_tool_call_markup(reply));
         assert_eq!(tool_calls_as_blocks(reply), reply);
+    }
+
+    #[test]
+    fn remember_blocks_are_kept_once_and_neither_written_nor_run() {
+        let reply = "Noted.\n\n```remember\n- Use pnpm, not npm\nTabs, not spaces\n```\n\n```remember\nunclosed";
+        assert_eq!(remembered(reply), ["Use pnpm, not npm", "Tabs, not spaces"]);
+        assert!(blocks(reply).is_empty() && commands(reply).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(memory_note(dir.path()), "");
+        assert_eq!(remember(dir.path(), &remembered(reply)).unwrap(), ["Use pnpm, not npm", "Tabs, not spaces"]);
+        let again = ["use PNPM, not npm".to_string(), "Run clippy".to_string()];
+        assert_eq!(remember(dir.path(), &again).unwrap(), ["Run clippy"]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MEMORY)).unwrap(),
+            "- Use pnpm, not npm\n- Tabs, not spaces\n- Run clippy\n"
+        );
+        assert!(memory_note(dir.path()).ends_with("- Use pnpm, not npm\n- Tabs, not spaces\n- Run clippy\n\n"));
+    }
+
+    #[test]
+    fn asking_to_remember_is_told_apart() {
+        assert!(wants_memory("Remember that we deploy with fly"));
+        assert!(wants_memory("from now on use tabs"));
+        assert!(wants_memory("don't forget the changelog"));
+        assert!(!wants_memory("why does the build fail?"));
     }
 }
