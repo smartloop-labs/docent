@@ -4722,8 +4722,11 @@ impl App {
             .map(|(i, entry)| {
                 // A reply's version is the text it's laid out from: laid
                 // out now, so the frame measures and draws the same lines.
+                // At the width `reply_lines` draws it at: laid out at
+                // another, it was laid out twice a frame, diffs and all,
+                // and an idle screen kept a core busy.
                 if let Entry::Reply(reply) = entry {
-                    reply.layout(width);
+                    reply.layout(reply_width(width));
                 }
                 match cache[i] {
                     Some((w, version, rows)) if w == width && version == entry_version(entry) => rows,
@@ -5491,6 +5494,12 @@ fn project_root(project: &str) -> Option<std::path::PathBuf> {
     docent::folder(project).or_else(|| folder_root().filter(|root| docent::linked(root).is_some_and(|l| l.project == project)))
 }
 
+/// The width a reply's body is laid out at in a conversation `width`
+/// wide: less its `■ ` margin.
+fn reply_width(width: u16) -> u16 {
+    width.saturating_sub(2)
+}
+
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
 /// sources, then `⎿` with the model that answered and how it went.
 fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
@@ -5500,7 +5509,7 @@ fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
             Span::styled(warning.clone(), dim()),
         ]));
     }
-    for (i, line) in reply.body(width.saturating_sub(2)).into_iter().enumerate() {
+    for (i, line) in reply.body(reply_width(width)).into_iter().enumerate() {
         let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
         lines.push(Line::from(std::iter::once(mark).chain(line.spans).collect::<Vec<_>>()));
     }
@@ -9763,5 +9772,28 @@ mod tests {
         // Still written as each block ends.
         assert_eq!(std::fs::read_to_string(dir.path().join("index.html")).unwrap(), body);
         assert_eq!(std::fs::read_to_string(dir.path().join("render.js")).unwrap(), body);
+    }
+
+    #[test]
+    fn an_idle_screen_lays_a_reply_out_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file: String = (0..430).map(|i| format!("  <div class=\"row-{i}\">markup {i}</div>\n")).collect();
+        std::fs::write(dir.path().join("index.html"), &file).unwrap();
+        let mut edits = String::new();
+        for i in (0..400).step_by(20) {
+            edits.push_str(&format!("<<<<<<< SEARCH\n  <div class=\"row-{i}\">markup {i}</div>\n=======\n  <div class=\"row-{i} bold\">markup {i}</div>\n>>>>>>> REPLACE\n"));
+        }
+        let text = format!("Bolder rows.\n\n```edit index.html\n{edits}```\n\nDone.\n");
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::User("make it bold".into()));
+        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1) };
+        app.entries.push(Entry::Reply(Reply { text, root: Some(dir.path().to_path_buf()), stats: Some(stats), ..Default::default() }));
+        let _ = screen(&app, 120, 40);
+        // Drawn again with nothing new, it isn't laid out again.
+        let Some(Entry::Reply(reply)) = app.entries.last() else { panic!() };
+        let at = reply.rendered_at.get();
+        let _ = screen(&app, 120, 40);
+        assert_eq!(reply.rendered_at.get(), at, "laid out again on an idle frame");
     }
 }
