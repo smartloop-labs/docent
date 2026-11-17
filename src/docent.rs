@@ -202,20 +202,23 @@ fn found(path: &Path, known: Option<&Entry>) -> std::io::Result<Found> {
 const SKIPPED_DIRS: [&str; 9] = ["node_modules", "target", "dist", "build", ".venv", "venv", "__pycache__", "vendor", ".out"];
 
 /// The documents under `root`: files of a kind the agent reads, past the
-/// ignore files, hidden folders and `SKIPPED_DIRS`.
+/// ignore files, hidden folders and `SKIPPED_DIRS`. In a code project only
+/// `DOCUMENTS`: its text files are already in the workspace index, and as
+/// documents they'd send every turn through a document search for nothing.
 fn walk(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
+    let kinds: &[&str] = if crate::files::project_kind(root).is_some() { &DOCUMENTS } else { &EXTENSIONS };
     ignore::WalkBuilder::new(root)
         .add_custom_ignore_filename(IGNORE_FILE)
         .require_git(false)
         .filter_entry(|e| e.depth() == 0 || !SKIPPED_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
         .build()
         .flatten()
-        .filter(|entry| {
+        .filter(move |entry| {
             let supported = entry
                 .path()
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+                .is_some_and(|e| kinds.contains(&e.to_ascii_lowercase().as_str()));
             supported && entry.file_type().is_some_and(|t| t.is_file())
         })
 }
@@ -1043,6 +1046,22 @@ mod tests {
             .map(|e| e.path().strip_prefix(dir.path()).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(found, ["docs/guide.md"]);
+    }
+
+    #[test]
+    fn a_code_project_syncs_only_what_it_cant_read() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["README.md", "notes.txt", "data.csv", "spec.pdf"] {
+            std::fs::write(dir.path().join(path), "x").unwrap();
+        }
+        let found = |dir: &Path| {
+            let mut found: Vec<String> = super::walk(dir).map(|e| relative_key(dir, e.path())).collect();
+            found.sort();
+            found
+        };
+        assert_eq!(found(dir.path()), ["README.md", "data.csv", "notes.txt", "spec.pdf"]);
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(found(dir.path()), ["spec.pdf"]);
     }
 
     use super::*;

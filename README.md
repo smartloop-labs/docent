@@ -273,10 +273,14 @@ then every few seconds pushes only what was added, changed or removed:
 - Your home folder (or one holding it) is never synced. A first sync of more
   than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
 - **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
-  and text files. Hidden folders, `.gitignore` and a `.docentignore` (same
-  syntax) keep files out, and so are build output and dependencies always:
-  `node_modules`, `target`, `dist`, `build`, `vendor`, `venv` and the like.
-  A document in a subfolder is stored flat, as `docs__guide.pdf`.
+  and text files. In a code project (a folder with a `Cargo.toml`,
+  `package.json`, `go.mod` or the like) only the PDF, Word, PowerPoint and
+  Excel files: the agent already reads its text files in place, so as
+  documents they'd only be indexed twice. Hidden folders, `.gitignore` and a
+  `.docentignore` (same syntax) keep files out, and so are build output and
+  dependencies always: `node_modules`, `target`, `dist`, `build`, `vendor`,
+  `venv` and the like. A document in a subfolder is stored flat, as
+  `docs__guide.pdf`.
 - **`.docentignore`** keeps files out of the project without keeping them out
   of git. Put it in the synced folder (or any folder under it, for that
   folder's files) and list paths or patterns, one per line, as in
