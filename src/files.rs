@@ -17,15 +17,19 @@ use std::path::{Component, Path, PathBuf};
 
 /// Told to the agent with a prompt that asks for something to be made.
 pub const HINT: &str = "If your answer creates or changes files, start with a line or two on what the \
-files below do and why, then give every one of them: a file you only describe isn't written. Give each \
-file whole with a shell heredoc in a fenced block marked `sh`: a line `cat > path/to/file <<'EOF'`, with the path \
-relative to the working folder, then the file's complete contents, then `EOF` alone on its line. Do so to change \
-a file that's there too: give it again whole, every line of it, changed or not, never a comment such as \
-`// ... rest unchanged` in place of lines, or it isn't written. When a file's contents hold a line of three \
-backticks, open and close its block with four. Include every file the change \
+files below do and why, then give every change: a change you only describe isn't made. Change a file that's \
+there with an edit block, never by giving it again whole: a fenced block marked `edit` with the file's path \
+after it (```` ```edit src/app.js ````), holding one or more pairs of a line `<<<<<<< SEARCH`, the lines to \
+change copied exactly from the file with a line or two around them so they're found once, a line `=======`, \
+the lines to put in their place, and a line `>>>>>>> REPLACE`. Copy the lines as the file has them, without \
+the line numbers `explore` shows. Give only the lines that change and a little around them, never the rest of \
+the file. Give a new file whole with a shell heredoc in a fenced block marked `sh`: a line \
+`cat > path/to/file <<'EOF'`, with the path relative to the working folder, then the file's complete contents, \
+then `EOF` alone on its line; never a comment such as `// ... rest unchanged` in place of lines. When a block's \
+contents hold a line of three backticks, open and close it with four. Include every change the request \
 needs, such as the manifest when the code uses a new dependency. I'm shown each change as a diff and the files \
 are written for me from those blocks, so don't tell me to create or edit them by hand. Asked to make \
-or save a skill, write it the same way, to `.docent/skills/<name>/SKILL.md`: frontmatter with its `name` and a \
+or save a skill, write it as a new file, to `.docent/skills/<name>/SKILL.md`: frontmatter with its `name` and a \
 one-line `description` of when to use it, then its instructions. Something to do in the folder that isn't a \
 file, such as committing or pushing to git, installing a dependency or running the tests, you do by giving the \
 shell commands for it in a fenced block marked `sh`: they're run for me in the working folder, in order, after \
@@ -36,9 +40,10 @@ a remote that isn't set, ask me for instead. A command that keeps running until 
 server or a watcher, you give with `&` at its end, as `npm run dev &`, in a block of its own: it's started in \
 the background, and what comes after doesn't wait for it.";
 
-/// A change to a file as it's to be written, the file given again whole,
-/// shown to the agent with `HINT` and again when a change is asked for over.
-pub const EDIT_EXAMPLE: &str = "For example, to change one line of `src/app.js`, give all of it again:\n\n```sh\ncat > src/app.js <<'EOF'\nconst speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\nEOF\n```";
+/// A change to a file that's there, as an edit block of just the lines
+/// that change, shown to the agent with `HINT` and again when a change is
+/// asked for over.
+pub const EDIT_EXAMPLE: &str = "For example, to change the speed in `src/app.js`, give just those lines:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 3;\n\nfunction tick(x) {\n=======\nconst speed = 5;\n\nfunction tick(x) {\n>>>>>>> REPLACE\n```";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -128,8 +133,8 @@ pub fn project_brief(root: &Path, kind: &str) -> String {
          of the codebase (its files, manifests and README), then call `{tool}` with the `paths` the request \
          concerns to read them, as many rounds as you need, and only then decide what to do. When I ask for code \
          or a change, answer with the code itself, not a description of it: change the project's files where the \
-         request fits them, keeping what they already do unless I ask otherwise. Give back whole only a file \
-         you've read whole.\n",
+         request fits them, keeping what they already do unless I ask otherwise. Read only the parts of a large \
+         file you need, by its lines, and change it with edit blocks quoting the lines you read.\n",
         kind,
         root.display(),
         tool = EXPLORE_TOOL,
@@ -321,6 +326,11 @@ pub fn explore_files(root: &Path, paths: &[String], budget: usize) -> Explored {
     }
     if text.is_empty() {
         text = format!("No paths given; call `{}` with none for the overview, or with `paths` to read files.", EXPLORE_TOOL);
+    } else {
+        text.push_str(
+            "\nThe numbers at the start of each line are for reference, not part of the file: leave them out of \
+             an edit's SEARCH and REPLACE lines.\n",
+        );
     }
     Explored { text: text.trim_start().to_string(), whole }
 }
@@ -625,6 +635,9 @@ pub struct Extracted {
     pub files: Vec<File>,
     pub edited: Vec<String>,
     pub failed: Vec<(String, String)>,
+    /// Files whose block the reply never closed: it was cut off, as at
+    /// the model's token limit, partway through them. Not written.
+    pub cut: Vec<String>,
 }
 
 /// The files in `reply`: each fenced block whose path is on the line above
@@ -654,8 +667,14 @@ pub fn extract_with(reply: &str, before: impl Fn(&str) -> Option<String>) -> Ext
 
 fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
     let mut files: Vec<File> = Vec::new();
-    let (mut edited, mut failed) = (Vec::new(), Vec::new());
+    let (mut edited, mut failed, mut cut) = (Vec::new(), Vec::new(), Vec::new());
     for block in blocks(reply) {
+        // Never closed, the reply stopped partway through it: written, the
+        // file would lose all it didn't get to.
+        if !block.closed {
+            cut.push(block.file.path);
+            continue;
+        }
         let mut file = block.file;
         if let Some(edits) = &block.edit {
             let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
@@ -678,7 +697,7 @@ fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
         files.retain(|f| f.path != file.path);
         files.push(file);
     }
-    Extracted { files, edited, failed }
+    Extracted { files, edited, failed, cut }
 }
 
 /// A line opening an edit's search text: `<<<<<<< SEARCH`.
@@ -835,6 +854,46 @@ pub fn plainly(why: &str) -> String {
 
 /// `text` with `edit`'s search text, found once, replaced.
 fn replace_once(text: &str, edit: &Edit) -> Result<String, String> {
+    let found = replace_exactly(text, edit);
+    // Not found as given, it may carry the line numbers `explore` shows:
+    // without them, both sides.
+    if found.is_err()
+        && let Some(search) = unnumbered(&edit.search)
+    {
+        let replace = unnumbered(&edit.replace).unwrap_or_else(|| edit.replace.clone());
+        let plain = Edit { search, replace, splits: Vec::new() };
+        if let Ok(done) = replace_exactly(text, &plain) {
+            return Ok(done);
+        }
+    }
+    found
+}
+
+/// `text` with the line numbers `explore` puts before each line taken off
+/// (`   12  code`), when every line that isn't blank has one; else none.
+fn unnumbered(text: &str) -> Option<String> {
+    let strip = |line: &str| -> Option<String> {
+        let rest = line.trim_start();
+        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+        (digits > 0 && rest[digits..].starts_with("  ")).then(|| rest[digits + 2..].to_string())
+    };
+    let mut out = Vec::new();
+    let mut numbered = false;
+    for line in text.lines() {
+        match strip(line) {
+            Some(rest) => {
+                numbered = true;
+                out.push(rest);
+            }
+            None if line.trim().is_empty() => out.push(String::new()),
+            None => return None,
+        }
+    }
+    let ends = if text.ends_with('\n') { "\n" } else { "" };
+    numbered.then(|| out.join("\n") + ends)
+}
+
+fn replace_exactly(text: &str, edit: &Edit) -> Result<String, String> {
     let (search, replace) = (edit.search.as_str(), edit.replace.as_str());
     match text.matches(search).count() {
         1 => return Ok(text.replacen(search, replace, 1)),
@@ -1916,8 +1975,9 @@ mod tests {
         assert_eq!(files[1].content, "const a = 1;\n");
         // A path line with prose after it names nothing.
         assert!(extract("File: a.rs\nnot code\n    nor this\n").is_empty());
-        // A fence left open runs to the end.
-        assert_eq!(extract("`a.rs`\n```rust\nfn f() {}\n")[0].content, "fn f() {}\n");
+        // A fence left open is the reply cut off in it: not taken.
+        let open = extract_with("`a.rs`\n```rust\nfn f() {}\n", |_| None);
+        assert!(open.files.is_empty() && open.cut == ["a.rs"], "{:?}", open.cut);
     }
 
     #[test]
@@ -2260,6 +2320,36 @@ mod tests {
         let cut = "```sh\ncat > a.txt <<EOF\nhi\n```\nmore prose";
         assert_eq!(extract(cut)[0].content, "hi\n");
         assert!(blocks(cut)[0].closed);
+    }
+
+    #[test]
+    fn an_edit_with_explores_line_numbers_still_applies() {
+        let file = "let a = 1;\nlet b = 2;\n\nlet c = 3;\n";
+        let numbered = "```edit app.js\n<<<<<<< SEARCH\n    2  let b = 2;\n\n    4  let c = 3;\n=======\n    2  let b = 20;\n\n    4  let c = 3;\n>>>>>>> REPLACE\n```\n";
+        let found = extract_with(numbered, |_| Some(file.into()));
+        assert!(found.failed.is_empty(), "{:?}", found.failed);
+        assert_eq!(found.files[0].content, "let a = 1;\nlet b = 20;\n\nlet c = 3;\n");
+        // Code that only starts with a number is left as it is.
+        assert_eq!(unnumbered("10 items\n"), None);
+        assert_eq!(unnumbered("   7  x\n"), Some("x\n".to_string()));
+        // The example the agent is shown applies.
+        let example = EDIT_EXAMPLE.split_once("\n\n").unwrap().1;
+        let app = "const speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\n";
+        let done = extract_with(example, |_| Some(app.into()));
+        assert_eq!(done.files[0].content, app.replace("speed = 3", "speed = 5"));
+    }
+
+    #[test]
+    fn a_file_the_reply_was_cut_off_in_isnt_taken() {
+        // At the token limit, partway through the second file.
+        let reply = "```sh\ncat > a.txt <<'EOF'\nwhole\nEOF\n```\n\n```sh\ncat > index.html <<'EOF'\n<html>\n<script>\nctx";
+        let found = extract_with(reply, |_| None);
+        assert_eq!(found.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a.txt"]);
+        assert_eq!(found.cut, ["index.html"]);
+        // An edit cut off is left too, not half made.
+        let edit = "```edit app.js\n<<<<<<< SEARCH\nold\n=======\nne";
+        let found = extract_with(edit, |_| Some("old\n".into()));
+        assert!(found.files.is_empty() && found.cut == ["app.js"], "{:?}", found.cut);
     }
 
     #[test]

@@ -1232,7 +1232,7 @@ impl Tooling {
                 // no question, and what was read whole may be given back so.
                 if call.name == files::EXPLORE_TOOL {
                     let (result, note) = self.explore(&call.arguments);
-                    shown.push_str(&format!("\n\n_{}_\n", note));
+                    shown.push_str(&format!("\n\n{}\n", note));
                     c.result = Some(result);
                     return c;
                 }
@@ -1241,7 +1241,7 @@ impl Tooling {
                 if call.name == crate::web::TOOL {
                     match crate::web::query(&call.arguments) {
                         Ok(query) => {
-                            shown.push_str(&format!("\n\n_Searching the web: {}_\n", query.replace('\n', " ")));
+                            shown.push_str(&format!("\n\nSearching the web: {}\n", query.replace('\n', " ")));
                             self.searches.push((c.id.clone(), query));
                         }
                         Err(why) => c.result = Some(why),
@@ -2301,6 +2301,13 @@ impl App {
             self.files_asked = true;
             return self.ask_for_files();
         }
+        // Cut off partway through a file, the reply leaves it as it is.
+        if !found.cut.is_empty() {
+            self.entries.push(Entry::Warning(format!(
+                "Not written, as the reply stopped partway through: {}; ask again, for less at a time",
+                found.cut.join(", ")
+            )));
+        }
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
         self.apply_reply(root, found.files, &whole, commands, found.failed);
@@ -2406,8 +2413,9 @@ impl App {
         self.entries.push(Entry::Notice(format!("Asking the agent for those edits again (try {} of {})", self.edit_round, EDIT_ROUNDS)));
         let message = format!(
             "These changes from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
-             just those files again, each whole as a heredoc: every line of it as it is to be, changed or not, with \
-             no comment standing in for lines. Don't repeat the files that were written.\n\n{}",
+             just those changes again as edit blocks, their SEARCH lines copied exactly from the files as they are \
+             now, above, with a line or two around them so each is found once. Don't repeat the changes that were \
+             made.\n\n{}",
             reasons.join("\n"),
             files.join("\n\n"),
             files::EDIT_EXAMPLE
@@ -7366,7 +7374,8 @@ mod tests {
         assert!(result.starts_with("A Rust project at"), "{}", result);
         assert!(result.contains("- src/main.rs (1 lines)"), "{}", result);
         let Some(Entry::Reply(shown)) = app.entries.iter().rev().nth(1) else { panic!() };
-        assert!(shown.text.contains("_Read the codebase's overview_"), "{}", shown.text);
+        assert!(shown.text.contains("\n\nRead the codebase's overview\n"), "{}", shown.text);
+        assert!(!shown.text.contains("_Read"), "{}", shown.text);
 
         // Then the files it wants: read whole, so a reply may give them back so.
         reply(&mut app, vec![call("call_2", r#"{"paths": ["src/main.rs"]}"#)]);
@@ -7382,7 +7391,7 @@ mod tests {
         reply(&mut app, vec![search("call_3", r#"{"query": "tokio select"}"#), search("call_4", "{}")]);
         assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the search");
         let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
-        assert!(shown.text.contains("_Searching the web: tokio select_"), "{}", shown.text);
+        assert!(shown.text.contains("\n\nSearching the web: tokio select\n"), "{}", shown.text);
         let tooling = app.tooling.as_ref().unwrap();
         assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no `query` given")));
         app.apply(AppEvent::Searched("call_9".into(), "stray".into()));
