@@ -62,10 +62,6 @@ const MARKERS: [(&str, &str); 14] = [
 const SKIPPED: [&str; 10] =
     ["target", "node_modules", "dist", "build", ".venv", "venv", "__pycache__", "vendor", ".out", ".docent"];
 
-/// Generated files the agent needn't read.
-const LOCKS: [&str; 7] =
-    ["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "go.sum", "Gemfile.lock"];
-
 /// Most of the project's files listed for the agent.
 const LISTED: usize = 200;
 /// Characters of file contents sent with a prompt when nothing better is
@@ -107,46 +103,49 @@ pub fn missing_manifest(root: &Path, written: &[String]) -> Option<(&'static str
     })
 }
 
-/// Source files, by extension: where a change most often goes, so shown
-/// before configuration and docs.
-const SOURCE: [&str; 26] = [
-    "rs", "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "go", "java", "kt", "kts", "rb", "php", "swift", "c", "cc",
-    "cpp", "h", "hpp", "ex", "exs", "vue", "svelte", "cs", "scala",
-];
-
-/// Words of a prompt too common to pick out a file's lines.
-const COMMON: [&str; 28] = [
-    "this", "that", "with", "from", "what", "when", "then", "into", "file", "files", "code", "project", "make",
-    "create", "update", "change", "please", "should", "would", "also", "have", "there", "where", "which", "their",
-    "about", "like", "just",
-];
-/// Least room left for one more file's contents to be worth showing.
+/// Least room left for one more file's contents to be worth reading.
 const EXCERPT_MIN: usize = 1_500;
-/// Lines shown around one a prompt's word is on, in a file too big to show whole.
-const AROUND: usize = 6;
 
-/// What the agent is told of a code project with a prompt that makes files.
-pub struct Context {
-    pub text: String,
-    /// The files shown whole, which a reply can give back whole.
-    pub whole: Vec<String>,
+/// The name of the tool the agent reads the project with.
+pub const EXPLORE_TOOL: &str = "explore";
+
+/// Characters of one manifest or README the overview shows, at most.
+const OVERVIEW_DOC: usize = 6_000;
+/// Top-level docs the overview shows with the manifests.
+const READMES: [&str; 4] = ["README.md", "README", "readme.md", "README.txt"];
+
+/// What the agent is told of a code project with a prompt: the kind of
+/// project, where it is and its git state, and that it reads the code
+/// itself with `explore` before it decides what to do. Nothing of the
+/// files' contents: the agent asks for what the request needs, rather than
+/// docent guessing it from the prompt's words.
+pub fn project_brief(root: &Path, kind: &str) -> String {
+    let mut text = format!(
+        "I'm working in the {} project at {}. This is about that project, not a general question: answer from \
+         its files. For what they and your own knowledge don't tell, or may have out of date, such as a \
+         library's current API or an error message, call `web_search` when you have it. You haven't seen the \
+         code yet. Before you answer or change anything, call the `{tool}` tool with no arguments for an overview \
+         of the codebase (its files, manifests and README), then call `{tool}` with the `paths` the request \
+         concerns to read them, as many rounds as you need, and only then decide what to do. When I ask for code \
+         or a change, answer with the code itself, not a description of it: change the project's files where the \
+         request fits them, keeping what they already do unless I ask otherwise. Give back whole only a file \
+         you've read whole.\n",
+        kind,
+        root.display(),
+        tool = EXPLORE_TOOL,
+    );
+    if let Some(git) = git_state(root) {
+        text.push_str("\nIts git state:\n```\n");
+        text.push_str(&git);
+        text.push_str("\n```\n");
+    }
+    text
 }
 
-/// What the agent is told of the code project at `root` with `prompt`, a
-/// request that makes files: the kind of project, its files, and the
-/// contents of those that matter most to the request, as far as they fit,
-/// so it answers about this project with code that fits what's there,
-/// rather than in general. Files the prompt names come first, then the
-/// source, then the rest; one too big to show whole shows the parts the
-/// prompt's words are in, and says so. `kind` is what the project is,
-/// as in "Rust"; `budget` the characters of contents to send, for the
-/// model's window (`budget_for`), half of it at most for one file. The
-/// framework fits the prompt to the model its orchestrator picks, keeping
-/// its head and tail; so what matters most comes first (the file list,
-/// the git state, the manifests and the files the prompt names), the bulk
-/// after, and the request with `HINT` closes the message.
-pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> Context {
-    let shown_each = budget / 2;
+/// The project's files under `root`, relative and with `/` separators:
+/// hidden folders, `.gitignore`d files, build output and dependencies left
+/// out; the manifests first, then by path.
+fn project_files(root: &Path) -> Vec<String> {
     let mut paths: Vec<String> = ignore::WalkBuilder::new(root)
         .require_git(false)
         .filter_entry(|e| e.depth() == 0 || !SKIPPED.contains(&e.file_name().to_string_lossy().as_ref()))
@@ -156,77 +155,174 @@ pub fn project_context(root: &Path, kind: &str, prompt: &str, budget: usize) -> 
         .filter_map(|e| e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
         .collect();
     let is_manifest = |p: &str| MARKERS.iter().any(|(m, _)| *m == p);
-    // The manifests first, then by path.
     paths.sort_by_key(|p| (!is_manifest(p), p.clone()));
-    let mut text = format!(
-        "I'm working in the {} project at {}. This is about that project, not a general question: answer from \
-         its files below and what's in the folder; the web is for what they don't tell, such as a library's \
-         current API, not for a general answer. When I ask for code or a change, answer with the code itself, \
-         not a description of it: change the project's files where the request fits them, keeping what they \
-         already do unless I ask otherwise.\n\n\
-         Its files:\n",
-        kind,
-        root.display()
-    );
+    paths
+}
+
+/// `explore` with no paths: an overview of the folder at `root`, for the
+/// agent to decide from what to read. What kind of project it is, its
+/// files with their sizes (lines for text, bytes otherwise), and the
+/// contents of its manifests and README, each cut at `OVERVIEW_DOC`.
+pub fn explore_overview(root: &Path) -> String {
+    let paths = project_files(root);
+    let mut text = match project_kind(root) {
+        Some(kind) => format!("A {} project at {}, {} files.\n", kind, root.display(), paths.len()),
+        None if paths.is_empty() => format!("{} is empty.\n", root.display()),
+        None => format!("A folder at {}, {} files, with no build manifest.\n", root.display(), paths.len()),
+    };
+    if paths.is_empty() {
+        return text;
+    }
+    text.push_str("\nFiles:\n");
     for path in paths.iter().take(LISTED) {
-        text.push_str(&format!("- {}\n", path));
+        let size = match fs::read(root.join(path)) {
+            Ok(bytes) if !bytes.contains(&0) => format!("{} lines", bytes.iter().filter(|b| **b == b'\n').count()),
+            Ok(bytes) => format!("{} bytes", bytes.len()),
+            Err(_) => "unreadable".to_string(),
+        };
+        text.push_str(&format!("- {} ({})\n", path, size));
     }
     if paths.len() > LISTED {
-        text.push_str(&format!("- …and {} more\n", paths.len() - LISTED));
+        text.push_str(&format!("- …and {} more; `ls` or `find` with the shell tool lists them\n", paths.len() - LISTED));
     }
-    // Contents, the most relevant first: the manifests, the files the
-    // prompt names, the source, then the rest, each group by path.
-    let lower = prompt.to_lowercase();
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() >= 4 && !COMMON.contains(w))
-        .collect();
-    let mentioned = |p: &str| {
-        let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
-        let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
-        lower.contains(&name) || words.iter().any(|w| *w == stem)
-    };
-    let is_source = |p: &str| p.rsplit_once('.').is_some_and(|(_, ext)| SOURCE.contains(&ext));
-    let mut order: Vec<&String> =
-        paths.iter().filter(|p| !LOCKS.contains(&p.rsplit('/').next().unwrap_or(p))).collect();
-    order.sort_by_key(|p| (!is_manifest(p), !mentioned(p), !is_source(p), (*p).clone()));
-    let mut room = budget;
-    let mut shown = String::new();
-    let mut whole = Vec::new();
-    for path in order {
-        if room < EXCERPT_MIN {
-            break;
-        }
+    let docs = MARKERS.iter().map(|(m, _)| *m).chain(READMES).filter(|p| root.join(p).is_file());
+    let mut seen = Vec::new();
+    for path in docs {
         let Ok(content) = fs::read_to_string(root.join(path)) else { continue };
-        if content.contains('\0') {
+        // A case-insensitive file system finds `README.md` twice.
+        if seen.contains(&content) {
             continue;
         }
-        let limit = shown_each.min(room);
-        let (body, note) = if content.len() <= limit {
-            whole.push(path.clone());
-            (content.trim_end().to_string(), String::new())
-        } else {
-            let (part, lines) = excerpt(&content, &words, limit);
-            let what = if lines == 0 { "its start".to_string() } else { format!("{} of its {} lines", lines, content.lines().count()) };
-            (part, format!(" ({}, for reference: don't give this file back whole)", what))
+        let body = cut(&content, OVERVIEW_DOC).trim_end();
+        let note = if body.len() < content.trim_end().len() { " (its start)" } else { "" };
+        let fence = if body.contains("```") { "````" } else { "```" };
+        text.push_str(&format!("\n`{}`{}\n{}\n{}\n{}\n", path, note, fence, body, fence));
+        seen.push(content);
+    }
+    text.push_str(&format!(
+        "\nRead the files the request concerns with `{}` and their `paths`; a large one by its lines, as \
+         `src/app.rs:120-260`.\n",
+        EXPLORE_TOOL
+    ));
+    text
+}
+
+/// What `explore` with paths read: the text for the agent, and the files it
+/// was given whole, which a reply may give back whole.
+pub struct Explored {
+    pub text: String,
+    pub whole: Vec<String>,
+}
+
+/// `path`, or `path:START-END`, as the agent asks for it: the relative path
+/// and the 1-based lines, both ends kept.
+fn explore_target(asked: &str) -> (&str, Option<(usize, usize)>) {
+    if let Some((path, lines)) = asked.rsplit_once(':')
+        && let Some((a, b)) = lines.split_once('-')
+        && let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+        && a >= 1
+        && b >= a
+    {
+        return (path, Some((a, b)));
+    }
+    (asked, None)
+}
+
+/// `path` relative to `root`, when it's an absolute path inside it: as
+/// given, or with the folder's real path, links resolved.
+fn within(root: &Path, path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return None;
+    }
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let rest = path.strip_prefix(root).ok().or_else(|| path.strip_prefix(real(root)).ok())?;
+    Some(rest.to_string_lossy().replace('\\', "/"))
+}
+
+/// `explore` with `paths`: each file's contents, numbered by line, as far as
+/// `budget` characters go, half of it at most for one file; a folder's
+/// files listed. Paths are relative to `root` and stay in it.
+pub fn explore_files(root: &Path, paths: &[String], budget: usize) -> Explored {
+    let each = (budget / 2).max(EXCERPT_MIN);
+    let mut room = budget;
+    let (mut text, mut whole) = (String::new(), Vec::new());
+    for asked in paths {
+        let asked = asked.trim().trim_start_matches("./");
+        let (path, lines) = explore_target(asked);
+        // Models give back the folder's full path, as the prompt shows it:
+        // one inside the folder is read by its relative path.
+        let relative = within(root, path);
+        let path = relative.as_deref().unwrap_or(path).trim_end_matches('/');
+        let safe = !path.is_empty()
+            && Path::new(path).components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        if !safe {
+            text.push_str(&format!("\n`{}`: not read; give a path relative to the project folder, inside it\n", asked));
+            continue;
+        }
+        let full = root.join(path);
+        // A link inside the folder to a file outside it isn't read either.
+        let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if full.canonicalize().is_ok_and(|real| !real.starts_with(&real_root)) {
+            text.push_str(&format!("\n`{}`: not read; it leads outside the project folder\n", asked));
+            continue;
+        }
+        if full.is_dir() {
+            let prefix = format!("{}/", path);
+            let inside: Vec<String> = project_files(root).into_iter().filter(|p| p.starts_with(&prefix)).collect();
+            text.push_str(&format!("\n`{}/` holds {} files:\n", path, inside.len()));
+            for p in inside.iter().take(LISTED) {
+                text.push_str(&format!("- {}\n", p));
+            }
+            continue;
+        }
+        let content = match fs::read(&full) {
+            Ok(bytes) if bytes.contains(&0) => {
+                text.push_str(&format!("\n`{}`: not text ({} bytes)\n", path, bytes.len()));
+                continue;
+            }
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                text.push_str(&format!("\n`{}`: not read ({})\n", path, e));
+                continue;
+            }
         };
+        if room < EXCERPT_MIN {
+            text.push_str(&format!("\n`{}`: not read, as this call read as much as fits; ask for it again\n", asked));
+            continue;
+        }
+        let all: Vec<&str> = content.lines().collect();
+        let (first, last) = lines.map_or((1, all.len()), |(a, b)| (a, b.min(all.len())));
+        let limit = each.min(room);
+        let mut body = String::new();
+        let mut shown_to = first.saturating_sub(1);
+        for (i, line) in all.iter().enumerate().take(last).skip(first.saturating_sub(1)) {
+            let numbered = format!("{:>5}  {}\n", i + 1, line);
+            if body.len() + numbered.len() > limit {
+                break;
+            }
+            body.push_str(&numbered);
+            shown_to = i + 1;
+        }
         room = room.saturating_sub(body.len());
+        let complete = first == 1 && shown_to >= all.len();
+        let note = if complete {
+            whole.push(path.to_string());
+            format!("{} lines, whole", all.len())
+        } else if shown_to < first {
+            format!("{} lines; nothing in lines {}-{}", all.len(), first, last)
+        } else {
+            let more = if shown_to < last { format!("; ask for `{}:{}-…` for more", path, shown_to + 1) } else { String::new() };
+            format!("lines {}-{} of {}{}, for reference: don't give this file back whole", first, shown_to, all.len(), more)
+        };
         let fence = if body.contains("```") { "````" } else { "```" };
         let lang = path.rsplit_once('.').map_or("", |(_, ext)| ext);
-        shown.push_str(&format!("\n`{}`{}\n{}{}\n{}\n{}\n", path, note, fence, lang, body, fence));
+        text.push_str(&format!("\n`{}` ({})\n{}{}\n{}{}\n", path, note, fence, lang, body, fence));
     }
-    // Ahead of the contents: a model whose window the prompt outruns gets
-    // its head and tail, and loses the middle.
-    if let Some(git) = git_state(root) {
-        text.push_str("\nIts git state:\n```\n");
-        text.push_str(&git);
-        text.push_str("\n```\n");
+    if text.is_empty() {
+        text = format!("No paths given; call `{}` with none for the overview, or with `paths` to read files.", EXPLORE_TOOL);
     }
-    if !shown.is_empty() {
-        text.push_str("\nTheir contents now:\n");
-        text.push_str(&shown);
-    }
-    Context { text, whole }
+    Explored { text: text.trim_start().to_string(), whole }
 }
 
 /// The folder's git branch, remotes and changed files, as `git status
@@ -394,39 +490,6 @@ pub fn placeholders(script: &str) -> Vec<String> {
         }
     }
     found
-}
-
-/// Up to `limit` bytes of `content`, a file too big to show whole: the
-/// lines around those that have one of `words`, runs apart marked `…`,
-/// and the number of lines that is; with no such line, its start.
-fn excerpt(content: &str, words: &[&str], limit: usize) -> (String, usize) {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut keep = vec![false; lines.len()];
-    for (i, line) in lines.iter().enumerate() {
-        let low = line.to_lowercase();
-        if words.iter().any(|w| low.contains(w)) {
-            for k in i.saturating_sub(AROUND)..(i + AROUND + 1).min(lines.len()) {
-                keep[k] = true;
-            }
-        }
-    }
-    if !keep.iter().any(|k| *k) {
-        return (cut(content, limit).trim_end().to_string(), 0);
-    }
-    let (mut text, mut count, mut last) = (String::new(), 0, None);
-    for (i, line) in lines.iter().enumerate().filter(|(i, _)| keep[*i]) {
-        if text.len() + line.len() + 2 > limit {
-            break;
-        }
-        if last.is_some_and(|l| l + 1 != i) {
-            text.push_str("…\n");
-        }
-        text.push_str(line);
-        text.push('\n');
-        count += 1;
-        last = Some(i);
-    }
-    (text.trim_end().to_string(), count)
 }
 
 /// The first `limit` bytes of `text`, on a character.
@@ -1964,71 +2027,99 @@ mod tests {
     }
 
     #[test]
-    fn a_code_project_is_described_with_its_files() {
+    fn a_code_project_is_briefed_and_left_for_the_agent_to_read() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(project_kind(dir.path()), None);
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
         assert_eq!(project_kind(dir.path()), Some("Rust"));
-        fs::write(dir.path().join("Cargo.lock"), "lock").unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let text = project_brief(dir.path(), "Rust");
+        assert!(text.starts_with("I'm working in the Rust project at"), "{}", text);
+        assert!(text.contains("not a general question"), "{}", text);
+        assert!(text.contains("call the `explore` tool"), "{}", text);
+        // None of the files' contents: the agent asks for them.
+        assert!(!text.contains("fn main()") && !text.contains("[package]"), "{}", text);
+    }
+
+    #[test]
+    fn the_overview_lists_the_files_with_the_manifests_and_readme() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        fs::write(dir.path().join("README.md"), "# Tool\nDoes things.\n").unwrap();
+        fs::write(dir.path().join("Cargo.lock"), "lock\n").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("logo.png"), [0u8, 1, 2, 3]).unwrap();
         fs::create_dir_all(dir.path().join("target/debug")).unwrap();
         fs::write(dir.path().join("target/debug/x.rs"), "built").unwrap();
         fs::create_dir_all(dir.path().join(".hidden")).unwrap();
         fs::write(dir.path().join(".hidden/x.rs"), "hidden").unwrap();
-        let context = project_context(dir.path(), "Rust", "", DEFAULT_BUDGET);
-        let text = context.text;
-        assert_eq!(context.whole, ["Cargo.toml", "src/main.rs"]);
-        assert!(text.starts_with("I'm working in the Rust project at"), "{}", text);
-        assert!(text.contains("not a general question"), "{}", text);
-        assert!(text.contains("- Cargo.toml\n- Cargo.lock\n- src/main.rs\n"), "{}", text);
-        assert!(text.contains("`src/main.rs`\n```rs\nfn main() {}\n```"), "{}", text);
-        assert!(!text.contains("target") && !text.contains("\nlock\n"), "{}", text);
-        assert!(!text.contains(".hidden"), "{}", text);
+        let text = explore_overview(dir.path());
+        assert!(text.starts_with("A Rust project at"), "{}", text);
+        assert!(text.contains("- Cargo.toml (2 lines)\n"), "{}", text);
+        assert!(text.contains("- src/main.rs (1 lines)\n"), "{}", text);
+        assert!(text.contains("- logo.png (4 bytes)\n"), "{}", text);
+        assert!(text.contains("`Cargo.toml`\n```\n[package]\nname = \"t\"\n```"), "{}", text);
+        assert!(text.contains("`README.md`\n```\n# Tool\nDoes things.\n```"), "{}", text);
+        // Source isn't shown, only listed; build output and hidden folders aren't.
+        assert!(!text.contains("fn main()"), "{}", text);
+        assert!(!text.contains("target") && !text.contains(".hidden"), "{}", text);
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(explore_overview(empty.path()).ends_with("is empty.\n"));
     }
 
     #[test]
-    fn the_files_a_prompt_concerns_are_shown_first_and_big_ones_in_part() {
+    fn explore_reads_files_by_line_within_the_folder_and_budget() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
-        fs::write(dir.path().join("README.md"), "# Docs\n").unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        fs::write(dir.path().join("src/news.rs"), "pub fn news() {}\n").unwrap();
-        let big: String = (1..=1400).map(|i| format!("    let value_{} = {};\n", i, i)).collect();
-        let big = format!("{}fn status_line() {{}}\n{}", big, big);
+        let big: String = (1..=3000).map(|i| format!("let value_{} = {};\n", i, i)).collect();
         fs::write(dir.path().join("src/ui.rs"), &big).unwrap();
-        let text = project_context(dir.path(), "Rust", "Fix the status line in the news feed", DEFAULT_BUDGET);
-        // A wider window takes the big file whole.
-        let wide = project_context(dir.path(), "Rust", "Fix the status line in the news feed", MOST_BUDGET);
-        assert!(wide.whole.contains(&"src/ui.rs".to_string()), "{:?}", wide.whole);
+        let paths = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let read = explore_files(dir.path(), &paths(&["src/main.rs"]), DEFAULT_BUDGET);
+        assert_eq!(read.whole, ["src/main.rs"]);
+        assert!(read.text.contains("`src/main.rs` (1 lines, whole)\n```rs\n    1  fn main() {}\n```"), "{}", read.text);
+
+        // A big file in part, said so, and how to read on.
+        let read = explore_files(dir.path(), &paths(&["src/ui.rs"]), DEFAULT_BUDGET);
+        assert!(read.whole.is_empty());
+        assert!(read.text.contains("lines 1-"), "{}", read.text);
+        assert!(read.text.contains("don't give this file back whole"), "{}", read.text);
+        assert!(read.text.contains("ask for `src/ui.rs:"), "{}", read.text);
+
+        // By its lines.
+        let read = explore_files(dir.path(), &paths(&["src/ui.rs:2000-2002"]), DEFAULT_BUDGET);
+        assert!(read.text.contains(" 2000  let value_2000 = 2000;\n 2001  let value_2001 = 2001;\n 2002  let value_2002 = 2002;\n"), "{}", read.text);
+        assert!(!read.text.contains("value_1999") && !read.text.contains("value_2003"), "{}", read.text);
+
+        // An absolute path inside the folder is read, as models give one.
+        let full = format!("{}/src/main.rs", dir.path().display());
+        let read = explore_files(dir.path(), &paths(&[full.as_str()]), DEFAULT_BUDGET);
+        assert_eq!(read.whole, ["src/main.rs"], "{}", read.text);
+
+        // A folder lists its files; nothing outside the folder is read.
+        let read = explore_files(dir.path(), &paths(&["src/", "../etc/passwd", "/etc/passwd", "nope.rs"]), DEFAULT_BUDGET);
+        assert!(read.text.contains("`src/` holds 2 files:\n- src/main.rs\n- src/ui.rs\n"), "{}", read.text);
+        assert!(read.text.contains("`../etc/passwd`: not read; give a path relative"), "{}", read.text);
+        assert!(read.text.contains("`/etc/passwd`: not read; give a path relative"), "{}", read.text);
+        assert!(read.text.contains("`nope.rs`: not read ("), "{}", read.text);
+        assert!(read.whole.is_empty());
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("secret"), "key\n").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+            let read = explore_files(dir.path(), &paths(&["link"]), DEFAULT_BUDGET);
+            assert!(read.text.contains("`link`: not read; it leads outside"), "{}", read.text);
+        }
+
         assert_eq!(budget_for(None), DEFAULT_BUDGET);
         assert_eq!(budget_for(Some(32_768)), 65_536);
         assert_eq!(budget_for(Some(4_096)), DEFAULT_BUDGET);
         assert_eq!(budget_for(Some(1_048_576)), MOST_BUDGET);
-        let at = |needle: &str| text.text.find(needle).unwrap_or(usize::MAX);
-        // The manifest, the file the prompt names, the source, then the docs.
-        assert!(at("`Cargo.toml`") < at("`src/news.rs`"), "{}", text.text);
-        assert!(at("`src/news.rs`") < at("`src/main.rs`"), "{}", text.text);
-        assert!(at("`src/main.rs`") < at("`README.md`"), "{}", text.text);
-        // The big file shows the lines around the prompt's words, and says so.
-        assert!(text.text.contains("`src/ui.rs` (13 of its 2801 lines, for reference: don't give this file back whole)"), "{}", text.text);
-        assert!(text.text.contains("fn status_line() {}"), "{}", text.text);
-        assert!(!text.text.contains("let value_300 = 300;"), "{}", text.text);
-        assert!(!text.whole.contains(&"src/ui.rs".to_string()));
-        assert!(text.whole.contains(&"src/news.rs".to_string()));
-    }
-
-    #[test]
-    fn an_excerpt_takes_the_lines_around_the_words_or_the_start() {
-        // Hits on lines 5 and 35 of 41: six lines around each, a break between.
-        let content: String = (0..41).map(|i| if i == 5 || i == 35 { "hit\n".to_string() } else { format!("l{}\n", i) }).collect();
-        let (part, lines) = excerpt(&content, &["hit"], 1000);
-        assert_eq!(lines, 24);
-        assert!(part.starts_with("l0\nl1\n"), "{}", part);
-        assert!(part.contains("l11\n…\nl29\n"), "{}", part);
-        assert!(part.ends_with("hit\nl36\nl37\nl38\nl39\nl40"), "{}", part);
-        assert_eq!(excerpt("one\ntwo\n", &["zzz"], 5), ("one\nt".to_string(), 0));
         assert_eq!(cut("héllo", 2), "h");
     }
 

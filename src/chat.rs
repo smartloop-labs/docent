@@ -127,12 +127,13 @@ pub struct Request<'a> {
     /// message.
     pub attachments: &'a [String],
     pub project_id: &'a str,
-    pub cwd: Option<&'a std::path::Path>,
     pub session_id: &'a str,
-    /// Offer the `bash` tool: on any turn with a working directory, where
-    /// its commands run. A server that won't give tools
+    /// Offer the `bash` and `explore` tools: on any turn with a working
+    /// directory, where its commands run and its files are read. A server that won't give tools
     /// to the model it picked ignores it and answers in text, as before.
     pub tools: bool,
+    /// Offer `web_search` too: the project's web search is on.
+    pub web_search: bool,
     /// The turn's tool rounds so far, after the user's message: each
     /// assistant message with its `tool_calls`, then a `tool` message with
     /// each call's result.
@@ -191,6 +192,33 @@ pub fn bash_tool() -> serde_json::Value {
                     "description": {"type": "string", "description": "What the command does, in a few words"},
                 },
                 "required": ["command"],
+            },
+        },
+    })
+}
+
+/// The tool the model reads the project with, run by docent in the
+/// project folder with no approval, as it only reads: with no `paths`, an
+/// overview of the codebase (its files and their sizes, manifests and
+/// README); with `paths`, those files' contents by line, or a folder's
+/// files. The model calls it first to understand the code, then decides
+/// what to read next and what to do, rather than docent guessing which
+/// files the request needs and the agent indexing the whole folder.
+pub fn explore_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": crate::files::EXPLORE_TOOL,
+            "description": "Read the project to understand it before you answer or change anything. With no `paths`, returns an overview of the codebase: what kind of project it is, its files with their sizes, and its manifests and README. With `paths`, returns those files' contents with line numbers (a folder lists its files). Call it with no arguments first, then with the files the request concerns, as many times as you need.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Files or folders to read, relative to the project folder; a large file by its lines, as `src/app.rs:120-260`. Leave out for the overview."
+                    },
+                },
             },
         },
     })
@@ -272,17 +300,23 @@ pub fn request_body(request: &Request) -> serde_json::Value {
     }
     messages.push(user);
     messages.extend(request.rounds.iter().cloned());
-    let cwd = request.cwd.map(|dir| dir.to_string_lossy().into_owned());
+    // No `cwd`: given one, the agent binds the project to that folder and
+    // indexes it before every turn, which in a large folder takes minutes.
+    // The model reads the folder itself instead, with `explore`, as far as
+    // the request needs.
     let mut body = serde_json::json!({
         "model": "sl-mini",
         "messages": messages,
         "session_id": request.session_id,
         "project_id": request.project_id,
-        "cwd": cwd,
         "stream": true,
     });
     if request.tools {
-        body["tools"] = serde_json::json!([bash_tool()]);
+        let mut tools = vec![bash_tool(), explore_tool()];
+        if request.web_search {
+            tools.push(crate::web::tool());
+        }
+        body["tools"] = serde_json::json!(tools);
         body["tool_choice"] = serde_json::json!("auto");
     }
     body
@@ -373,9 +407,9 @@ async fn stream_turn_once(
     Ok(TurnStats { tokens, elapsed: started.elapsed() })
 }
 
-/// The folder a turn of `project_id` works in: the agent binds the project
-/// to it on first use, then indexes and explores it. That's the folder the
-/// project syncs from, when it has one, wherever the chat was opened; never
+/// The folder a turn of `project_id` works in: its commands run there and
+/// `explore` reads it. That's the folder the
+/// project is linked to, when it has one, wherever the chat was opened; never
 /// one linked to another project.
 pub fn turn_dir(project_id: &str) -> Option<std::path::PathBuf> {
     std::env::current_dir().ok().and_then(|here| crate::docent::workspace(project_id, &here))
@@ -383,7 +417,7 @@ pub fn turn_dir(project_id: &str) -> Option<std::path::PathBuf> {
 
 /// The folder a turn that makes files works in: the one the chat was opened
 /// in, so the agent reads the code that's there and the files land next to
-/// it. None when that folder syncs to another project, or this project is
+/// it. None when that folder is linked to another project, or this project is
 /// linked to a folder elsewhere: the agent only works in the folder its
 /// project is bound to, and sent any other it falls back to its own state
 /// under `~/.smartloop`, writing and citing files there.
@@ -502,8 +536,7 @@ impl From<&str> for Reference {
 
 /// What clicking `citation` opens. A web source opens its page and a tool
 /// nothing. A document opens, best first: the file the agent gave the full
-/// path of; the file under `root` that `/sync` pushed by the document's
-/// name; the copy the agent keeps under `project_dir`, at the
+/// path of; the file of that name under `root`, the project's folder; the copy the agent keeps under `project_dir`, at the
 /// `document_path` it gave or else in `documents/` by name, which only an
 /// agent on this machine has. A file that isn't there is passed over.
 pub fn reference(
@@ -525,9 +558,9 @@ pub fn reference(
         return found(given);
     }
     if let Some(name) = name(citation) {
-        if let Some((key, path)) = root.and_then(|root| crate::docent::synced_file(root, name)) {
-            let label = label(citation, Some(&key))?;
-            return Some(Reference { label, target: Some(crate::links::file_url(&path)) });
+        let here = root.map(|root| root.join(name)).filter(|p| p.is_file() && !name.contains(".."));
+        if let Some(path) = here {
+            return found(Some(crate::links::file_url(&path)));
         }
         let copy = project_dir
             .into_iter()
@@ -543,7 +576,7 @@ pub fn reference(
     found(None)
 }
 
-/// The references for `citations`, found from the folder `project` syncs
+/// The references for `citations`, found from the folder `project` is linked to
 /// from (its own, else the working directory's when that's linked to it)
 /// and the project's folder at the agent when the agent runs here.
 pub fn references(citations: &[Citation], project: Option<&str>) -> Vec<Reference> {
@@ -636,9 +669,9 @@ mod tests {
             message: "list it",
             attachments: &[],
             project_id: "p1",
-            cwd: None,
             session_id: "s1",
             tools: true,
+            web_search: true,
             rounds: &rounds,
         };
         let body = request_body(&request);
@@ -646,6 +679,11 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], TOOL_NAME);
         assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
+        assert_eq!(body["tools"][1]["function"]["name"], crate::files::EXPLORE_TOOL);
+        assert_eq!(body["tools"][2]["function"]["name"], crate::web::TOOL);
+        assert!(body.get("cwd").is_none());
+        let offline = request_body(&Request { web_search: false, ..request });
+        assert_eq!(offline["tools"].as_array().unwrap().len(), 2);
         let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
         assert_eq!(
@@ -729,10 +767,6 @@ mod tests {
         fs::write(root.join("notes/plan.md"), "plan").unwrap();
         fs::write(project_dir.join("documents/notes__plan.md"), "plan").unwrap();
         fs::write(project_dir.join("documents/upload.pdf"), "pdf").unwrap();
-        let manifest = json!({"project": "p", "documents": {"notes/plan.md": {
-            "hash": "h", "size": 4, "mtime": 1, "remote": "notes__plan.md", "synced_at": 1,
-        }}});
-        fs::write(root.join(crate::docent::DIR).join("manifest.json"), manifest.to_string()).unwrap();
         let open = |value: serde_json::Value| reference(&sent("document", value), Some(&root), Some(&project_dir)).unwrap();
 
         // A web source opens its page, and a tool nothing, even one named
@@ -749,12 +783,11 @@ mod tests {
         let gone = open(json!({"document_name": "upload.pdf", "path": "/nowhere/upload.pdf"}));
         assert_eq!(gone.target, Some(file_url(&project_dir.join("documents/upload.pdf"))));
 
-        // A synced document opens the original, named as it is here.
-        let synced = open(json!({"document_name": "notes__plan.md", "page_numbers": [1]}));
-        assert_eq!(synced, Reference { label: "notes/plan.md, p. 1".into(), target: Some(file_url(&root.join("notes/plan.md"))) });
+        // One named by its path in the project's folder opens there.
+        let here = open(json!({"document_name": "notes/plan.md", "page_numbers": [1]}));
+        assert_eq!(here, Reference { label: "notes/plan.md, p. 1".into(), target: Some(file_url(&root.join("notes/plan.md"))) });
 
-        // Gone here since its sync: the agent's copy.
-        fs::remove_file(root.join("notes/plan.md")).unwrap();
+        // Not here: the agent's copy.
         let copy = open(json!({"document_name": "notes__plan.md"}));
         assert_eq!(copy, Reference { label: "notes__plan.md".into(), target: Some(file_url(&project_dir.join("documents/notes__plan.md"))) });
 
