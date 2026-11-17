@@ -20,6 +20,7 @@ mod progress;
 mod tui;
 mod update;
 mod usage;
+mod web;
 
 /// The Docent wordmark: `--help`, the setup checklist and the welcome card.
 /// `install.sh` prints its own copy.

@@ -65,8 +65,6 @@ const PAGE_LINES: u16 = 10;
 const DOUBLE_ESC: Duration = Duration::from_secs(2);
 /// Cells in `/usage`'s bar.
 const USAGE_BAR: usize = 30;
-/// Seconds between checks of the working directory's `.docent/` sync.
-const SYNC_INTERVAL: u64 = 5;
 /// A bar turning in brackets.
 const SPINNER: [&str; 4] = ["[-]", "[\\]", "[|]", "[/]"];
 
@@ -157,12 +155,8 @@ enum AppEvent {
     /// The project's web search switch, read or just toggled; `toggled`
     /// says whether to announce it.
     WebSearch { enabled: bool, toggled: bool },
-    /// A sync started pushing this many changes, or finished at 0.
-    Syncing(usize),
-    /// `/sync` checked the folder: link it to this project and follow it.
-    SyncLink(std::path::PathBuf, (String, String)),
-    /// The sync that `stop` stops has ended on its own.
-    SyncEnded(Arc<AtomicBool>),
+    /// The folder's skills went to the project: list them again.
+    SkillsPushed,
     /// What the agent is doing for this project, for the welcome card;
     /// `None` when it doesn't answer.
     Agent(Option<String>, Option<crate::AgentState>),
@@ -186,6 +180,8 @@ enum AppEvent {
     /// A reply's script finished, or went on in the background: as
     /// `Shell`, with the project it ran for.
     Ran(usize, String, String, Option<Ended>),
+    /// A `web_search` call's result, by the call's id.
+    Searched(String, String),
     /// A reply's scripts left unrun, as one before them failed or was
     /// stopped: off the running list, and out of the chat.
     Unrun(Vec<usize>),
@@ -551,6 +547,9 @@ struct Reply {
     warnings: Vec<String>,
     model: Option<String>,
     text: String,
+    /// Tool-call markup the model wrote as text is still open, waiting for
+    /// its closing tag: each chunk looks for it until it comes.
+    markup_open: bool,
     citations: Vec<chat::Reference>,
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
@@ -1169,7 +1168,14 @@ struct Sent {
     attachments: Vec<String>,
     cwd: Option<std::path::PathBuf>,
     files_dir: Option<std::path::PathBuf>,
+    /// The files the agent has read whole, with `explore`, which a reply
+    /// may give back whole.
     whole: Vec<String>,
+    /// Characters of file contents one `explore` call returns, for the
+    /// model's window.
+    budget: usize,
+    /// Offer `web_search`: the project's web search isn't off.
+    web_search: bool,
 }
 
 /// A turn's native tool calling: the reply asks for `bash` calls, they run
@@ -1189,6 +1195,8 @@ struct Tooling {
     failed: Option<String>,
     /// Why the next round isn't sent, once it's known it won't be.
     stop: Option<String>,
+    /// `web_search` calls of the last reply not started yet: id and query.
+    searches: Vec<(String, String)>,
 }
 
 /// One tool call of a reply, as it runs.
@@ -1223,6 +1231,26 @@ impl Tooling {
             .into_iter()
             .map(|call| {
                 let mut c = Call { id: call.id, command: None, run: None, result: None, context: None };
+                // Reading the project only reads: it's done at once, with
+                // no question, and what was read whole may be given back so.
+                if call.name == files::EXPLORE_TOOL {
+                    let (result, note) = self.explore(&call.arguments);
+                    shown.push_str(&format!("\n\n{}\n", note));
+                    c.result = Some(result);
+                    return c;
+                }
+                // A web search runs off the UI thread, with no question:
+                // its result comes when the pages are read.
+                if call.name == crate::web::TOOL {
+                    match crate::web::query(&call.arguments) {
+                        Ok(query) => {
+                            shown.push_str(&format!("\n\nSearching the web: {}\n", query.replace('\n', " ")));
+                            self.searches.push((c.id.clone(), query));
+                        }
+                        Err(why) => c.result = Some(why),
+                    }
+                    return c;
+                }
                 match bash_command(&call.name, &call.arguments) {
                     Ok((command, description)) => {
                         let note = description.map_or_else(String::new, |d| format!("# {}\n", d.replace('\n', " ")));
@@ -1241,6 +1269,33 @@ impl Tooling {
             })
             .collect();
         (commands, shown)
+    }
+
+    /// Run an `explore` call of `arguments` in the turn's folder: what goes
+    /// back to the agent, and a line for the reply on what it read.
+    fn explore(&mut self, arguments: &str) -> (String, String) {
+        let Some(root) = self.sent.files_dir.clone().or_else(|| self.sent.cwd.clone()) else {
+            return ("Error: there's no project folder to read.".to_string(), "No folder to read".to_string());
+        };
+        let arguments: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+        let paths: Vec<String> = match &arguments["paths"] {
+            serde_json::Value::Array(list) => list.iter().filter_map(|p| p.as_str().map(str::to_string)).collect(),
+            serde_json::Value::String(one) => vec![one.clone()],
+            _ => Vec::new(),
+        };
+        if paths.is_empty() {
+            return (files::explore_overview(&root), "Read the codebase's overview".to_string());
+        }
+        let budget = if self.sent.budget == 0 { files::DEFAULT_BUDGET } else { self.sent.budget };
+        let read = files::explore_files(&root, &paths, budget);
+        for path in read.whole {
+            if !self.sent.whole.contains(&path) {
+                self.sent.whole.push(path);
+            }
+        }
+        let shown: Vec<&str> = paths.iter().map(|p| p.trim()).take(6).collect();
+        let more = if paths.len() > 6 { format!(" and {} more", paths.len() - 6) } else { String::new() };
+        (read.text, format!("Read {}{}", shown.join(", "), more))
     }
 
     /// The call waiting to run `command`, not started yet.
@@ -1263,7 +1318,13 @@ impl Tooling {
 fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>), String> {
     // `bash` by habit, on Windows too, runs as the tool offered there.
     if name != chat::TOOL_NAME && name != "bash" {
-        return Err(format!("Error: there's no tool named `{}`; the only tool is `{}`.", name, chat::TOOL_NAME));
+        return Err(format!(
+            "Error: there's no tool named `{}`; the tools are `{}`, `{}` and, when web search is on, `{}`.",
+            name,
+            chat::TOOL_NAME,
+            files::EXPLORE_TOOL,
+            crate::web::TOOL
+        ));
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|e| format!("Error: the arguments aren't valid JSON ({}); give {{\"command\": \"...\"}}.", e))?;
@@ -1305,7 +1366,6 @@ fn head_tail(text: &str, n: usize) -> String {
     format!("{}\n…({} characters cut)…\n{}", &text[..head_end], count - 2 * half, &text[tail_start..])
 }
 
-/// The working directory's sync to `project`, running until `stop`.
 /// A check of the project in `project`, shown in shell entry `id`.
 struct Check {
     id: usize,
@@ -1373,14 +1433,6 @@ fn after_check(code: Option<i32>, output: &str, fix_round: u32, last_failure: Op
     }
 }
 
-struct Sync {
-    project: String,
-    root: std::path::PathBuf,
-    stop: Arc<AtomicBool>,
-    /// Set to have the next pass run now, as after the chat writes files.
-    nudge: Arc<AtomicBool>,
-}
-
 struct App {
     client: Client,
     tx: UnboundedSender<AppEvent>,
@@ -1393,8 +1445,6 @@ struct App {
     pending_prompt: Option<String>,
     entries: Vec<Entry>,
     turn: Option<Turn>,
-    /// Set while a turn runs, so the background sync waits for it.
-    busy: Arc<AtomicBool>,
     downloads: Vec<Download>,
     overlay: Overlay,
     input: String,
@@ -1513,8 +1563,6 @@ struct App {
     connections: Option<(usize, usize)>,
     /// When the agent's state was last asked for; `None` while asking.
     agent_asked: Option<Instant>,
-    /// The working directory's sync, while it runs.
-    sync: Option<Sync>,
     /// This month's web search usage, shown in the footer once known.
     search: Option<SearchUsage>,
     /// A newer release's version, for the footer to ask for an upgrade.
@@ -1544,7 +1592,6 @@ impl App {
             pending_prompt: prompt.filter(|p| !p.trim().is_empty()),
             entries: Vec::new(),
             turn: None,
-            busy: Arc::new(AtomicBool::new(false)),
             downloads: Vec::new(),
             overlay: Overlay::None,
             input: String::new(),
@@ -1594,7 +1641,6 @@ impl App {
             account: None,
             connections: None,
             agent_asked: Some(Instant::now() - AGENT_EVERY),
-            sync: None,
             search: None,
             update: None,
             models_checked: false,
@@ -1664,180 +1710,57 @@ impl App {
         });
     }
 
-    /// Keep the current project's folder in step with it, when it has one
-    /// not paused; a sync already running stops.
+    /// The current project's folder, when it has one: claim the project as
+    /// docent's, and push its skills.
     fn follow_project(&mut self) {
-        self.stop_sync();
         let Some(project) = self.project.clone() else { return };
         let Some(root) = project_root(&project.0) else { return };
         let Some(link) = docent::linked(&root) else { return };
+        if link.project != project.0 || cfg!(test) {
+            return;
+        }
         // A folder docent linked is docent's project: one made before
         // projects carried a client is marked so now, and stays out of
         // Studio's list. Quietly: an agent that doesn't know the field yet
         // refuses, and the next run tries again.
-        if link.project == project.0 && !cfg!(test) {
-            let id = project.0.clone();
-            self.spawn(move |client, _| {
-                let _ = crate::try_claim_project(&client, &id);
-            });
-        }
-        if !link.paused {
-            self.start_sync(root, project, false);
-        }
+        let id = project.0.clone();
+        self.spawn(move |client, _| {
+            let _ = crate::try_claim_project(&client, &id);
+        });
+        // What the old sync uploaded goes, once: indexed, the agent reads it
+        // again on every request.
+        let old = root.clone();
+        self.spawn(move |client, tx| match docent::retire_documents(&client, &old) {
+            Ok(0) => {}
+            Ok(n) => drop(tx.send(AppEvent::Notice(format!(
+                "Removed {} document{} the old sync uploaded; the agent reads the folder itself now",
+                n,
+                if n == 1 { "" } else { "s" }
+            )))),
+            Err(e) => drop(tx.send(AppEvent::Warning(format!("Removing what the old sync uploaded: {}", e)))),
+        });
+        self.push_skills(root);
     }
 
-    /// Keep `root` in step with `project`, linking it first when `link`
-    /// says to; a sync already running stops. One away from the working
-    /// directory says where it is.
-    fn start_sync(&mut self, root: std::path::PathBuf, project: (String, String), link: bool) {
-        self.stop_sync();
-        let stop = Arc::new(AtomicBool::new(false));
-        let nudge = Arc::new(AtomicBool::new(false));
-        self.sync = Some(Sync { project: project.0.clone(), root: root.clone(), stop: stop.clone(), nudge: nudge.clone() });
-        if link || sync_root().is_none_or(|here| here != root) {
-            self.entries.push(Entry::Notice(format!("Syncing {} to project {}", root.display(), project.1)));
-        }
+    /// Bring the project's skills in line with `root`'s `.docent/skills/`,
+    /// saying what changed and what failed.
+    fn push_skills(&self, root: std::path::PathBuf) {
         if cfg!(test) {
             return;
         }
-        let busy = self.busy.clone();
-        self.spawn(move |client, tx| {
-            let linked = if link { docent::link(&root, &project.0) } else { Ok(()) };
-            match linked {
-                Ok(()) => {
-                    let idle = || !busy.load(Ordering::Relaxed);
-                    docent::follow(&client, &root, SYNC_INTERVAL, &idle, &stop, &nudge, &mut |event| {
-                        // Stopped, say nothing more: the project may have switched.
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let _ = match event {
-                            docent::Event::Working(count) => tx.send(AppEvent::Syncing(count)),
-                            docent::Event::Summary(text) => {
-                                let _ = tx.send(AppEvent::Syncing(0));
-                                // Sent, not yet indexed: the status line shows that next.
-                                tx.send(AppEvent::Notice(format!("Synced: {}", text)))
-                            }
-                            docent::Event::Failure(text) => tx.send(AppEvent::Warning(format!("Sync: {}", text))),
-                            docent::Event::Note(text) => tx.send(AppEvent::Notice(format!("Sync: {}", text))),
-                        };
-                    });
+        self.spawn(move |client, tx| match docent::push_skills(&client, &root) {
+            Ok(pushed) => {
+                let line = pushed.line();
+                if !line.is_empty() {
+                    let _ = tx.send(AppEvent::Notice(format!("Skills: {}", line)));
+                    let _ = tx.send(AppEvent::SkillsPushed);
                 }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Warning(format!("Sync: {}", e)));
+                for failure in pushed.failures {
+                    let _ = tx.send(AppEvent::Warning(format!("Skill {}", failure)));
                 }
             }
-            let _ = tx.send(AppEvent::SyncEnded(stop));
+            Err(e) => drop(tx.send(AppEvent::Warning(format!("Skills: {}", e)))),
         });
-    }
-
-    fn stop_sync(&mut self) {
-        if let Some(sync) = self.sync.take() {
-            sync.stop.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// `/sync`: link the working directory to the current project and keep
-    /// it in step; `status` and `stop` too, of the folder the project syncs
-    /// from. A first sync of a big folder asks for `--yes`, one of a project
-    /// linked to another folder for `--move`, and the home folder is never
-    /// synced.
-    fn sync_command(&mut self, arguments: &[&str]) {
-        let Some(here) = sync_root() else {
-            return self.entries.push(Entry::Error("No working directory to sync".to_string()));
-        };
-        let current = self.project.clone();
-        // The folder the current project syncs from, wherever it is.
-        let root = current.as_ref().and_then(|(id, _)| project_root(id)).unwrap_or_else(|| here.clone());
-        match arguments {
-            flags if flags.iter().all(|f| matches!(*f, "--yes" | "--move")) => {
-                let root = here;
-                if let Some(refusal) = docent::refusal(&root) {
-                    return self.entries.push(Entry::Error(format!("Not syncing: {}", refusal)));
-                }
-                let Some(project) = current else {
-                    return self.entries.push(Entry::Error("No project to sync to yet".to_string()));
-                };
-                if self.sync.as_ref().is_some_and(|s| s.project == project.0 && s.root == root) {
-                    let text = format!("{} is up to date with project {}", root.display(), project.1);
-                    return self.entries.push(Entry::Notice(text));
-                }
-                if let Some(other) = project_root(&project.0).filter(|other| *other != root)
-                    && !flags.contains(&"--move")
-                {
-                    return self.entries.push(Entry::Error(format!(
-                        "Project {} syncs {}; /sync --move syncs {} instead",
-                        project.1,
-                        other.display(),
-                        root.display()
-                    )));
-                }
-                let confirmed = flags.contains(&"--yes");
-                self.spawn(move |_, tx| {
-                    // Pushed before, to this project: only the changes go.
-                    let first = docent::linked(&root).is_none_or(|l| l.project != project.0);
-                    let size = docent::measure(&root);
-                    if first && size.large() && !confirmed {
-                        let _ = tx.send(AppEvent::Warning(format!(
-                            "{} has {} documents ({}); /sync --yes pushes them all to project {}",
-                            root.display(),
-                            size.files,
-                            format_size(size.bytes),
-                            project.1
-                        )));
-                        return;
-                    }
-                    let _ = tx.send(AppEvent::SyncLink(root, project));
-                });
-            }
-            ["status"] => {
-                let name = |id: &str| match &current {
-                    Some((current, name)) if current == id => name.clone(),
-                    _ => id.to_string(),
-                };
-                let text = match docent::linked(&root) {
-                    None => Ok(format!("{} isn't synced; /sync syncs it to the current project", root.display())),
-                    Some(link) => docent::status(&root).map(|status| {
-                        let state = if link.paused { "Paused syncing" } else { "Syncing" };
-                        let mut text = format!(
-                            "{} {} to project {}: {} documents, {} skills",
-                            state,
-                            root.display(),
-                            name(&link.project),
-                            status.documents,
-                            status.skills
-                        );
-                        match status.changes.len() {
-                            0 => text.push_str("; up to date"),
-                            n => {
-                                let shown = status.changes.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-                                let more = if n > 5 { format!(", and {} more", n - 5) } else { String::new() };
-                                text.push_str(&format!("; {} to push: {}{}", n, shown, more));
-                            }
-                        }
-                        text
-                    }),
-                };
-                self.entries.push(match text {
-                    Ok(text) => Entry::Notice(text),
-                    Err(e) => Entry::Error(e),
-                });
-            }
-            ["stop"] => {
-                let root = self.sync.as_ref().map_or(root, |s| s.root.clone());
-                self.stop_sync();
-                self.spawn(move |_, tx| {
-                    let _ = tx.send(match docent::pause(&root) {
-                        Ok(()) => AppEvent::Notice(format!("Stopped syncing {}; /sync starts again", root.display())),
-                        Err(e) => AppEvent::Error(e),
-                    });
-                });
-            }
-            other => self.entries.push(Entry::Error(format!(
-                "Unknown /sync {}; try /sync status or /sync stop",
-                other.join(" ")
-            ))),
-        }
     }
 
     fn load_projects(&self) {
@@ -1928,8 +1851,8 @@ impl App {
         let Some((project, _)) = self.project.clone() else { return };
         let files_dir = if making { chat::making_dir(&project) } else { None };
         // Asked to make something, the reply comes as files to write; in a
-        // code project, as code that fits the files already there.
-        let mut whole = Vec::new();
+        // code project, as code that fits the files already there, which
+        // the agent reads first with `explore`.
         // The machine, the folder and how to give files go as the system
         // message, the request alone as the user's: the agent repeats the
         // user's message in its prompt and reads what's around it as data,
@@ -1937,11 +1860,7 @@ impl App {
         let mut system = None;
         if let Some(root) = &files_dir {
             let context = match code_kind(root) {
-                Some(kind) => {
-                    let c = files::project_context(root, kind, &message, files::budget_for(self.window));
-                    whole = c.whole;
-                    format!("{}\n\n", c.text)
-                }
+                Some(kind) => format!("{}\n\n", files::project_brief(root, kind)),
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
                 None => String::new(),
             };
@@ -1970,14 +1889,16 @@ impl App {
         if making && files_dir.is_none() {
             let warning = match docent::folder(&project) {
                 Some(folder) => format!(
-                    "This project is linked to {}, so no files will be written here; open docent there, or /sync this folder",
+                    "This project is linked to {}, so no files will be written here; open docent there",
                     folder.display()
                 ),
-                None => "This folder syncs to another project, so no files will be written; switch to it with /project".to_string(),
+                None => "This folder is linked to another project, so no files will be written; switch to it with /project".to_string(),
             };
             self.entries.push(Entry::Warning(warning));
         }
-        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole };
+        let budget = files::budget_for(self.window);
+        let web_search = self.web_search != Some(false);
+        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget, web_search };
         // A turn with a working directory offers the `bash` tool, run there,
         // and its tool rounds start over: it's a new request, not one going on.
         self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
@@ -2021,9 +1942,9 @@ impl App {
                 message: &sent.message,
                 attachments: &ids,
                 project_id: &project,
-                cwd: sent.cwd.as_deref(),
                 session_id: &session,
                 tools: sent.cwd.is_some(),
+                web_search: sent.web_search,
                 rounds: &rounds,
             };
             let result = chat::stream_turn(&chat, &request, &mut on).await;
@@ -2039,7 +1960,6 @@ impl App {
             whole,
             calls: Vec::new(),
         });
-        self.busy.store(true, Ordering::Relaxed);
     }
 
     /// Put the project's web search back on after a turn that had it off.
@@ -2115,11 +2035,9 @@ impl App {
         for failure in failed {
             self.entries.push(Entry::Error(format!("Failed to write {}", failure)));
         }
-        // Documents among them go to the project now, not on the next pass.
-        if !written.is_empty()
-            && let Some(sync) = &self.sync
-        {
-            sync.nudge.store(true, Ordering::Relaxed);
+        // A skill among them goes to the project now.
+        if written.iter().any(|p| docent::is_skill(p)) {
+            self.push_skills(root.to_path_buf());
         }
         self.scroll_back = 0;
         written
@@ -2386,6 +2304,13 @@ impl App {
             self.files_asked = true;
             return self.ask_for_files();
         }
+        // Cut off partway through a file, the reply leaves it as it is.
+        if !found.cut.is_empty() {
+            self.entries.push(Entry::Warning(format!(
+                "Not written, as the reply stopped partway through: {}; ask again, for less at a time",
+                found.cut.join(", ")
+            )));
+        }
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
         self.apply_reply(root, found.files, &whole, commands, found.failed);
@@ -2491,8 +2416,9 @@ impl App {
         self.entries.push(Entry::Notice(format!("Asking the agent for those edits again (try {} of {})", self.edit_round, EDIT_ROUNDS)));
         let message = format!(
             "These changes from your last reply couldn't be made, so those files weren't changed:\n{}\n\n{}\n\nGive \
-             just those files again, each whole as a heredoc: every line of it as it is to be, changed or not, with \
-             no comment standing in for lines. Don't repeat the files that were written.\n\n{}",
+             just those changes again as edit blocks, their SEARCH lines copied exactly from the files as they are \
+             now, above, with a line or two around them so each is found once. Don't repeat the changes that were \
+             made.\n\n{}",
             reasons.join("\n"),
             files.join("\n\n"),
             files::EDIT_EXAMPLE
@@ -2706,6 +2632,30 @@ impl App {
         self.tool_round_done();
     }
 
+    /// The last reply's `web_search` calls, started each on a thread of
+    /// its own, their pages coming back as `Searched`.
+    fn start_searches(&mut self) {
+        let searches = self.tooling.as_mut().map(|t| std::mem::take(&mut t.searches)).unwrap_or_default();
+        for (id, query) in searches {
+            if cfg!(test) {
+                continue;
+            }
+            self.spawn(move |_, tx| {
+                let _ = tx.send(AppEvent::Searched(id, crate::web::search(&query)));
+            });
+        }
+    }
+
+    /// A `web_search` call's pages are in: its result, and the round goes
+    /// on once every call of the reply has one. One for a turn since
+    /// stopped finds no call, and goes nowhere.
+    fn searched(&mut self, id: String, result: String) {
+        let Some(tooling) = &mut self.tooling else { return };
+        let Some(call) = tooling.calls.iter_mut().find(|c| c.id == id && c.result.is_none()) else { return };
+        call.result = Some(result);
+        self.tool_round_done();
+    }
+
     /// The last reply's tool calls, once each has its result and nothing
     /// else is going on (its files' check, a question about its commands,
     /// another turn), go back to the agent in a turn of their own, which
@@ -2748,7 +2698,6 @@ impl App {
         self.commands = None;
         self.tooling = None;
         if let Some(turn) = self.turn.take() {
-            self.busy.store(false, Ordering::Relaxed);
             turn.task.abort();
             if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                 reply.ended = Some("Interrupted".to_string());
@@ -2811,8 +2760,7 @@ impl App {
             AppEvent::Chat(event) => self.chat_event(event),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
-                self.busy.store(false, Ordering::Relaxed);
-                // A turn can add a skill ("save this as a skill"); read the
+                    // A turn can add a skill ("save this as a skill"); read the
                 // list again so `/` hints it without reopening the project.
                 self.load_skills();
                     if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
@@ -2847,6 +2795,7 @@ impl App {
                                         new: found.files.iter().find(|f| f.path == *path).map_or(String::new(), |f| f.content.clone()),
                                     })
                                     .collect();
+                                self.start_searches();
                                 self.reply_done(root, found, turn.whole, commands);
                                 self.tool_round_done();
                             } else if !turn.calls.is_empty()
@@ -2861,6 +2810,7 @@ impl App {
                                 if !commands.is_empty() {
                                     self.commands = Some((cwd, commands));
                                 }
+                                self.start_searches();
                                 self.run_commands();
                             }
                         }
@@ -2912,6 +2862,7 @@ impl App {
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
+            AppEvent::Searched(id, result) => self.searched(id, result),
             AppEvent::Uploaded(ids) => {
                 if let Some(tooling) = &mut self.tooling {
                     tooling.sent.attachments = ids;
@@ -2948,20 +2899,7 @@ impl App {
                     self.connections = Some(connection_counts(&servers));
                 }
             }
-            // Indexing runs in the background, unannounced; a push done only
-            // has the card's document count refreshed.
-            AppEvent::Syncing(count) => {
-                if count == 0 {
-                    // Ask the agent now, rather than at the next poll.
-                    self.agent_asked = Some(Instant::now() - AGENT_EVERY);
-                }
-            }
-            AppEvent::SyncLink(root, project) => self.start_sync(root, project, true),
-            AppEvent::SyncEnded(stop) => {
-                if self.sync.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, &stop)) {
-                    self.sync = None;
-                }
-            }
+            AppEvent::SkillsPushed => self.load_skills(),
             AppEvent::Agent(project, state) => {
                 self.agent_asked = Some(Instant::now());
                 // Asked before a switch: ask again, for this one.
@@ -3003,8 +2941,8 @@ impl App {
             }
         };
         let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
-        // Without one asked for, the project the folder syncs to.
-        let link = sync_root()
+        // Without one asked for, the project the folder is linked to.
+        let link = folder_root()
             .filter(|root| docent::refusal(root).is_none())
             .and_then(|root| docent::linked(&root));
         let linked = link
@@ -3016,7 +2954,7 @@ impl App {
         // own, named after it: never the one the last folder left current.
         if self.wanted_project.is_none()
             && linked.is_none()
-            && let Some(root) = sync_root().filter(|root| docent::refusal(root).is_none())
+            && let Some(root) = folder_root().filter(|root| docent::refusal(root).is_none())
             && let Some(folder) = root.file_name().map(|name| name.to_string_lossy().into_owned())
         {
             self.phase = Phase::Ready;
@@ -3037,12 +2975,8 @@ impl App {
         self.phase = Phase::Ready;
         match chosen {
             Some(project) => {
-                // Nothing here or for the project synced yet: say what /sync would add.
-                if linked.is_none() && project_root(&project.0).is_none() {
-                    self.hint_unsynced(project.1.clone());
-                }
                 self.project = Some(project);
-                // Its folder keeps syncing, wherever it is, until `/sync stop`.
+                // Its folder's skills go to it, wherever the folder is.
                 self.follow_project();
                 self.load_web_search();
                 // Read now, so a project with no model enabled says so at once.
@@ -3061,8 +2995,8 @@ impl App {
 
     /// Give `root`, a folder never linked, a project of its own: one named
     /// after it that has no folder yet, else a new one. The chat switches
-    /// to it and the folder syncs to it from then on; a large folder is
-    /// linked but left paused, for `/sync --yes` to push.
+    /// to it, and the folder is linked to it but not synced: nothing is
+    /// pushed but its skills.
     fn adopt_folder(&mut self, root: std::path::PathBuf, folder: String, projects: &[serde_json::Value]) {
         let field = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or_default().to_string();
         let taken: Vec<(String, String)> = projects.iter().map(|p| (field(p, "id"), field(p, "name"))).collect();
@@ -3086,34 +3020,14 @@ impl App {
                 Ok(project) => project,
                 Err(e) => return drop(tx.send(AppEvent::Error(e))),
             };
-            let project = Project { id: id.clone(), name: name.clone(), description: String::new(), system: false };
+            // Linked first, so the folder keeps its project and its skills
+            // go to it on the switch. No documents are pushed: the agent
+            // reads the folder itself with `explore`.
+            if let Err(e) = docent::link(&root, &id) {
+                return drop(tx.send(AppEvent::Error(e)));
+            }
+            let project = Project { id, name, description: String::new(), system: false };
             let _ = tx.send(AppEvent::SwitchProject(project));
-            let size = docent::measure(&root);
-            if !size.large() {
-                return drop(tx.send(AppEvent::SyncLink(root, (id, name))));
-            }
-            let _ = tx.send(match docent::link(&root, &id).and_then(|()| docent::pause(&root)) {
-                Ok(()) => AppEvent::Warning(format!(
-                    "{} has {} documents ({}); /sync --yes pushes them all to project {}",
-                    root.display(),
-                    size.files,
-                    format_size(size.bytes),
-                    name
-                )),
-                Err(e) => AppEvent::Error(e),
-            });
-        });
-    }
-
-    /// Point out the documents in a folder never synced, which the agent
-    /// can't search until `/sync` indexes them.
-    fn hint_unsynced(&self, project: String) {
-        let Some(root) = sync_root().filter(|root| docent::refusal(root).is_none()) else { return };
-        self.spawn(move |_, tx| {
-            let found = docent::unsynced(&root);
-            if let Some(text) = unsynced_hint(&found, &project) {
-                let _ = tx.send(AppEvent::Notice(text));
-            }
         });
     }
 
@@ -3190,15 +3104,25 @@ impl App {
         match event {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
+                let before = reply.text.len();
                 reply.text.push_str(&content);
                 // A tool call the model wrote as text runs as a shell
-                // block, and its control tokens never show.
-                if files::has_tool_call_markup(&reply.text) {
+                // block, and its control tokens never show. Only what just
+                // came is looked at, with a little before it for a tag
+                // split between chunks: the whole reply on every chunk
+                // stalls the terminal on a long one.
+                let tail = floor_boundary(&reply.text, before.saturating_sub(MARKUP_TAIL));
+                if reply.markup_open || files::has_tool_call_markup(&reply.text[tail..]) {
                     reply.text = files::tool_calls_as_blocks(&reply.text);
+                    reply.markup_open = files::has_tool_call_markup(&reply.text);
                 }
                 // A file's written once its block is done, not when the
-                // reply is.
-                if content.contains('\n')
+                // reply is; looked for only when a line just ended that
+                // may end one.
+                let from = floor_boundary(&reply.text, before.min(reply.text.len()));
+                let start = reply.text[..from].rfind('\n').map_or(0, |i| i + 1);
+                let ended = reply.text[start..].rfind('\n').map(|i| &reply.text[start..start + i]);
+                if ended.is_some_and(|lines| lines.lines().any(files::may_close_block))
                     && let Some(root) = &turn.files_dir
                 {
                     reply.write_done(root);
@@ -4110,7 +4034,6 @@ impl App {
                     Some(_) => self.find_project(input.split_once(' ').map_or("", |(_, name)| name).trim().to_string()),
                 }
             }
-            "/sync" => self.sync_command(&words.collect::<Vec<_>>()),
             "/stop" => self.stop_command(&words.collect::<Vec<_>>().join(" ")),
             "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
@@ -4799,8 +4722,11 @@ impl App {
             .map(|(i, entry)| {
                 // A reply's version is the text it's laid out from: laid
                 // out now, so the frame measures and draws the same lines.
+                // At the width `reply_lines` draws it at: laid out at
+                // another, it was laid out twice a frame, diffs and all,
+                // and an idle screen kept a core busy.
                 if let Entry::Reply(reply) = entry {
-                    reply.layout(width);
+                    reply.layout(reply_width(width));
                 }
                 match cache[i] {
                     Some((w, version, rows)) if w == width && version == entry_version(entry) => rows,
@@ -5556,29 +5482,22 @@ fn code_kind(root: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-/// The folder `/sync` works on: the one the working directory is part of.
-fn sync_root() -> Option<std::path::PathBuf> {
+/// The folder the working directory is part of.
+fn folder_root() -> Option<std::path::PathBuf> {
     let root = docent::root(&std::env::current_dir().ok()?);
     Some(std::fs::canonicalize(&root).unwrap_or(root))
 }
 
-/// The folder `project` syncs from: the one it was last linked to, else the
+/// The folder of `project`: the one it was last linked to, else the
 /// working directory's when that's linked to it.
 fn project_root(project: &str) -> Option<std::path::PathBuf> {
-    docent::folder(project).or_else(|| sync_root().filter(|root| docent::linked(root).is_some_and(|l| l.project == project)))
+    docent::folder(project).or_else(|| folder_root().filter(|root| docent::linked(root).is_some_and(|l| l.project == project)))
 }
 
-/// `3 documents here aren't searchable yet (a.pdf, b.docx, and 1 more)…`,
-/// or nothing when there are none.
-fn unsynced_hint(found: &[String], project: &str) -> Option<String> {
-    let n = found.len();
-    if n == 0 {
-        return None;
-    }
-    let shown = found.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
-    let more = if n > 2 { format!(", and {} more", n - 2) } else { String::new() };
-    let (noun, verb) = if n == 1 { ("document", "isn't") } else { ("documents", "aren't") };
-    Some(format!("{n} {noun} here {verb} searchable yet ({shown}{more}); /sync adds them to project {project}"))
+/// The width a reply's body is laid out at in a conversation `width`
+/// wide: less its `■ ` margin.
+fn reply_width(width: u16) -> u16 {
+    width.saturating_sub(2)
 }
 
 /// A reply as Claude Code lays one out: the answer under a `■` (square, like the setup blocks), its
@@ -5590,7 +5509,7 @@ fn reply_lines(reply: &Reply, width: u16, lines: &mut Vec<Line<'static>>) {
             Span::styled(warning.clone(), dim()),
         ]));
     }
-    for (i, line) in reply.body(width.saturating_sub(2)).into_iter().enumerate() {
+    for (i, line) in reply.body(reply_width(width)).into_iter().enumerate() {
         let mark = if i == 0 { Span::raw("■ ") } else { Span::raw("  ") };
         lines.push(Line::from(std::iter::once(mark).chain(line.spans).collect::<Vec<_>>()));
     }
@@ -5709,7 +5628,20 @@ const MODELS_PAGE: usize = 5;
 const COMMAND_ROUNDS: u32 = 3;
 /// How many times a reply's tool calls go back with their results, per
 /// prompt: the agent looks around, builds and tests, a step a round.
-const TOOL_ROUNDS: u32 = 8;
+const TOOL_ROUNDS: u32 = 12;
+/// Characters before a chunk looked at again for tool-call markup, so a
+/// tag split between two chunks is still found.
+const MARKUP_TAIL: usize = 64;
+
+/// The largest char boundary of `text` at `at` or before it.
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
 /// Characters of a tool call's output the agent gets, its start and end.
 const TOOL_KEPT: usize = 6000;
 /// A tool call's result when the user skips its command.
@@ -6515,7 +6447,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -6523,7 +6455,6 @@ const COMMANDS: [(&str, &str); 14] = [
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
-    ("/sync", "sync this folder's documents to the project"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
     ("/usage", "credits used this month"),
@@ -6606,10 +6537,6 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/project <name>", "switch to a project by its name or ID"),
         ("/project new <name>", "create a project and switch to it"),
         ("/project import <zip>", "import an exported project"),
-        ("/sync", "keep this folder's documents in the project"),
-        ("/sync status", "what's synced, and what's waiting"),
-        ("/sync --move", "sync this folder instead of the project's other one"),
-        ("/sync stop", "stop syncing the project's folder"),
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
@@ -6912,95 +6839,29 @@ mod tests {
     }
 
     #[test]
-    fn hints_at_documents_only_a_sync_makes_searchable() {
-        assert_eq!(unsynced_hint(&[], "Docs"), None);
-        assert_eq!(
-            unsynced_hint(&["a.pdf".into()], "Docs").unwrap(),
-            "1 document here isn't searchable yet (a.pdf); /sync adds them to project Docs"
-        );
-        let found: Vec<String> = ["a.pdf", "b.docx", "c.pptx", "d.xlsx"].map(String::from).into();
-        assert_eq!(
-            unsynced_hint(&found, "Docs").unwrap(),
-            "4 documents here aren't searchable yet (a.pdf, b.docx, and 2 more); /sync adds them to project Docs"
-        );
-    }
-
-    #[test]
     fn indexing_never_takes_the_status_line() {
         let mut app = app();
         app.phase = Phase::Ready;
-        app.apply(AppEvent::Syncing(3));
-        assert!(!screen(&app, 80, 24).contains("Indexing"));
-        app.apply(AppEvent::Syncing(0));
         let agent = crate::AgentState { state: "indexing".into(), memory: None, documents: 5, pending: 3 };
         app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(agent)));
         assert!(!screen(&app, 80, 24).contains("Indexing"));
     }
 
     #[test]
-    fn sync_links_the_folder_to_the_current_project_only() {
-        let mut app = app();
-        app.phase = Phase::Ready;
-        let last = |app: &App| match app.entries.last() {
-            Some(Entry::Error(e) | Entry::Notice(e)) => e.clone(),
-            _ => String::new(),
-        };
-        // Nothing to sync to, so nothing is made.
-        app.input = "/sync".into();
-        app.submit();
-        assert!(last(&app).contains("No project to sync to"), "{}", last(&app));
-        app.input = "/sync now".into();
-        app.submit();
-        assert!(last(&app).contains("Unknown /sync now"));
-
-        app.project = Some(("p1".into(), "notes".into()));
-        app.apply(AppEvent::SyncLink(sync_root().unwrap(), ("p1".into(), "notes".into())));
-        assert!(last(&app).contains("to project notes"));
-        app.input = "/sync".into();
-        app.submit();
-        assert!(last(&app).contains("up to date with project notes"));
-        // Its thread ending lets `/sync` start it again.
-        let stop = app.sync.as_ref().unwrap().stop.clone();
-        app.apply(AppEvent::SyncEnded(stop));
-        assert!(app.sync.is_none());
-    }
-
-    #[test]
-    fn a_project_syncs_from_its_own_folder_wherever_the_chat_is() {
+    fn sync_is_gone_and_a_projects_folder_follows_it() {
         let elsewhere = tempfile::tempdir().unwrap();
         let elsewhere = std::fs::canonicalize(elsewhere.path()).unwrap();
         docent::link(&elsewhere, "p9").unwrap();
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
-
-        // Switched to, the project's folder syncs, and says where it is.
-        app.switch_project(("p9".into(), "Contracts".into()));
-        assert_eq!(app.sync.as_ref().map(|s| s.root.clone()), Some(elsewhere.clone()));
-        let text = format!("Syncing {} to project Contracts", elsewhere.display());
-        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if *n == text)));
-
-        // Here isn't linked to it without --move.
         app.input = "/sync".into();
         app.submit();
-        let Some(Entry::Error(e)) = app.entries.last() else { panic!("no error") };
-        assert!(e.starts_with(&format!("Project Contracts syncs {}; /sync --move syncs", elsewhere.display())), "{}", e);
-
-        // Switched away, the stopped sync and what the agent said of the
-        // last project's documents don't read as this one indexing.
-        let stop = app.sync.as_ref().unwrap().stop.clone();
-        app.apply(AppEvent::Agent(app.project.as_ref().map(|p| p.0.clone()), Some(crate::AgentState { state: "indexing".into(), memory: None, documents: 0, pending: 2 })));
-        app.switch_project(("p1".into(), "Default".into()));
-        app.apply(AppEvent::SyncEnded(stop));
-        app.apply(AppEvent::Agent(Some("p9".into()), Some(crate::AgentState { state: "indexing".into(), memory: None, documents: 0, pending: 2 })));
-        assert!(!screen(&app, 80, 24).contains("Indexing"));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n.contains("Syncing"))));
+        assert!(!help_lines().iter().any(|l| l.to_string().contains("/sync")));
+        // Switched to, the project works in its own folder, nothing synced.
         app.switch_project(("p9".into(), "Contracts".into()));
-
-        // Paused, switching back to it leaves it alone.
-        docent::pause(&elsewhere).unwrap();
-        app.switch_project(("p1".into(), "Default".into()));
-        app.switch_project(("p9".into(), "Contracts".into()));
-        assert!(app.sync.is_none());
+        assert_eq!(project_root("p9"), Some(elsewhere.clone()));
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
@@ -7505,8 +7366,75 @@ mod tests {
         reply(&mut app, "", vec![call("call_6", "bash", r#"{"command":"ls"}"#)]);
         app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "src".into(), Some(Ended::Exited(0))));
         assert!(app.turn.is_none());
-        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Stopped after 8 tool rounds")));
+        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Stopped after 12 tool rounds")));
         assert_eq!(app.shell_context.len(), 1);
+    }
+
+    #[test]
+    fn explore_calls_read_the_project_at_once_and_the_rounds_go_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let sent = Sent { message: "fix it".into(), files_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        app.tooling = Some(Tooling { sent, ..Default::default() });
+        let call = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "explore".into(), arguments: arguments.into() };
+        let reply = |app: &mut App, calls: Vec<chat::ToolCall>| {
+            app.entries.push(Entry::Reply(Reply::default()));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        };
+        let last_round = |app: &App| app.tooling.as_ref().unwrap().rounds.last().cloned().unwrap();
+
+        // The overview: no question asked, and the next round goes at once.
+        reply(&mut app, vec![call("call_1", "{}")]);
+        assert!(app.ask.is_none() && app.commands.is_none());
+        assert!(app.turn.is_some(), "the next round was sent");
+        let result = last_round(&app)["content"].as_str().unwrap().to_string();
+        assert!(result.starts_with("A Rust project at"), "{}", result);
+        assert!(result.contains("- src/main.rs (1 lines)"), "{}", result);
+        let Some(Entry::Reply(shown)) = app.entries.iter().rev().nth(1) else { panic!() };
+        assert!(shown.text.contains("\n\nRead the codebase's overview\n"), "{}", shown.text);
+        assert!(!shown.text.contains("_Read"), "{}", shown.text);
+
+        // Then the files it wants: read whole, so a reply may give them back so.
+        reply(&mut app, vec![call("call_2", r#"{"paths": ["src/main.rs"]}"#)]);
+        let result = last_round(&app)["content"].as_str().unwrap().to_string();
+        assert!(result.contains("    1  fn main() {}"), "{}", result);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert_eq!(tooling.sent.whole, ["src/main.rs"]);
+        assert_eq!(tooling.round, 2);
+        assert_eq!(app.turn.as_ref().unwrap().whole, ["src/main.rs"]);
+
+        // A web search waits for its pages, with no question, then goes on.
+        let search = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "web_search".into(), arguments: arguments.into() };
+        reply(&mut app, vec![search("call_3", r#"{"query": "tokio select"}"#), search("call_4", "{}")]);
+        assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the search");
+        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
+        assert!(shown.text.contains("\n\nSearching the web: tokio select\n"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no `query` given")));
+        app.apply(AppEvent::Searched("call_9".into(), "stray".into()));
+        assert!(app.turn.is_none());
+        app.apply(AppEvent::Searched("call_3".into(), "Web search results for: tokio select".into()));
+        assert!(app.turn.is_some(), "the next round was sent");
+        let rounds = &app.tooling.as_ref().unwrap().rounds;
+        assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: tokio select");
     }
 
     #[test]
@@ -8102,15 +8030,11 @@ mod tests {
         let file = |path: &str, content: &str| files::File { path: path.into(), content: content.into() };
         let mut app = app();
         app.phase = Phase::Ready;
-        let nudge = Arc::new(AtomicBool::new(false));
-        app.sync = Some(Sync { project: "p1".into(), root: dir.path().into(), stop: Arc::default(), nudge: nudge.clone() });
         let written = app.reply_files(
             dir.path(),
             vec![file("main.rs", "new\n"), file("same.rs", "same\n"), file("src/a.rs", "a\n")],
             &[],
         );
-        // The folder's sync pushes what was written now.
-        assert!(nudge.load(Ordering::Relaxed));
         assert_eq!(written, ["src/a.rs", "main.rs"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(), "a\n");
@@ -9802,5 +9726,74 @@ mod tests {
         assert!(!rows.iter().any(|r| r.contains("const B")), "its code isn't drawn while it streams: {:?}", rows);
     }
 
-}
 
+    #[test]
+    #[ignore]
+    fn a_long_reply_streams_without_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..430).map(|i| format!("  <div class=\"row-{i}\">some markup {i} with text</div>\n")).collect();
+        let reply = format!("Making it bold.\n\n```sh\ncat > index.html <<'EOF'\n{body}EOF\n```\n\n```sh\ncat > render.js <<'EOF'\n{body}EOF\n```\n");
+        let chunks: Vec<String> = reply.chars().collect::<Vec<_>>().chunks(3).map(|c| c.iter().collect()).collect();
+
+        // As it was: the whole reply parsed on every line, and scanned for
+        // markup on every chunk.
+        let started = Instant::now();
+        let mut text = String::new();
+        for chunk in &chunks {
+            text.push_str(chunk);
+            let _ = files::has_tool_call_markup(&text);
+            if chunk.contains('\n') {
+                let _ = files::blocks(&text);
+            }
+        }
+        let old = started.elapsed();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply { root: Some(dir.path().to_path_buf()), ..Default::default() }));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let started = Instant::now();
+        for chunk in &chunks {
+            app.apply(AppEvent::Chat(ChatEvent::Content(chunk.clone())));
+        }
+        let new = started.elapsed();
+        println!("{} chars in {} chunks: before {:?}, now {:?}", reply.len(), chunks.len(), old, new);
+        // Still written as each block ends.
+        assert_eq!(std::fs::read_to_string(dir.path().join("index.html")).unwrap(), body);
+        assert_eq!(std::fs::read_to_string(dir.path().join("render.js")).unwrap(), body);
+    }
+
+    #[test]
+    fn an_idle_screen_lays_a_reply_out_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file: String = (0..430).map(|i| format!("  <div class=\"row-{i}\">markup {i}</div>\n")).collect();
+        std::fs::write(dir.path().join("index.html"), &file).unwrap();
+        let mut edits = String::new();
+        for i in (0..400).step_by(20) {
+            edits.push_str(&format!("<<<<<<< SEARCH\n  <div class=\"row-{i}\">markup {i}</div>\n=======\n  <div class=\"row-{i} bold\">markup {i}</div>\n>>>>>>> REPLACE\n"));
+        }
+        let text = format!("Bolder rows.\n\n```edit index.html\n{edits}```\n\nDone.\n");
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::User("make it bold".into()));
+        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1) };
+        app.entries.push(Entry::Reply(Reply { text, root: Some(dir.path().to_path_buf()), stats: Some(stats), ..Default::default() }));
+        let _ = screen(&app, 120, 40);
+        // Drawn again with nothing new, it isn't laid out again.
+        let Some(Entry::Reply(reply)) = app.entries.last() else { panic!() };
+        let at = reply.rendered_at.get();
+        let _ = screen(&app, 120, 40);
+        assert_eq!(reply.rendered_at.get(), at, "laid out again on an idle frame");
+    }
+}

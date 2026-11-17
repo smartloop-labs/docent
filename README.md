@@ -241,78 +241,26 @@ docent run --session <session-id>   # resume an existing session; a new one is c
 `docent` runs in a terminal only: with its input or output piped, it says so
 and stops.
 
-### Keep a project in sync
+### A folder and its project
 
-In the chat, `/sync` keeps the project you're in up to date with the folder
-`docent` was opened in. It maps the folder into `.docent/manifest.json` (every
-document and skill pushed: its hash, and the name or id it has at Smartloop),
-then every few seconds pushes only what was added, changed or removed:
-
-```
-/sync            sync this folder to the current project
-/sync status     what's synced, and what the next pass would push
-/sync stop       stop syncing this folder (/sync starts it again)
-```
+A folder belongs to one project. Nothing in it is uploaded: the model reads
+the code itself with its `explore` tool, as far as a request needs.
 
 - Opening `docent` in a folder that isn't linked to a project yet gives it
   one of its own, named after the folder (a project by that name with no
-  folder of its own is reused), writes the link to `.docent/manifest.json`,
-  and syncs the folder to it from then on. A folder of more than 200
-  documents or 500 MB is linked but not synced until `/sync --yes`. Opening
-  `docent` in a linked folder, or one under it, opens the chat in its project
-  and keeps syncing it, until `/sync stop`. `--project` opens another project
+  folder of its own is reused), and writes the link to
+  `.docent/manifest.json`. Opening `docent` in a linked folder, or one under
+  it, opens the chat in its project. `--project` opens another project
   instead, and links nothing.
-- The folder synced is the nearest one up from where `docent` was opened that
-  holds a `.docent/`, as git finds its repository, so opening it in a
-  subfolder of a synced project syncs the project. With none, it's the folder
-  `docent` was opened in.
-- Syncing runs while the chat is open, checking every 5 seconds and waiting
-  while the chat is answering; changes made while it's closed go on the first
-  check after it opens. `/sync` on a folder already syncing says it's up to
-  date.
-- Your home folder (or one holding it) is never synced. A first sync of more
-  than 200 documents or 500 MB asks first; `/sync --yes` goes ahead.
-- **Documents** are the folder's PDF, Word, PowerPoint, Excel, CSV, Markdown
-  and text files. In a code project (a folder with a `Cargo.toml`,
-  `package.json`, `go.mod` or the like) only the PDF, Word, PowerPoint and
-  Excel files: the agent already reads its text files in place, so as
-  documents they'd only be indexed twice. Hidden folders, `.gitignore` and a
-  `.docentignore` (same syntax) keep files out, and so are build output and
-  dependencies always: `node_modules`, `target`, `dist`, `build`, `vendor`,
-  `venv` and the like. A document in a subfolder is stored flat, as
-  `docs__guide.pdf`.
-- **`.docentignore`** keeps files out of the project without keeping them out
-  of git. Put it in the synced folder (or any folder under it, for that
-  folder's files) and list paths or patterns, one per line, as in
-  `.gitignore`:
-
-  ```
-  README.md
-  drafts/
-  *.csv
-  ```
-
-  A file ignored after it was synced is deleted from the project on the next
-  pass, as if it had been removed; take it out of `.docentignore` to push it
-  again.
+- The folder is the nearest one up from where `docent` was opened that holds a
+  `.docent/`, as git finds its repository. With none, it's the folder `docent`
+  was opened in. Your home folder (or one holding it) is never linked.
 - **Skills** are `.docent/skills/<name>.md` or `.docent/skills/<name>/SKILL.md`,
-  with optional `name:` and `description:` frontmatter. They are what you
-  commit from `.docent/`; the manifest is kept out of git by
-  `.docent/.gitignore`, as it names this machine's project.
-- While it pushes, a note appears in the chat when something was pushed, a
-  warning when something failed, and a line above the prompt says "Indexing N
-  documents", counting down as the agent gets through them.
-- A document the project already has, by content, is taken up rather than
-  pushed again, so a fresh `.docent/` (or a lost manifest) doesn't upload the
-  folder twice. A first sync also says which documents the project has that
-  aren't in the folder; it leaves those alone, as they may have come from
-  elsewhere.
-- A document removed or changed before the project has registered its
-  upload waits until the project lists it, then is deleted or replaced, so no
-  copy is left behind.
-- A document or skill deleted at Smartloop is pushed again on the next pass.
-  If the project itself is deleted, syncing stops; `/sync` links the folder to
-  the current project instead.
+  with optional `name:` and `description:` frontmatter. They go to the project
+  when the chat opens it and as soon as a reply writes one: new ones are
+  added, changed ones updated, deleted ones removed. They are what you commit
+  from `.docent/`; the manifest is kept out of git by `.docent/.gitignore`,
+  as it names this machine's project.
 
 ### Coding
 
@@ -342,9 +290,17 @@ touches anything outside your files:
 
 What happens on each prompt:
 
-1. **It reads the project.** The agent gets the file tree, the contents of
-   the files the prompt is about, and the git state (branch, remotes, what's
-   changed), so it answers from your code, and goes to the web only for what
+1. **It reads the project.** The agent is told what kind of project it is
+   and its git state (branch, remotes, what's changed), and is given an
+   `explore` tool. It calls it first for an overview of the codebase (its
+   files with their sizes, manifests and README), then for the files, or
+   the lines of a large one, that the request concerns, and decides from
+   them what to do. Reading only reads, inside the folder, so it's never
+   asked about. For what the code and the model's own knowledge don't
+   tell, or may have out of date, it calls `web_search`, which searches
+   through Smartloop's hosted search and reads the top pages. It's offered
+   while the project's web search is on (ctrl+s), signed in. That way it
+   answers from your code, and goes to the web only for what
    the code can't tell it, like a library's current API. It's also told about
    the machine (OS and version, shell, the package managers and toolchains on
    `PATH`, active virtualenvs), so commands use `apt-get` on Ubuntu and `brew`
