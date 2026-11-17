@@ -547,6 +547,9 @@ struct Reply {
     warnings: Vec<String>,
     model: Option<String>,
     text: String,
+    /// Tool-call markup the model wrote as text is still open, waiting for
+    /// its closing tag: each chunk looks for it until it comes.
+    markup_open: bool,
     citations: Vec<chat::Reference>,
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
@@ -3101,15 +3104,25 @@ impl App {
         match event {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
+                let before = reply.text.len();
                 reply.text.push_str(&content);
                 // A tool call the model wrote as text runs as a shell
-                // block, and its control tokens never show.
-                if files::has_tool_call_markup(&reply.text) {
+                // block, and its control tokens never show. Only what just
+                // came is looked at, with a little before it for a tag
+                // split between chunks: the whole reply on every chunk
+                // stalls the terminal on a long one.
+                let tail = floor_boundary(&reply.text, before.saturating_sub(MARKUP_TAIL));
+                if reply.markup_open || files::has_tool_call_markup(&reply.text[tail..]) {
                     reply.text = files::tool_calls_as_blocks(&reply.text);
+                    reply.markup_open = files::has_tool_call_markup(&reply.text);
                 }
                 // A file's written once its block is done, not when the
-                // reply is.
-                if content.contains('\n')
+                // reply is; looked for only when a line just ended that
+                // may end one.
+                let from = floor_boundary(&reply.text, before.min(reply.text.len()));
+                let start = reply.text[..from].rfind('\n').map_or(0, |i| i + 1);
+                let ended = reply.text[start..].rfind('\n').map(|i| &reply.text[start..start + i]);
+                if ended.is_some_and(|lines| lines.lines().any(files::may_close_block))
                     && let Some(root) = &turn.files_dir
                 {
                     reply.write_done(root);
@@ -5607,6 +5620,19 @@ const COMMAND_ROUNDS: u32 = 3;
 /// How many times a reply's tool calls go back with their results, per
 /// prompt: the agent looks around, builds and tests, a step a round.
 const TOOL_ROUNDS: u32 = 12;
+/// Characters before a chunk looked at again for tool-call markup, so a
+/// tag split between two chunks is still found.
+const MARKUP_TAIL: usize = 64;
+
+/// The largest char boundary of `text` at `at` or before it.
+fn floor_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
 /// Characters of a tool call's output the agent gets, its start and end.
 const TOOL_KEPT: usize = 6000;
 /// A tool call's result when the user skips its command.
@@ -9691,5 +9717,51 @@ mod tests {
         assert!(!rows.iter().any(|r| r.contains("const B")), "its code isn't drawn while it streams: {:?}", rows);
     }
 
-}
 
+    #[test]
+    #[ignore]
+    fn a_long_reply_streams_without_stalling() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..430).map(|i| format!("  <div class=\"row-{i}\">some markup {i} with text</div>\n")).collect();
+        let reply = format!("Making it bold.\n\n```sh\ncat > index.html <<'EOF'\n{body}EOF\n```\n\n```sh\ncat > render.js <<'EOF'\n{body}EOF\n```\n");
+        let chunks: Vec<String> = reply.chars().collect::<Vec<_>>().chunks(3).map(|c| c.iter().collect()).collect();
+
+        // As it was: the whole reply parsed on every line, and scanned for
+        // markup on every chunk.
+        let started = Instant::now();
+        let mut text = String::new();
+        for chunk in &chunks {
+            text.push_str(chunk);
+            let _ = files::has_tool_call_markup(&text);
+            if chunk.contains('\n') {
+                let _ = files::blocks(&text);
+            }
+        }
+        let old = started.elapsed();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.entries.push(Entry::Reply(Reply { root: Some(dir.path().to_path_buf()), ..Default::default() }));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let started = Instant::now();
+        for chunk in &chunks {
+            app.apply(AppEvent::Chat(ChatEvent::Content(chunk.clone())));
+        }
+        let new = started.elapsed();
+        println!("{} chars in {} chunks: before {:?}, now {:?}", reply.len(), chunks.len(), old, new);
+        // Still written as each block ends.
+        assert_eq!(std::fs::read_to_string(dir.path().join("index.html")).unwrap(), body);
+        assert_eq!(std::fs::read_to_string(dir.path().join("render.js")).unwrap(), body);
+    }
+}

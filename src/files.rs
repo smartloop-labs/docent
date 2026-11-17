@@ -1308,6 +1308,19 @@ pub fn commands(reply: &str) -> Vec<String> {
 /// Info-string languages that mark a block as shell commands to run.
 const SHELL_LANGS: [&str; 6] = ["sh", "bash", "zsh", "shell", "console", "terminal"];
 
+/// Whether `line`, just ended in a streaming reply, may be the one that
+/// closes a block: a fence, an edit's `>>>>>>> REPLACE`, or a heredoc's end
+/// word (`EOF`). The reply is parsed for done blocks only then, not on
+/// every line: parsed on every line, a long reply costs the square of its
+/// length, and the terminal stalls while it streams.
+pub fn may_close_block(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("```")
+        || t.starts_with("~~~")
+        || t.starts_with(">>>>>>>")
+        || (!t.is_empty() && t.len() <= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
 /// Whether `reply` holds tool-call markup a model wrote as text (see
 /// [`tool_calls_as_blocks`]).
 pub fn has_tool_call_markup(reply: &str) -> bool {
@@ -2337,6 +2350,16 @@ mod tests {
         let app = "const speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\n";
         let done = extract_with(example, |_| Some(app.into()));
         assert_eq!(done.files[0].content, app.replace("speed = 3", "speed = 5"));
+    }
+
+    #[test]
+    fn only_a_line_that_may_end_a_block_is_worth_a_parse() {
+        for line in ["```", "````\n", "  ```", "~~~", ">>>>>>> REPLACE", "EOF", "END_OF_FILE\n"] {
+            assert!(may_close_block(line), "{line}");
+        }
+        for line in ["const a = 1;", "", "  <div class=\"row\">", "<<<<<<< SEARCH", "======="] {
+            assert!(!may_close_block(line), "{line}");
+        }
     }
 
     #[test]
