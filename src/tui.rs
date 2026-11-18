@@ -166,8 +166,8 @@ enum AppEvent {
     Connections(String, Vec<mcp::Server>),
     /// The skills of this project, by id, for the slash-command hints.
     Skills(String, Vec<(String, String)>),
-    /// A shell run's process is up: its run's id and process id, for
-    /// `/stop`.
+    /// A shell run's process is up: its run's id and process id, for a
+    /// stop.
     Started(usize, u32),
     /// A shell run printed more: its run's id, and all it printed so far.
     Printed(usize, String),
@@ -471,7 +471,7 @@ enum Ended {
     Exited(i32),
     /// By a signal from outside.
     Killed,
-    /// By the user: `/stop`, or quitting.
+    /// By the user: `x` in `/tasks`, a click on `✕ stop`, or quitting.
     Stopped,
 }
 
@@ -500,7 +500,7 @@ impl Ended {
     }
 }
 
-/// A shell run still going, listed under the prompt, for `/stop` and for a
+/// A shell run still going, listed under the prompt and in `/tasks`, for a
 /// click on it.
 struct Job {
     id: usize,
@@ -514,7 +514,7 @@ struct Job {
 }
 
 /// Where a shell run's thread reports: the run's id, the app's channel,
-/// and the flag a `/stop` sets.
+/// and the flag a stop sets.
 struct Report {
     id: usize,
     tx: UnboundedSender<AppEvent>,
@@ -1504,7 +1504,7 @@ struct App {
     lsp: Arc<lsp::Lsp>,
     /// Checks asked of the language servers, for their ids.
     lsp_runs: usize,
-    /// The shell runs still going, which `/stop` ends, and quitting too.
+    /// The shell runs still going, which `/tasks` and a click end, and quitting too.
     jobs: Vec<Job>,
     /// The check running on the project after a reply's files were
     /// written, if one is.
@@ -2045,8 +2045,8 @@ impl App {
 
     /// Run `command` with the shell in the working directory, showing its
     /// output as it comes. Ending in `&`, as `npm run dev &`, it's started
-    /// in the background: the next prompt doesn't wait for it, and `/stop`
-    /// ends it, or a click on its entry.
+    /// in the background: the next prompt doesn't wait for it, and `x` in
+    /// `/tasks` ends it, or a click on its entry.
     fn run_shell(&mut self, command: String) {
         if command.is_empty() {
             return self.entries.push(Entry::Error("Give a command to run: !<command>".to_string()));
@@ -2126,19 +2126,6 @@ impl App {
         shell.ended = ended;
         shell.detached |= ended.is_none();
         Some(context)
-    }
-
-    /// `/stop [word]`: end the shell runs still going, or those with
-    /// `word` in their command.
-    fn stop_command(&mut self, word: &str) {
-        let stopped = self.stop_jobs(|job| word.is_empty() || job.command.contains(word));
-        let notice = match (stopped.is_empty(), word.is_empty()) {
-            (true, true) => "Nothing is running".to_string(),
-            (true, false) => format!("Nothing running has `{}` in it; /stop alone stops everything", word),
-            _ => format!("Stopping: {}", one_line(&stopped)),
-        };
-        self.entries.push(Entry::Notice(notice));
-        self.scroll_back = 0;
     }
 
     /// Stop the jobs `which` picks: their commands. Each run's thread sees
@@ -3218,7 +3205,7 @@ impl App {
             .join("\n")
     }
 
-    /// A clicked action: `stop/<id>` ends shell run `id`, as `/stop` does,
+    /// A clicked action: `stop/<id>` ends shell run `id`, as `x` in `/tasks` does,
     /// without a notice, as the run's entry says it's stopped; `show/<id>`
     /// expands the run under the prompt.
     fn act(&mut self, action: &str) {
@@ -3383,7 +3370,7 @@ impl App {
     /// `/project`: list the projects to switch to. Also with none to chat
     /// in yet, so one can be created.
     /// `/tasks` or `ctrl+b`: the commands still running, the first
-    /// selected; none, said so, as `/stop` says it.
+    /// selected; none, said so.
     fn open_jobs(&mut self) {
         if self.jobs.is_empty() {
             self.entries.push(Entry::Notice("Nothing is running".to_string()));
@@ -4033,7 +4020,6 @@ impl App {
                     Some(_) => self.find_project(input.split_once(' ').map_or("", |(_, name)| name).trim().to_string()),
                 }
             }
-            "/stop" => self.stop_command(&words.collect::<Vec<_>>().join(" ")),
             "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
@@ -5675,7 +5661,7 @@ const KILL_AFTER: Duration = Duration::from_secs(3);
 /// Run `command` with the platform's shell, its stdin closed, in `dir` or
 /// the working directory, on a thread of its own: what it printed, as a
 /// terminal would show it, and how it ended. As it runs, its output goes
-/// to the screen as `Printed`, and its process id as `Started`, so `/stop`
+/// to the screen as `Printed`, and its process id as `Started`, so a stop
 /// can end it. `background`, it's given `BACKGROUND_GRACE` to fail; still
 /// running then, this returns `None` with its output so far, and its end
 /// comes to the app as a `Shell` event.
@@ -5994,7 +5980,7 @@ fn shell_context(command: &str, output: &str, ended: Option<Ended>, since: bool)
 
 /// The entry for a shell run, with the last `shown` lines it printed. Its
 /// command line is clicked to expand it under the prompt, and while it
-/// runs, the `✕ stop` closing it is clicked to stop it, as `/stop` does.
+/// runs, the `✕ stop` closing it is clicked to stop it, as `x` in `/tasks` does.
 fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<'static>>) {
     let show = |style: Style| crate::links::action(style, &format!("show/{}", shell.id));
     let stop = crate::links::action(Style::new().fg(Color::Yellow).bold(), &format!("stop/{}", shell.id));
@@ -6457,7 +6443,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 13] = [
+const COMMANDS: [(&str, &str); 12] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -6466,7 +6452,6 @@ const COMMANDS: [(&str, &str); 13] = [
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
-    ("/stop", "stop the shell commands still running; /stop <word> those with word in them"),
     ("/usage", "credits used this month"),
     ("/upgrade", "Pro or Plus plan: more credits a month"),
     ("/clear", "clear the chat and start a new session"),
@@ -6558,7 +6543,6 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/<skill> [prompt]", "run one of the project's skills"),
         ("!<command>", "run a shell command; the next prompt shares its output"),
         ("!<command> &", "run it in the background, as a dev server, listed under the prompt until it ends"),
-        ("/stop [word]", "stop the shell commands still running, or those with word in them"),
         ("/tasks [ctrl+b]", "the commands still running: [↑] [↓] select, [enter] all it printed, [x] stop"),
         ("click a command", "running under the prompt, or in its entry: all it printed; its ✕ stop ends it"),
         ("[ctrl+c] /quit", "quit"),
@@ -7067,7 +7051,7 @@ mod tests {
         let (third, _) = app.shell_entry("git push".into(), false);
         app.apply(AppEvent::Shell(first, "fatal".into(), Some(Ended::Exited(1))));
         // Never started, so nothing would end them: they'd be listed
-        // under the prompt forever, and `/stop` would have nothing to end.
+        // under the prompt forever, with nothing to end.
         app.apply(AppEvent::Unrun(vec![second, third]));
         assert!(app.jobs.is_empty());
         assert!(!app.entries.iter().any(|e| matches!(e, Entry::Shell(s) if s.id != first)));
@@ -7078,9 +7062,6 @@ mod tests {
     fn stop_ends_the_commands_still_running_and_a_background_one_is_told_of_twice() {
         let mut app = app();
         app.phase = Phase::Ready;
-        app.input = "/stop".into();
-        app.submit();
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Nothing is running"));
         let (id, report) = app.shell_entry("npm run dev".into(), true);
         let (_, other) = app.shell_entry("cargo test".into(), false);
         app.apply(AppEvent::Started(id, 4242));
@@ -7091,12 +7072,10 @@ mod tests {
         // until it ends.
         assert!(!text.contains("running in the background"), "{}", text);
         assert!(text.lines().any(|r| r.contains("npm run dev (") && r.contains(", background)")), "{}", text);
-        // By a word, only the commands with it; `/stop` alone, all.
+        // A click on its `✕ stop` ends only that one.
         app.jobs[0].pid = None;
-        app.input = "/stop npm".into();
-        app.submit();
+        app.act(&format!("stop/{}", id));
         assert!(report.stopped.load(Ordering::Relaxed) && !other.stopped.load(Ordering::Relaxed));
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Stopping: npm run dev"));
         app.apply(AppEvent::Shell(id, "up".into(), Some(Ended::Stopped)));
         assert_eq!(app.jobs.len(), 1);
         assert!(screen(&app, 80, 24).contains("  ■ stopped"));
@@ -7104,9 +7083,6 @@ mod tests {
             app.shell_context.last().map(String::as_str),
             Some("I ran `npm run dev` in the shell; it was stopped by me:\n```\nup\n```")
         );
-        app.input = "/stop nothing".into();
-        app.submit();
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Nothing running has `nothing` in it")));
         // A background one told of as running has its end told as that
         // one's; what it prints shows meanwhile.
         let (id, _) = app.shell_entry("npm start".into(), true);
