@@ -2947,6 +2947,13 @@ impl App {
                         && let Some(nudge) = model_nudge(list)
                     {
                         self.entries.push(Entry::Warning(nudge));
+                        // Opened for them, unless another panel is up, with
+                        // the recommended model selected.
+                        if matches!(self.overlay, Overlay::None) {
+                            let pick = recommended_pick(list).map(|m| m.name.clone());
+                            let at = pick.and_then(|name| panel_models(list.clone()).iter().position(|m| m.name == name));
+                            self.overlay = Overlay::Models { rows: None, selected: at.unwrap_or(0) };
+                        }
                     }
                 }
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
@@ -5872,10 +5879,10 @@ fn model_nudge(models: &[ModelRow]) -> Option<String> {
     }
     Some(match recommended_pick(models) {
         Some(m) => format!(
-            "No model selected. Recommended for your system: {} · enable it in /models (ctrl+o)",
+            "No models enabled yet: pick at least one. Recommended for your system: {} · /models (ctrl+o)",
             m.name
         ),
-        None => "No model selected · open /models (ctrl+o) to enable one".to_string(),
+        None => "No models enabled yet: pick at least one · /models (ctrl+o)".to_string(),
     })
 }
 
@@ -9112,7 +9119,7 @@ mod tests {
         let nudge = model_nudge(&list).unwrap();
         assert!(nudge.contains("Recommended for your system: thinker"), "{}", nudge);
         let none_recommended = vec![model("big", "general", false, false)];
-        assert_eq!(model_nudge(&none_recommended).as_deref(), Some("No model selected · open /models (ctrl+o) to enable one"));
+        assert_eq!(model_nudge(&none_recommended).as_deref(), Some("No models enabled yet: pick at least one · /models (ctrl+o)"));
         let enabled = vec![model("big", "general", false, true), model("small", "general", true, false)];
         assert_eq!(model_nudge(&enabled), None);
     }
