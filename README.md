@@ -222,7 +222,7 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | `!<command>` | run a shell command in the working directory, its output shown as it comes, each command of a script on a `$` line over what it printed; the output goes to the agent with your next prompt, so it stays in the session. The prompt turns pink with `!` ahead as it's typed, and the footer says shell mode, as in Claude Code |
 | `!<command> &` | run it in the background, as a dev server: nothing waits for it, and it's listed under the prompt, out of the chat, until it ends |
 | `/tasks` | the commands still running, as in Claude Code: `↑` `↓` pick one, `Enter` shows all it printed, `x` stops it; `ctrl+b` opens it too (twice under tmux, where it's the prefix) |
-| `/stop [word]` | stop the shell commands still running, or those with the word in their command; a click on a running command's `✕ stop` in its entry stops it too, and a click on its command expands all it printed |
+| click a running command | its `✕ stop` in its entry stops it; a click on the command expands all it printed |
 | `/help`, `/quit` | |
 
 Pass an initial prompt to send immediately:
@@ -321,7 +321,7 @@ What happens on each prompt:
 | Command | Does |
 | --- | --- |
 | `!<command> [&]` | run a shell command yourself, in the background with `&` |
-| `/tasks` or `ctrl+b`, `/stop` | see, expand or stop running commands |
+| `/tasks` or `ctrl+b` | see, expand or stop running commands |
 | `Tab` on an empty prompt | turn auto-approve on or off |
 
 More in the [coding docs](https://smartloop.ai/docs/coding/).
