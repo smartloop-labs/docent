@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, docent, files, framework, lsp, mcp};
+use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -191,6 +191,8 @@ enum AppEvent {
     /// The language servers' errors in the files written: the check's id,
     /// the servers asked, and what they report.
     Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
+    /// The pre-run skill's lookup is done: the turn it held goes now.
+    PreRun(Box<PreRun>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -1178,6 +1180,28 @@ struct Sent {
     web_search: bool,
 }
 
+/// What the pre-run skill looks up for a turn: the `deps` its `prompt`,
+/// as typed, names, or `guessed` of a scope it names.
+struct Lookup {
+    deps: Vec<prerun::Dep>,
+    guessed: bool,
+    prompt: String,
+}
+
+/// A turn held for the pre-run skill to read the API of the `deps` it
+/// uses, `guessed` of a scope its prompt names, and what it `found`;
+/// `waited` on when they were read in the background.
+struct PreRun {
+    id: usize,
+    project: String,
+    sent: Sent,
+    files: Vec<Attachment>,
+    deps: Vec<prerun::Dep>,
+    guessed: bool,
+    found: Vec<prerun::Api>,
+    waited: bool,
+}
+
 /// A turn's native tool calling: the reply asks for `bash` calls, they run
 /// as a reply's fenced commands do, asked about first unless auto-approve
 /// is on, and their results go back in a turn of their own so the agent
@@ -1374,6 +1398,10 @@ struct Check {
     /// Asked of the language servers, not run: the folder and the files,
     /// to check with the build once they're clean.
     servers: Option<(std::path::PathBuf, Vec<String>)>,
+    /// The project's folder, where its tests run once it builds.
+    root: std::path::PathBuf,
+    /// The project's tests, run by the post-run skill once it builds.
+    tests: bool,
 }
 
 /// What a check's end calls for, by its exit code and whether the round
@@ -1383,14 +1411,13 @@ enum AfterCheck {
     Passed,
     /// Ask the agent to fix it: the round this makes.
     Fix(u32),
-    /// The last fix changed nothing in what the check says: left to the
-    /// user, as another round would too.
+    /// A fix brought the check back to what it said before, so the
+    /// rounds go in circles: left to the user, as another would too.
     Stalled,
+    /// `FIX_ROUNDS` fixes and still failing: left to the user.
+    OutOfRounds,
 }
 
-/// The loop goes on as long as the errors are not fixed, round after round,
-/// and stops only when a round made no difference: the check's `output` is
-/// what it was after the last failure.
 /// Words for a reply being written, when the model writing it isn't known.
 const WORKING_WORDS: [&str; 12] = [
     "Generating",
@@ -1425,10 +1452,22 @@ const EDIT_ROUNDS: u32 = 2;
 /// Characters of a file sent back with an edit that didn't apply.
 const EDIT_SHOWN: usize = 40_000;
 
-fn after_check(code: Option<i32>, output: &str, fix_round: u32, last_failure: Option<&str>) -> AfterCheck {
+/// Rounds of fixes for one prompt's failing check, before it's left to
+/// the user.
+const FIX_ROUNDS: u32 = 5;
+/// Of those, the rounds for failing tests: a test can want more than the
+/// code changed, and that's for the user to say.
+const TEST_ROUNDS: u32 = 3;
+
+/// The loop goes on as long as the errors are not fixed, round after round,
+/// and stops when the check's `output` is one it gave earlier in the turn,
+/// as a fix that undoes the last one would go round again, or after
+/// `FIX_ROUNDS`.
+fn after_check(code: Option<i32>, output: &str, fix_round: u32, failures: &[String]) -> AfterCheck {
     match code {
         Some(0) => AfterCheck::Passed,
-        _ if last_failure == Some(output) => AfterCheck::Stalled,
+        _ if failures.iter().any(|f| f == output) => AfterCheck::Stalled,
+        _ if fix_round >= FIX_ROUNDS => AfterCheck::OutOfRounds,
         _ => AfterCheck::Fix(fix_round + 1),
     }
 }
@@ -1511,6 +1550,8 @@ struct App {
     check: Option<Check>,
     /// Rounds of fixing a failed check since the user's last prompt.
     fix_round: u32,
+    /// Of those, the rounds of fixing failed tests.
+    test_round: u32,
     /// The files the last reply wrote as it streamed, each with whether
     /// it made it and the lines added and removed: reported and checked
     /// with the rest once it's in.
@@ -1531,9 +1572,9 @@ struct App {
     /// The project's enabled models, once read; empty asks for one on the
     /// card.
     enabled_models: Option<Vec<String>>,
-    /// What the check said when it last failed, to tell a round that fixed
-    /// nothing.
-    last_failure: Option<String>,
+    /// What the check said each time it failed this turn, to tell a round
+    /// that brought back errors already seen.
+    failures: Vec<String>,
     /// The last reply's shell commands, with their folder, waiting for the
     /// check of its files to pass before they run.
     commands: Option<(std::path::PathBuf, Vec<String>)>,
@@ -1548,6 +1589,19 @@ struct App {
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
+    /// Whether the next turn's the user's prompt, for the pre-run skill
+    /// to look up the libraries it uses; its fix rounds aren't.
+    look_up: bool,
+    /// The pre-run lookup the turn waits on, by its id.
+    pre_run: Option<usize>,
+    /// Lookups started, for their ids.
+    pre_runs: usize,
+    /// Libraries the pre-run skill found no installed package of, said
+    /// once a session.
+    not_installed: Vec<prerun::Dep>,
+    /// The current API the pre-run skill found for the user's prompt, told
+    /// in its every round.
+    reference: Option<String>,
     /// The highlighted slash-command hint while typing a command.
     hint_at: usize,
     /// The project's skills as `(name, description)`, hinted and run as
@@ -1623,6 +1677,7 @@ impl App {
             jobs: Vec::new(),
             check: None,
             fix_round: 0,
+            test_round: 0,
             edit_round: 0,
             files_asked: false,
             manifest_asked: false,
@@ -1634,7 +1689,12 @@ impl App {
             always_run: false,
             tooling: None,
             command_round: 0,
-            last_failure: None,
+            look_up: false,
+            pre_run: None,
+            pre_runs: 0,
+            not_installed: Vec::new(),
+            reference: None,
+            failures: Vec::new(),
             hint_at: 0,
             skills: Vec::new(),
             agent: None,
@@ -1858,20 +1918,39 @@ impl App {
         // user's message in its prompt and reads what's around it as data,
         // and a small model then describes files instead of giving them.
         let mut system = None;
+        let (mut deps, mut guessed) = (Vec::new(), false);
+        let mut kind = "";
         if let Some(root) = &files_dir {
             let context = match code_kind(root) {
-                Some(kind) => format!("{}\n\n", files::project_brief(root, kind)),
+                Some(project_kind) => {
+                    kind = project_kind;
+                    // The pre-run skill looks up the libraries the user's
+                    // prompt names, as typed, not with the output of
+                    // commands run since, which names libraries it doesn't
+                    // use.
+                    let libraries = if std::mem::take(&mut self.look_up) { prerun::dependencies(root, kind) } else { Vec::new() };
+                    (deps, guessed) = prerun::relevant(&libraries, &shown);
+                    format!("{}\n\n", files::project_brief(root, kind))
+                }
                 None if files::is_empty_folder(root) => format!("{}\n\n", files::EMPTY_FOLDER),
                 None => String::new(),
             };
+            // What the user asked to be remembered goes ahead of the
+            // project, and the post-run skill, on how to keep more, with
+            // the rest of how to reply.
             system = Some(format!(
-                "{}\n{}\n\n{}{}\n\n{}",
+                "{}\n{}\n\n{}{}{}\n\n{}\n\n{}",
                 files::system_context(),
                 files::folder_note(root),
+                files::memory_note(root),
                 context,
                 files::HINT,
+                skills::body(skills::POST_RUN),
                 files::EDIT_EXAMPLE
             ));
+            if let Some(reference) = &self.reference {
+                system = system.map(|system| format!("{system}\n\n{reference}"));
+            }
             // Its language server starts now, indexing while the reply comes,
             // to be ready for the files it gives.
             if !cfg!(test)
@@ -1885,7 +1964,7 @@ impl App {
         // model and decides whether to search the web, for coding as for
         // anything else. Docent is the harness around its answer.
         let cwd = files_dir.clone().or_else(|| chat::turn_dir(&project));
-        self.entries.push(Entry::User(shown));
+        self.entries.push(Entry::User(shown.clone()));
         if making && files_dir.is_none() {
             let warning = match docent::folder(&project) {
                 Some(folder) => format!(
@@ -1899,10 +1978,108 @@ impl App {
         let budget = files::budget_for(self.window);
         let web_search = self.web_search != Some(false);
         let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget, web_search };
+        if deps.is_empty() {
+            return self.start_sent(project, sent, files);
+        }
+        let lookup = Lookup { deps, guessed, prompt: shown };
+        self.pre_run(project, sent, files, lookup, kind);
+    }
+
+    /// Start the turn `sent`, its tool rounds from none.
+    fn start_sent(&mut self, project: String, sent: Sent, files: Vec<Attachment>) {
         // A turn with a working directory offers the `bash` tool, run there,
         // and its tool rounds start over: it's a new request, not one going on.
         self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
+    }
+
+    /// The pre-run skill: the current API of the libraries the turn `sent`
+    /// uses, by its `lookup`, told to the agent with it. Those kept from an
+    /// earlier turn are told straight away; the rest are read from the
+    /// packages installed for the project, a `kind` of it, and a guess
+    /// weighed, while the turn waits.
+    fn pre_run(&mut self, project: String, sent: Sent, files: Vec<Attachment>, lookup: Lookup, kind: &str) {
+        let Lookup { deps, guessed, prompt } = lookup;
+        let Some(root) = sent.files_dir.clone() else { return self.start_sent(project, sent, files) };
+        self.pre_runs += 1;
+        let id = self.pre_runs;
+        // Those not kept are read, if they can be: one not locked yet isn't
+        // installed either, nor has a package without types any API to
+        // read, and each is said so without a read.
+        let (deps, unread): (Vec<prerun::Dep>, Vec<prerun::Dep>) = deps
+            .into_iter()
+            .partition(|d| prerun::kept(&root, d) || (apidocs::readable(kind, d) && !apidocs::untyped(&root, d)));
+        let missing: Vec<prerun::Dep> = deps.iter().filter(|d| !prerun::kept(&root, d)).cloned().collect();
+        let said = [missing.clone(), unread].concat();
+        // A few named and kept are told straight away; scoring the many a
+        // guess weighs is too long a wait at the prompt, so it's done with
+        // any reading, in the background.
+        if (missing.is_empty() && !guessed) || cfg!(test) {
+            let found = prerun::look_up(&root, kind, &deps, &prompt, false);
+            return self.pre_run_done(PreRun { id, project, sent, files, deps: said, guessed, found, waited: false });
+        }
+        if !missing.is_empty() {
+            let names: Vec<String> = missing.iter().map(|d| d.to_string()).collect();
+            let from = if names.len() == 1 { "its installed package" } else { "their installed packages" };
+            self.entries.push(Entry::Notice(format!("Reading the API of {} from {from} (esc stops)", names.join(", "))));
+        }
+        self.pre_run = Some(id);
+        let kind = kind.to_string();
+        self.spawn(move |_, tx| {
+            let found = prerun::look_up(&root, &kind, &deps, &prompt, true);
+            let _ = tx.send(AppEvent::PreRun(Box::new(PreRun { id, project, sent, files, deps: said, guessed, found, waited: true })));
+        });
+    }
+
+    /// A pre-run lookup's end: what it found goes with the turn, which
+    /// starts, unless it was stopped or the project changed meanwhile.
+    /// Those `deps` read for and not installed are said, once a session.
+    fn pre_run_done(&mut self, done: PreRun) {
+        let PreRun { id, project, mut sent, files, deps, guessed, found, waited } = done;
+        // One read in the background is waited on, unless it was stopped
+        // since; one only read from the cache never was.
+        if waited && self.pre_run.take_if(|p| *p == id).is_none() {
+            return;
+        }
+        if self.project.as_ref().is_none_or(|(p, _)| *p != project) {
+            return;
+        }
+        // Only for those the prompt names: a guess weighs many, most of
+        // which it was never going to tell.
+        let missed: Vec<prerun::Dep> = deps
+            .into_iter()
+            .filter(|d| !guessed && !found.iter().any(|f| f.dep == *d) && !self.not_installed.contains(d))
+            .collect();
+        // A package installed without types has no API to read, and
+        // building won't give it one.
+        let root = sent.files_dir.clone().unwrap_or_default();
+        let (untyped, absent): (Vec<&prerun::Dep>, Vec<&prerun::Dep>) =
+            missed.iter().partition(|d| apidocs::untyped(&root, d));
+        let names = |deps: Vec<&prerun::Dep>| deps.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
+        if !absent.is_empty() {
+            self.entries.push(Entry::Notice(format!(
+                "Found no installed API for {}, so the agent goes without it; building the project installs it",
+                names(absent)
+            )));
+        }
+        if !untyped.is_empty() {
+            let ships = if untyped.len() == 1 { "ships" } else { "ship" };
+            self.entries.push(Entry::Notice(format!(
+                "{} {ships} no types, so the agent goes without its API",
+                names(untyped)
+            )));
+        }
+        self.not_installed.extend(missed);
+        let found = if guessed { prerun::guess(found) } else { found };
+        if !found.is_empty() {
+            let names: Vec<String> = found.iter().map(|f| f.dep.to_string()).collect();
+            self.entries.push(Entry::Notice(format!("Using the current API of {}", names.join(", "))));
+        }
+        self.reference = prerun::reference(&found);
+        if let Some(reference) = &self.reference {
+            sent.system = sent.system.map(|system| format!("{system}\n\n{reference}"));
+        }
+        self.start_sent(project, sent, files);
     }
 
     /// Stream the turn `sent`, with `files` uploaded first and the tool
@@ -1965,12 +2142,14 @@ impl App {
     /// Put the project's web search back on after a turn that had it off.
     /// Whether a turn of `prompt` makes files: always in a code project the
     /// chat was opened in, and elsewhere when the prompt asks for something
-    /// to be made or names a file of the folder, as a pasted error does.
+    /// to be made, names a file of the folder, as a pasted error does, or
+    /// asks for something to be remembered, which is kept in the folder.
     fn making(&self, prompt: &str) -> bool {
         let Some((project, _)) = &self.project else { return false };
         files::wants_files(prompt)
-            || chat::making_dir(project)
-                .is_some_and(|dir| code_kind(&dir).is_some() || files::mentions_file(&dir, prompt))
+            || chat::making_dir(project).is_some_and(|dir| {
+                code_kind(&dir).is_some() || files::mentions_file(&dir, prompt) || files::wants_memory(prompt)
+            })
     }
 
     /// Write the files a reply gave into the turn's folder, new and changed
@@ -2155,8 +2334,9 @@ impl App {
             self.lsp_runs += 1;
             let id = self.lsp_runs;
             let servers = Some((root.to_path_buf(), written.to_vec()));
-            self.check = Some(Check { id, project, command: "the language server".to_string(), servers });
             let (lsp, dir, written) = (self.lsp.clone(), root.to_path_buf(), written.to_vec());
+            let command = "the language server".to_string();
+            self.check = Some(Check { id, project, command, servers, root: dir.clone(), tests: false });
             self.spawn(move |_, tx| {
                 let (asked, problems) = lsp.errors(&dir, &written);
                 let _ = tx.send(AppEvent::Diagnostics(id, asked, problems));
@@ -2169,18 +2349,36 @@ impl App {
     /// Check that the project at `root` still builds after `written`
     /// changed, by its build command or each file's own.
     fn run_build_check(&mut self, root: &std::path::Path, written: &[String]) {
-        let Some((project, _)) = self.project.clone() else { return };
-        let Some(command) = files::check_command(root, code_kind(root), written) else { return };
-        let (id, report) = self.shell_entry(command.clone(), false);
-        self.check = Some(Check { id, project, command: command.clone(), servers: None });
-        if cfg!(test) {
-            return;
+        if let Some(command) = files::check_command(root, code_kind(root), written) {
+            self.run_check_command(root, command, false);
         }
-        let dir = root.to_path_buf();
-        self.spawn(move |_, tx| {
-            let (output, ended) = run_command(&command, Some(&dir), false, report);
-            let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
-        });
+    }
+
+    /// The checks passed, or none applied, for the files written in
+    /// `root`: the post-run skill runs the project's tests, if it has
+    /// any, and then the reply's commands run.
+    fn checks_passed(&mut self, root: &std::path::Path) {
+        let tests = files::test_command(root, code_kind(root));
+        if !tests.is_some_and(|command| self.run_check_command(root, command, true)) {
+            self.run_commands();
+        }
+    }
+
+    /// Run `command` in `root` as the check, the project's `tests` or its
+    /// build, in a shell entry of its own; whether it runs, as it needs a
+    /// project.
+    fn run_check_command(&mut self, root: &std::path::Path, command: String, tests: bool) -> bool {
+        let Some((project, _)) = self.project.clone() else { return false };
+        let (id, report) = self.shell_entry(command.clone(), false);
+        let root = root.to_path_buf();
+        self.check = Some(Check { id, project, command: command.clone(), servers: None, root: root.clone(), tests });
+        if !cfg!(test) {
+            self.spawn(move |_, tx| {
+                let (output, ended) = run_command(&command, Some(&root), false, report);
+                let _ = tx.send(AppEvent::Check(id, output, ended.unwrap_or(Ended::Killed)));
+            });
+        }
+        true
     }
 
     /// A check ended: passed, it's said; failed, the agent is asked to fix
@@ -2209,8 +2407,7 @@ impl App {
                 self.entries.push(Entry::Notice(format!("{}: no errors in {}", check.command, files)));
                 self.run_build_check(&root, &written);
                 if self.check.is_none() {
-                    self.last_failure = None;
-                    self.run_commands();
+                    self.checks_passed(&root);
                 }
             }
             return;
@@ -2225,9 +2422,10 @@ impl App {
         self.check_outcome(check, Some(1), output);
     }
 
-    /// What a check that ended with `code` and `output` calls for: passed,
-    /// the reply's commands; failed, a round of fixes, unless the last one
-    /// changed nothing.
+    /// What a check that ended with `code` and `output` calls for: a
+    /// build passed, the project's tests; they passed, the reply's
+    /// commands; failed, a round of fixes, unless the rounds go in circles
+    /// or have run out.
     fn check_outcome(&mut self, check: Check, code: Option<i32>, output: String) {
         // The project switched meanwhile: its errors aren't this one's.
         if self.project.as_ref().is_none_or(|(p, _)| *p != check.project) {
@@ -2235,20 +2433,36 @@ impl App {
             self.answer_ask(false, false);
             return;
         }
-        match after_check(code, &output, self.fix_round, self.last_failure.as_deref()) {
+        // The failures seen are kept through a pass: tests that fail as
+        // they did before a build was fixed go round in circles too.
+        let outcome = match after_check(code, &output, self.fix_round, &self.failures) {
+            AfterCheck::Fix(_) if check.tests && self.test_round >= TEST_ROUNDS => AfterCheck::OutOfRounds,
+            outcome => outcome,
+        };
+        match outcome {
             AfterCheck::Passed => {
-                self.last_failure = None;
                 let fixed = if self.fix_round > 0 { format!(" after {} fix(es)", self.fix_round) } else { String::new() };
                 self.entries.push(Entry::Notice(format!("{} passed{}", check.command, fixed)));
-                self.run_commands();
+                if check.tests {
+                    self.run_commands();
+                } else {
+                    self.checks_passed(&check.root);
+                }
             }
             AfterCheck::Fix(round) => {
                 self.fix_round = round;
-                self.last_failure = Some(output.clone());
+                if check.tests {
+                    self.test_round += 1;
+                }
+                self.failures.push(output.clone());
                 self.entries.push(Entry::Notice(format!("Asking the agent to fix it (round {}; esc stops)", round)));
-                let shown = format!("Fix the errors from `{}`", check.command);
+                let shown = match check.tests {
+                    true => format!("Fix the failing tests from `{}`", check.command),
+                    false => format!("Fix the errors from `{}`", check.command),
+                };
                 let what = match check.servers {
                     Some(_) => format!("The language server ({}) reports these errors in the files after your change", check.command),
+                    None if check.tests => format!("Your change builds, but I ran the tests with `{}` and they failed", check.command),
                     None => format!("I ran `{}` in the project after your change; it failed", check.command),
                 };
                 let message = format!(
@@ -2258,11 +2472,13 @@ impl App {
                 );
                 self.send_turn(shown, message, Vec::new(), true);
             }
-            AfterCheck::Stalled => {
-                self.last_failure = None;
+            outcome @ (AfterCheck::Stalled | AfterCheck::OutOfRounds) => {
+                self.failures.clear();
+                let how = if outcome == AfterCheck::Stalled { "fails with errors it gave before" } else { "still fails" };
                 self.entries.push(Entry::Warning(format!(
-                    "{} still fails the same way after {} fix(es); the errors are above",
+                    "{} {} after {} fix(es); the errors are above",
                     check.command,
+                    how,
                     self.fix_round
                 )));
                 // The tool calls among them are dropped with them: the
@@ -2321,9 +2537,10 @@ impl App {
         });
         failed.extend(elided.into_iter().map(|f| (f.path, files::ELIDED.to_string())));
         let written = self.reply_files(&root, found, whole);
+        let runs = !commands.is_empty();
         // The reply's commands run once its files are in and checked: a
         // fix round's reply has none of its own, so the first reply's wait.
-        if !commands.is_empty() {
+        if runs {
             self.commands = Some((root.clone(), commands));
         }
         if !failed.is_empty() {
@@ -2349,12 +2566,17 @@ impl App {
         }
         if !written.is_empty() {
             self.run_check(&root, &written);
-        } else if self.fix_round > 0 {
+            if self.check.is_none() {
+                self.checks_passed(&root);
+            }
+            return;
+        }
+        // A fix that's a command to run may yet change them: said only of
+        // one that's neither.
+        if self.fix_round > 0 && !runs {
             self.entries.push(Entry::Warning("The fix changed no file, so the errors stand; see them above".to_string()));
         }
-        if self.check.is_none() {
-            self.run_commands();
-        }
+        self.run_commands();
     }
 
     /// Ask the agent for the `manifest` the `lang` files it `wrote` need.
@@ -2684,6 +2906,9 @@ impl App {
     fn stop_turn(&mut self) {
         self.commands = None;
         self.tooling = None;
+        if self.pre_run.take().is_some() {
+            self.entries.push(Entry::Notice("Stopped reading the API; the prompt wasn't sent".to_string()));
+        }
         if let Some(turn) = self.turn.take() {
             turn.task.abort();
             if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
@@ -2782,7 +3007,15 @@ impl App {
                                         new: found.files.iter().find(|f| f.path == *path).map_or(String::new(), |f| f.content.clone()),
                                     })
                                     .collect();
+                                // The post-run skill: what the reply gave to
+                                // remember is kept for the next sessions.
+                                let remembered = files::remembered(&reply.text);
                                 self.start_searches();
+                                match files::remember(&root, &remembered) {
+                                    Ok(added) if added.is_empty() => {}
+                                    Ok(added) => self.entries.push(Entry::Notice(format!("Remembered: {}", added.join("; ")))),
+                                    Err(e) => self.entries.push(Entry::Error(format!("Couldn't save to {}: {}", files::MEMORY, e))),
+                                }
                                 self.reply_done(root, found, turn.whole, commands);
                                 self.tool_round_done();
                             } else if !turn.calls.is_empty()
@@ -2848,6 +3081,7 @@ impl App {
             AppEvent::Error(text) => self.entries.push(Entry::Error(text)),
             AppEvent::Check(id, output, code) => self.check_ended(id, output, code),
             AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
+            AppEvent::PreRun(done) => self.pre_run_done(*done),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
             AppEvent::Searched(id, result) => self.searched(id, result),
             AppEvent::Uploaded(ids) => {
@@ -3557,6 +3791,36 @@ impl App {
         });
     }
 
+    /// `/memory`: the notes kept in this folder; `/memory clear` forgets
+    /// them.
+    fn memory_command(&mut self, action: Option<&str>) {
+        let Some(root) = self.project.as_ref().and_then(|(p, _)| chat::making_dir(p)) else {
+            return self.entries.push(Entry::Error(
+                "Notes are kept in the project's folder; open docent there, or /sync this one".to_string(),
+            ));
+        };
+        let entry = match action {
+            None => match files::memory(&root) {
+                notes if notes.is_empty() => {
+                    Entry::Notice("Nothing remembered here yet; ask, as \"remember we use pnpm\"".to_string())
+                }
+                // A notice a line, as a notice's own lines run together.
+                notes => {
+                    self.entries.push(Entry::Notice(format!("Remembered in {}:", files::MEMORY)));
+                    let lines = notes.iter().map(|n| Entry::Notice(format!("  - {n}")));
+                    return self.entries.extend(lines);
+                }
+            },
+            Some("clear") => match std::fs::remove_file(root.join(files::MEMORY)) {
+                Ok(()) => Entry::Notice("Forgot everything remembered here".to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Entry::Notice("Nothing remembered here".to_string()),
+                Err(e) => Entry::Error(format!("Couldn't remove {}: {}", files::MEMORY, e)),
+            },
+            Some(other) => Entry::Error(format!("Unknown /memory {}; try /memory or /memory clear", other)),
+        };
+        self.entries.push(entry);
+    }
+
     fn open_status(&mut self) {
         self.overlay = Overlay::Status(None);
         self.spawn(|client, tx| {
@@ -3726,7 +3990,7 @@ impl App {
                 self.cursor = 0;
             }
             // Esc interrupts the reply: the next queued prompt goes at once.
-            KeyCode::Esc if self.turn.is_some() => self.stop_turn(),
+            KeyCode::Esc if self.turn.is_some() || self.pre_run.is_some() => self.stop_turn(),
             // Up on an empty prompt takes back the last queued one, to edit.
             KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
                 let last = self.queued.pop().expect("queued is not empty");
@@ -4023,6 +4287,7 @@ impl App {
             "/tasks" => self.open_jobs(),
             "/help" | "/?" => self.overlay = Overlay::Help,
             "/status" => self.open_status(),
+            "/memory" => self.memory_command(words.next()),
             "/usage" => self.open_usage(),
             "/upgrade" => {
                 crate::open_browser(crate::UPGRADE_URL);
@@ -4085,11 +4350,14 @@ impl App {
         }
         let making = self.making(&input);
         self.fix_round = 0;
+        self.test_round = 0;
         self.edit_round = 0;
         self.files_asked = false;
         self.manifest_asked = false;
         self.command_round = 0;
-        self.last_failure = None;
+        self.failures.clear();
+        self.look_up = true;
+        self.reference = None;
         self.send_turn(input, message, files, making);
     }
 
@@ -4110,6 +4378,7 @@ impl App {
     /// of its running (fix rounds start from those).
     fn idle(&self) -> bool {
         self.turn.is_none()
+            && self.pre_run.is_none()
             && self.ask.is_none()
             && self.commands.is_none()
             && self.check.is_none()
@@ -6443,7 +6712,7 @@ fn is_document(path: &std::path::Path) -> bool {
 
 /// The slash commands, for hints as they're typed.
 /// `/exit` and `/q` also quit, but aren't hinted.
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 13] = [
     ("/help", "shortcuts and commands"),
     ("/login", "sign in in the browser (--token to paste one)"),
     ("/logout", "log out"),
@@ -6451,6 +6720,7 @@ const COMMANDS: [(&str, &str); 12] = [
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
     ("/project", "switch, create, import and delete projects"),
     ("/status", "account, model, agent and versions"),
+    ("/memory", "what docent was asked to remember here; /memory clear forgets it"),
     ("/tasks", "the commands still running: pick one to see its output or stop it"),
     ("/usage", "credits used this month"),
     ("/upgrade", "Pro or Plus plan: more credits a month"),
@@ -6532,6 +6802,8 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/project <name>", "switch to a project by its name or ID"),
         ("/project new <name>", "create a project and switch to it"),
         ("/project import <zip>", "import an exported project"),
+        ("/memory", "what docent was asked to remember in this folder"),
+        ("/memory clear", "forget it all"),
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
@@ -6914,8 +7186,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_command_has_no_terminal_to_hang_on() {
-        // The shell leads a session of its own, which has no terminal.
-        let (output, ended) = run_command("[ \"$(ps -o sid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo own session", None, false, report());
+        // The shell leads a session of its own, which has no terminal. A
+        // session's leader leads its process group too, which `ps` tells on
+        // Linux and macOS alike; macOS's has no `sid`.
+        let (output, ended) = run_command("[ \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\" ] && echo own session", None, false, report());
         assert!(output.ends_with("own session"), "{}", output);
         assert_eq!(ended, Some(Ended::Exited(0)));
         let (output, _) = run_command("exec 3</dev/tty || echo no terminal", None, false, report());
@@ -7203,13 +7477,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_check_is_fixed_until_it_passes_or_a_round_changes_nothing() {
-        assert_eq!(after_check(Some(0), "", 0, None), AfterCheck::Passed);
-        assert_eq!(after_check(Some(0), "", 7, Some("err")), AfterCheck::Passed);
-        assert_eq!(after_check(Some(1), "err A", 0, None), AfterCheck::Fix(1));
-        assert_eq!(after_check(None, "err B", 1, Some("err A")), AfterCheck::Fix(2));
-        assert_eq!(after_check(Some(101), "err C", 9, Some("err B")), AfterCheck::Fix(10));
-        assert_eq!(after_check(Some(1), "err C", 10, Some("err C")), AfterCheck::Stalled);
+    fn a_failed_check_is_fixed_until_it_passes_repeats_itself_or_runs_out_of_rounds() {
+        let seen = |errors: &[&str]| errors.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        assert_eq!(after_check(Some(0), "", 0, &[]), AfterCheck::Passed);
+        assert_eq!(after_check(Some(0), "", 3, &seen(&["err"])), AfterCheck::Passed);
+        assert_eq!(after_check(Some(1), "err A", 0, &[]), AfterCheck::Fix(1));
+        assert_eq!(after_check(None, "err B", 1, &seen(&["err A"])), AfterCheck::Fix(2));
+        assert_eq!(after_check(Some(101), "err C", 2, &seen(&["err A", "err B"])), AfterCheck::Fix(3));
+        assert_eq!(after_check(Some(1), "err C", 3, &seen(&["err C"])), AfterCheck::Stalled);
+        // A fix that undoes the last one goes round in circles.
+        assert_eq!(after_check(Some(1), "err A", 2, &seen(&["err A", "err B"])), AfterCheck::Stalled);
+        assert_eq!(after_check(Some(1), "err F", FIX_ROUNDS, &seen(&["err E"])), AfterCheck::OutOfRounds);
         assert_eq!(head("abc", 5), "abc");
         assert_eq!(head("abcdef", 3), "abc\n(more output cut)");
     }
@@ -7473,6 +7751,10 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet"));
         let id = check.id;
         app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
+        // It builds: the tests, and then the question.
+        assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo test --quiet"));
+        let id = app.check.as_ref().expect("the tests run").id;
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
         assert!(matches!(app.entries.last(), Some(Entry::Ask(_, c)) if c == &["git commit -am \"main\""]));
         assert!(app.commands.is_none());
         key(&mut app, KeyCode::Tab);
@@ -7566,11 +7848,142 @@ mod tests {
         // A check that fails for good drops them, and says so.
         turn(&mut app, "`src/main.rs`\n```rust\nfn main() { 1 }\n```\n\n```sh\ngit push\n```\n");
         let id = app.check.as_ref().unwrap().id;
-        app.fix_round = 10;
-        app.last_failure = Some("err".into());
+        app.fix_round = 3;
+        app.failures = vec!["err".into()];
         app.apply(AppEvent::Check(id, "err".into(), Ended::Exited(1)));
         assert!(app.commands.is_none());
         assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w == "Not run, as the check failed: git push"), "{:?}", app.entries.len());
+    }
+
+    #[test]
+    fn a_reply_keeps_what_it_was_asked_to_remember() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let turn = |app: &mut App, text: &str| {
+            app.entries.push(Entry::Reply(Reply { text: text.into(), ..Default::default() }));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        };
+        turn(&mut app, "Noted.\n\n```remember\nUse pnpm, not npm\n```\n");
+        assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Remembered: Use pnpm, not npm")));
+        // Said again, it's kept once and not told again.
+        let told = app.entries.len();
+        turn(&mut app, "```remember\nuse pnpm, not npm\n```\n");
+        assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Remembered"))));
+        assert!(files::memory_note(dir.path()).contains("- Use pnpm, not npm"));
+    }
+
+    #[test]
+    fn the_api_the_pre_run_skill_found_goes_with_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let serde = prerun::Dep { name: "serde".into(), version: Some("1.0.219".into()) };
+        let sent = || Sent {
+            system: Some("system".into()),
+            cwd: Some(dir.path().to_path_buf()),
+            files_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let found = vec![prerun::Api { dep: serde.clone(), told: "derive(Serialize)".into(), fit: 0.0 }];
+        // A lookup since stopped is dropped, and its turn with it.
+        app.pre_run = Some(1);
+        app.stop_turn();
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n.starts_with("Stopped reading")));
+        let done = |id, found| PreRun {
+            id,
+            project: "p1".into(),
+            sent: sent(),
+            files: Vec::new(),
+            deps: vec![serde.clone()],
+            guessed: false,
+            found,
+            waited: true,
+        };
+        app.apply(AppEvent::PreRun(Box::new(done(1, found.clone()))));
+        assert!(app.turn.is_none() && app.reference.is_none());
+        // One waited on: what it found goes in the system message, and is
+        // kept for the prompt's fix rounds.
+        app.pre_run = Some(2);
+        assert!(!app.idle());
+        app.apply(AppEvent::PreRun(Box::new(done(2, found))));
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "Using the current API of serde 1.0.219")));
+        let system = app.tooling.as_ref().and_then(|t| t.sent.system.clone()).unwrap();
+        assert!(system.starts_with("system\n\n") && system.ends_with("## serde 1.0.219\n\nderive(Serialize)"));
+        assert_eq!(app.reference.as_deref(), system.strip_prefix("system\n\n"));
+        // Nothing found: said, and the turn goes without.
+        app.stop_turn();
+        app.pre_run = Some(3);
+        app.apply(AppEvent::PreRun(Box::new(done(3, Vec::new()))));
+        let not_installed = |e: &Entry| matches!(e, Entry::Notice(n) if n.starts_with("Found no installed API for serde 1.0.219"));
+        assert_eq!(app.entries.iter().filter(|e| not_installed(e)).count(), 1);
+        assert!(app.turn.is_some() && app.reference.is_none());
+        // Said once a session.
+        app.stop_turn();
+        app.pre_run = Some(4);
+        app.apply(AppEvent::PreRun(Box::new(done(4, Vec::new()))));
+        assert_eq!(app.entries.iter().filter(|e| not_installed(e)).count(), 1);
+        // One kept from an earlier turn goes straight away, not looked up.
+        app.stop_turn();
+        let api = dir.path().join(".docent/cache/api");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::write(api.join("serde@1.0.219.md"), "<!-- section: serde -->\nderive(Deserialize)\n").unwrap();
+        let told = app.entries.len();
+        let lookup = |deps, guessed, prompt: &str| Lookup { deps, guessed, prompt: prompt.into() };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![serde.clone()], false, "derive"), "Rust");
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Reading"))));
+        assert!(app.reference.as_deref().is_some_and(|r| r.ends_with("### serde\n\nderive(Deserialize)")));
+        // Guessed by part of their names, only the one that fits the
+        // prompt best is told.
+        app.stop_turn();
+        std::fs::write(api.join("serde_json@1.0.0.md"), "<!-- section: serde_json -->\nJSON.\n<!-- section: to_string -->\nSerialize it to a string.\n").unwrap();
+        let json = prerun::Dep { name: "serde_json".into(), version: Some("1.0.0".into()) };
+        let told = app.entries.len();
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![serde.clone(), json], true, "write it to a string"), "Rust");
+        assert!(app.reference.as_deref().is_some_and(|r| r.contains("to_string") && !r.contains("derive(Deserialize)")));
+        let using: Vec<&Entry> = app.entries[told..].iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("Using"))).collect();
+        assert!(matches!(using[..], [Entry::Notice(n)] if n == "Using the current API of serde_json 1.0.0"), "{:?}", using.len());
+        // One not locked yet is said not to be installed, by name alone.
+        app.stop_turn();
+        let regex = prerun::Dep { name: "regex".into(), version: None };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![regex], false, ""), "Rust");
+        assert!(app.turn.is_some() && app.pre_run.is_none());
+        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n.starts_with("Found no installed API for regex,")));
+        // One only a guess weighed isn't said.
+        app.stop_turn();
+        let told = app.entries.len();
+        let anyhow = prerun::Dep { name: "anyhow".into(), version: None };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![anyhow], true, "add a flag"), "Rust");
+        assert!(app.turn.is_some());
+        assert!(!app.entries[told..].iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("Found no"))));
+        // A package installed without types is said to ship none.
+        app.stop_turn();
+        let package = dir.path().join("node_modules/better-sqlite3");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), "{}").unwrap();
+        let sqlite = prerun::Dep { name: "better-sqlite3".into(), version: Some("12.11.1".into()) };
+        app.pre_run("p1".into(), sent(), Vec::new(), lookup(vec![sqlite], false, ""), "JavaScript/TypeScript");
+        assert!(matches!(app.entries.iter().rev().find(|e| matches!(e, Entry::Notice(_))), Some(Entry::Notice(n)) if n == "better-sqlite3 12.11.1 ships no types, so the agent goes without its API"));
     }
 
     #[test]
@@ -7586,11 +7999,43 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "cargo check --quiet" && s.ended.is_none()));
         let id = check.id;
         app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
-        assert!(app.check.is_none());
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "cargo check --quiet passed"), "{:?}", app.entries.len());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "cargo check --quiet passed")));
+        // It builds, so its tests run.
+        let tests = app.check.as_ref().expect("the tests run");
+        assert!(tests.tests && tests.command == "cargo test --quiet");
+        let tests = tests.id;
         // A stale result, from a check since replaced, is dropped.
         app.apply(AppEvent::Check(id, "late".into(), Ended::Exited(1)));
-        assert!(matches!(app.entries.last(), Some(Entry::Notice(_))));
+        assert!(app.check.is_some() && app.fix_round == 0);
+        app.apply(AppEvent::Check(tests, String::new(), Ended::Exited(0)));
+        assert!(app.check.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "cargo test --quiet passed"));
+    }
+
+    #[test]
+    fn failing_tests_are_fixed_for_a_few_rounds_then_left_to_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let tests_fail = |app: &mut App, output: &str| {
+            app.stop_turn();
+            app.checks_passed(dir.path());
+            let id = app.check.as_ref().expect("the tests run").id;
+            app.apply(AppEvent::Check(id, output.into(), Ended::Exited(101)));
+        };
+        tests_fail(&mut app, "test a ... FAILED");
+        assert_eq!((app.fix_round, app.test_round), (1, 1));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Fix the failing tests from `cargo test --quiet`")));
+        tests_fail(&mut app, "test b ... FAILED");
+        tests_fail(&mut app, "test c ... FAILED");
+        assert_eq!(app.test_round, TEST_ROUNDS);
+        tests_fail(&mut app, "test d ... FAILED");
+        assert_eq!(app.fix_round, TEST_ROUNDS, "no fourth round");
+        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("cargo test --quiet still fails after 3 fix(es)")));
     }
 
     #[test]
@@ -7854,7 +8299,8 @@ mod tests {
         app.project = Some(("p1".into(), "app".into()));
         let asked = |app: &mut App, id: usize| {
             let servers = Some((dir.path().to_path_buf(), vec!["main.c".to_string()]));
-            app.check = Some(Check { id, project: "p1".into(), command: "the language server".into(), servers });
+            let root = dir.path().to_path_buf();
+            app.check = Some(Check { id, project: "p1".into(), command: "the language server".into(), servers, root, tests: false });
         };
         // Errors: shown, and sent to be fixed.
         asked(&mut app, 1);
@@ -7999,6 +8445,23 @@ mod tests {
     }
 
     #[test]
+    fn a_fix_that_changes_no_file_is_said_so_unless_it_runs_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.fix_round = 1;
+        let said = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Warning(w) if w.starts_with("The fix changed no file"))).count();
+        // Its command, `git checkout` say, may yet change them.
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["git checkout -- notes.md".into()]);
+        assert_eq!(said(&app), 0);
+        assert!(app.ask.is_some());
+        app.ask = None;
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
+        assert_eq!(said(&app), 1);
+    }
+
+    #[test]
     fn a_replys_files_are_written_without_asking_and_only_its_commands_are_asked() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "old\n").unwrap();
@@ -8015,8 +8478,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
         assert!(app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n == "  updated main.rs (+1 −1)")));
-        // Checked first in a code folder, then the commands are asked about.
-        if let Some(check) = app.check.as_ref().map(|c| c.id) {
+        // Checked first in a code folder, and tested, then the commands are
+        // asked about.
+        while let Some(check) = app.check.as_ref().map(|c| c.id) {
             app.apply(AppEvent::Check(check, String::new(), Ended::Exited(0)));
         }
         assert!(app.ask.is_some());
@@ -9150,7 +9614,7 @@ mod tests {
 
         app.input = "/m".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
-        assert_eq!(names, ["/mcp", "/Meeting_Notes", "/models", "/morning"]);
+        assert_eq!(names, ["/mcp", "/Meeting_Notes", "/memory", "/models", "/morning"]);
         app.input = "/".into();
         let names: Vec<String> = app.command_hints().into_iter().map(|(name, _)| name).collect();
         assert_eq!(names.last().map(String::as_str), Some("/usage"));

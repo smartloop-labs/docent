@@ -8,6 +8,7 @@ use reqwest::blocking::{Client, Response, multipart};
 use progress::Steps;
 
 mod agent;
+mod apidocs;
 mod askpass;
 mod chat;
 mod docent;
@@ -16,7 +17,9 @@ mod framework;
 mod links;
 mod lsp;
 mod mcp;
+mod prerun;
 mod progress;
+mod skills;
 mod tui;
 mod update;
 mod usage;

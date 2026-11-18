@@ -2,7 +2,7 @@
 
 The private coding agent for your terminal. Frontier quality, local first.
 
-Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd) and your build, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent.
+Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. Before it writes, it reads the current API of the libraries the change uses from their installed packages. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd), your build and your tests, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent. What you ask it to remember, it keeps for the project.
 
 It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
@@ -218,6 +218,7 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | `/usage` | credits used this month (cloud models and web search) |
 | `/upgrade` | Pro or Plus plan: more credits a month |
 | `/clear` | clear the chat and start a new session |
+| `/memory` | what docent was asked to remember in this folder; `/memory clear` forgets it |
 | `/<skill> [prompt]` | run one of the project's skills; `/` lists them with the commands |
 | `!<command>` | run a shell command in the working directory, its output shown as it comes, each command of a script on a `$` line over what it printed; the output goes to the agent with your next prompt, so it stays in the session. The prompt turns pink with `!` ahead as it's typed, and the footer says shell mode, as in Claude Code |
 | `!<command> &` | run it in the background, as a dev server: nothing waits for it, and it's listed under the prompt, out of the chat, until it ends |
@@ -283,6 +284,9 @@ touches anything outside your files:
 ! cargo check --quiet
   ✓ done
 
+! cargo test --quiet
+  ✓ done
+
 ? Run these in the folder?
   $ git commit -am "greet takes a name"
   [enter] run   [tab] always this session   [esc] skip
@@ -304,18 +308,42 @@ What happens on each prompt:
    the code can't tell it, like a library's current API. It's also told about
    the machine (OS and version, shell, the package managers and toolchains on
    `PATH`, active virtualenvs), so commands use `apt-get` on Ubuntu and `brew`
-   on a Mac.
-2. **You see diffs as they stream in.** Each file shows as numbered hunks,
+   on a Mac. It's also told what you asked it to remember here (see below).
+2. **It reads the current API.** The libraries the prompt names (three at
+   most), or if it names none, the one whose package name has a word of the
+   prompt in it that best fits what it asks ("yaml" for `js-yaml`, "MUI"
+   for `@mui/material`), at the versions your lockfile pins, have their
+   API read from the packages
+   installed for the project: a crate's source in cargo's registry,
+   `node_modules`' type declarations, the project's virtualenv, Go's module
+   cache, or a Maven or Gradle jar. The parts the prompt uses
+   go to the agent with it, so it doesn't write against an API it remembers
+   from an older version. It's offline and costs nothing; a library that
+   isn't installed yet goes without (building the project installs it), and
+   with web search on (`Ctrl+S`) the agent can look it up itself. Each is
+   kept in `.docent/cache/api/` as markdown you can read, which has a
+   `.gitignore` of its own, so it's read once a version. `Esc` stops it.
+3. **You see diffs as they stream in.** Each file shows as numbered hunks,
    additions in green and removals in red. Then it's written into the folder.
-3. **It checks the build and fixes it.** It runs a fast check for the kind of
+4. **It checks the build and fixes it.** It runs a fast check for the kind of
    project: `cargo check`, `go build`, `tsc --noEmit`, or `bash -n` and
    `py_compile` for loose scripts. Errors go back to the agent, round after
-   round, until the check passes or a round changes nothing. `Esc` stops it.
-4. **Commands wait for your OK.** Commits, installs and test runs come back
+   round, until the check passes. It stops after five rounds, or sooner when
+   a round brings back errors it had already given. `Esc` stops it.
+5. **It runs the tests.** Once the change builds, the project's tests run:
+   its end-to-end tests when it has them (an npm `test:e2e` or `e2e` script,
+   a `make e2e` or `test-e2e` target), else `cargo test`, `go test`,
+   `npm test`, `pytest`, `mix test`, `swift test`, `mvn test` or
+   `./gradlew test`. Failures go back to the agent, three rounds at most.
+6. **It remembers what you ask.** Say "remember we use pnpm" or "from now on,
+   tabs" and it's kept in `.docent/memory.md`, one line each, and told to the
+   agent in every later session in the folder. `/memory` lists it, and
+   `/memory clear` forgets it; the file is yours to edit or commit.
+7. **Commands wait for your OK.** Commits, installs and test runs come back
    as shell commands. `Enter` runs them, `Tab` runs them and approves every
    later one too, and `Esc` skips them. Their output streams into the chat and
    goes back to the agent, so a failing test gets fixed next.
-5. **Long runs go to the background.** Dev servers and watchers (`npm run dev
+8. **Long runs go to the background.** Dev servers and watchers (`npm run dev
    &`) keep running under the prompt while you go on chatting.
 
 | Command | Does |

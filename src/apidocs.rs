@@ -1,0 +1,1138 @@
+//! The API of a project's libraries, read from the packages installed for
+//! it: their doc comments and the signatures they document, at the exact
+//! versions the project builds with, and offline. The pre-run skill keeps
+//! them in the project's cache and tells the agent the parts a prompt uses.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::prerun::{Dep, locked};
+
+/// One part of a library's API: a module's docs, or a documented item's
+/// signature and docs, under its name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Section {
+    pub title: String,
+    pub text: String,
+}
+
+/// Source files read for one library, at most.
+const FILES: usize = 500;
+/// A source file bigger than this isn't read.
+const FILE_BYTES: u64 = 512 * 1024;
+/// A signature runs on this many lines at most.
+const SIGNATURE_LINES: usize = 8;
+
+/// `dep`'s API, from the package installed for `root`, a project of
+/// `kind`; `None` when it isn't installed, or documents nothing.
+pub fn collect(root: &Path, kind: &str, dep: &Dep) -> Option<Vec<Section>> {
+    match kind {
+        "Rust" => {
+            let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
+            rust(&cargo_registry()?, &lock, dep)
+        }
+        "JavaScript/TypeScript" => npm(&root.join("node_modules"), &dep.name),
+        "Python" => python(&site_packages(root)?, &dep.name),
+        "Go" => go(&go_modules()?, &dep.name, dep.version.as_deref()?),
+        "Java" | "Java/Kotlin" | "Kotlin" => {
+            let (group, artifact) = dep.name.split_once(':')?;
+            java(&java_jar(&home()?, group, artifact, dep.version.as_deref()?)?, artifact)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `dep`, of a project of `kind`, can be read at all: a crate, a
+/// Go module or a jar is installed by the version it's locked at, so one
+/// with none isn't, while a package in the project's own `node_modules` or
+/// virtualenv is whatever version that holds.
+pub fn readable(kind: &str, dep: &Dep) -> bool {
+    dep.version.is_some() || !matches!(kind, "Rust" | "Go" | "Java" | "Java/Kotlin" | "Kotlin")
+}
+
+/// Whether `dep` is an npm package installed for `root` without types to
+/// read its API from, of its own or from `@types`: told by their manifests
+/// alone, so it's never read for nothing.
+pub fn untyped(root: &Path, dep: &Dep) -> bool {
+    let node_modules = root.join("node_modules");
+    let typed = format!("@types/{}", dep.name.trim_start_matches('@').replace('/', "__"));
+    node_modules.join(&dep.name).join("package.json").is_file()
+        && [dep.name.as_str(), typed.as_str()].iter().all(|name| types_entry(&node_modules.join(name)).is_none())
+}
+
+/// The user's home folder.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+/// Where cargo unpacks the crates it downloads, a folder per registry.
+fn cargo_registry() -> Option<PathBuf> {
+    let cargo = match std::env::var_os("CARGO_HOME") {
+        Some(cargo) => PathBuf::from(cargo),
+        None => home()?.join(".cargo"),
+    };
+    Some(cargo.join("registry").join("src"))
+}
+
+/// A crate's API from its source under `registry`, with that of the
+/// crates its root re-exports, as clap does clap_builder's, at the
+/// versions `lock` pins.
+fn rust(registry: &Path, lock: &str, dep: &Dep) -> Option<Vec<Section>> {
+    let dir = crate_dir(registry, &dep.name, dep.version.as_deref()?)?;
+    let mut sections = crate_api(&dir, &dep.name);
+    let lib = fs::read_to_string(dir.join("src").join("lib.rs")).unwrap_or_default();
+    // Not the crate itself, as anyhow's `pub use anyhow as format_err`.
+    let own = dep.name.replace('-', "_");
+    for name in reexported(&lib).into_iter().filter(|name| *name != own) {
+        // Named in code as `clap_builder`, maybe published as `clap-builder`.
+        let published = [name.clone(), name.replace('_', "-")].into_iter().find_map(|n| Some((locked(lock, &n)?, n)));
+        if let Some((version, published)) = published
+            && let Some(dir) = crate_dir(registry, &published, &version)
+        {
+            sections.extend(crate_api(&dir, &name));
+        }
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The folder `name` `version` is unpacked in, under one of `registry`'s.
+fn crate_dir(registry: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    fs::read_dir(registry)
+        .ok()?
+        .flatten()
+        .map(|index| index.path().join(format!("{name}-{version}")))
+        .find(|dir| dir.join("src").is_dir())
+}
+
+/// The crates a crate root's `pub use` lines re-export from.
+fn reexported(lib: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in lib.lines().map(str::trim) {
+        let Some(path) = line.strip_prefix("pub use ") else { continue };
+        let name: String = path.trim_start_matches("::").chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let local = ["crate", "self", "super", "std", "core", "alloc"].contains(&name.as_str());
+        if !name.is_empty() && !local && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The API a crate unpacked in `dir` documents, its root first.
+fn crate_api(dir: &Path, name: &str) -> Vec<Section> {
+    let src = dir.join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    // The root first: its docs say what the crate is.
+    files.sort_by_key(|f| (f.file_name().is_none_or(|n| n != "lib.rs") || f.parent() != Some(src.as_path()), f.clone()));
+    let mut sections = Vec::new();
+    for file in files.into_iter().take(FILES) {
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let module = module_path(&src, &file, &name.replace('-', "_"));
+        sections.extend(rust_sections(&text, &module, file.parent().unwrap_or(&src)));
+    }
+    sections
+}
+
+/// The `.rs` files under `dir`, at any depth.
+fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.is_dir() {
+            rust_files(&path, files);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+/// The module `file` under `src` is, as `clap::_derive`.
+fn module_path(src: &Path, file: &Path, name: &str) -> String {
+    let rel = file.strip_prefix(src).unwrap_or(file).with_extension("");
+    let mut parts = vec![name.to_string()];
+    parts.extend(rel.iter().map(|p| p.to_string_lossy().into_owned()).filter(|p| !matches!(p.as_str(), "lib" | "main" | "mod")));
+    parts.join("::")
+}
+
+/// What a Rust source file documents: the `module`'s own docs, and each
+/// public item with a doc comment, its signature and docs. Hidden items
+/// aren't the API; `dir` is the file's folder, its `include_str!`s from.
+fn rust_sections(text: &str, module: &str, dir: &Path) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let mut module_doc = Vec::new();
+    // In a `/*! … */` block, as regex writes its crate's docs.
+    let mut block = false;
+    for line in lines.iter().map(|l| l.trim_start()) {
+        if block || line.starts_with("/*!") {
+            let text = line.strip_prefix("/*!").unwrap_or(line);
+            block = !text.contains("*/");
+            let text = text.split("*/").next().unwrap_or_default();
+            if !(text.trim().is_empty() && module_doc.is_empty()) {
+                module_doc.push(text.to_string());
+            }
+        } else if let Some(doc) = line.strip_prefix("//!") {
+            module_doc.push(doc.strip_prefix(' ').unwrap_or(doc).to_string());
+        } else if let Some(file) = line.strip_prefix("#![doc = include_str!(\"").and_then(|l| l.split_once('"')).map(|(f, _)| f) {
+            module_doc.extend(fs::read_to_string(dir.join(file)).unwrap_or_default().lines().map(str::to_string));
+        }
+    }
+    if let Some(doc) = clean(&module_doc) {
+        sections.push(Section { title: module.to_string(), text: doc });
+    }
+    // The type an `impl` or trait block is for, its methods named after it,
+    // and how far the block is indented: one in a `mod` block is too.
+    let mut owner: Option<(String, bool, usize)> = None;
+    let mut doc: Vec<String> = Vec::new();
+    let mut hidden = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim_start();
+        if let Some(text) = item.strip_prefix("///").filter(|_| !item.starts_with("////")) {
+            doc.push(text.strip_prefix(' ').unwrap_or(text).to_string());
+            continue;
+        }
+        if item.starts_with("#[") {
+            hidden |= item.contains("doc(hidden)");
+            continue;
+        }
+        let indent = line.len() - item.len();
+        if owner.as_ref().is_some_and(|(_, _, at)| indent <= *at && item.starts_with('}')) {
+            owner = None;
+        }
+        // Not one inside another's block, nor one closed on its own line.
+        if owner.as_ref().is_none_or(|(_, _, at)| indent <= *at) && !item.trim_end().ends_with('}') {
+            if let Some(name) = impl_type(item) {
+                owner = Some((name, false, indent));
+            } else if let Some(name) = item.strip_prefix("pub trait ").map(ident) {
+                owner = Some((name, true, indent));
+            }
+        }
+        let in_trait = owner.as_ref().is_some_and(|(_, t, _)| *t);
+        if let (Some(name), Some(docs)) = (item_name(item, in_trait), clean(&doc))
+            && !hidden
+        {
+            let method = item.contains("fn ") && owner.as_ref().is_some_and(|(_, _, at)| indent > *at);
+            let title = match &owner {
+                Some((owner, _, _)) if method => format!("{owner}::{name}"),
+                _ => name,
+            };
+            sections.push(Section { title, text: format!("`{}`\n\n{docs}", signature(&lines[i..])) });
+        }
+        doc.clear();
+        hidden = false;
+    }
+    sections
+}
+
+/// The type an `impl` line is for: `Command` of `impl Command {`, or of
+/// `impl<T> Display for Command<T>`.
+fn impl_type(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("impl")?;
+    let rest = match rest.strip_prefix('<') {
+        Some(generics) => {
+            let mut depth = 1;
+            let end = generics.char_indices().find(|(_, c)| {
+                depth += match c {
+                    '<' => 1,
+                    '>' => -1,
+                    _ => 0,
+                };
+                depth == 0
+            })?;
+            &generics[end.0 + 1..]
+        }
+        None if rest.starts_with(' ') => rest,
+        None => return None,
+    };
+    let ty = rest.split_once(" for ").map_or(rest, |(_, ty)| ty).trim();
+    let name = ident(ty.rsplit("::").next().unwrap_or(ty));
+    (!name.is_empty()).then_some(name)
+}
+
+/// The name a public item line declares, as `arg` of `pub fn arg(`: any
+/// in a trait, whose items are all public, and `arg!` of a macro.
+fn item_name(line: &str, in_trait: bool) -> Option<String> {
+    if let Some(name) = line.strip_prefix("macro_rules! ") {
+        return Some(format!("{}!", ident(name)));
+    }
+    let mut rest = match line.strip_prefix("pub ") {
+        Some(rest) => rest,
+        None if in_trait => line,
+        None => return None,
+    };
+    // `const fn`, but not a `const` item.
+    while let Some(after) = ["async ", "unsafe ", "extern \"C\" "]
+        .iter()
+        .find_map(|q| rest.strip_prefix(q))
+        .or_else(|| rest.strip_prefix("const ").filter(|r| r.starts_with("fn ") || r.starts_with("unsafe ")))
+    {
+        rest = after;
+    }
+    let (keyword, name) = rest.split_once(' ')?;
+    let kinds = ["fn", "struct", "enum", "trait", "type", "const", "static", "union"];
+    let name = ident(name);
+    (kinds.contains(&keyword) && !name.is_empty()).then_some(name)
+}
+
+/// The identifier `text` starts with.
+fn ident(text: &str) -> String {
+    text.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+}
+
+/// An item's signature from its first `lines`: up to its body, on one line.
+fn signature(lines: &[&str]) -> String {
+    let mut words = Vec::new();
+    for line in lines.iter().take(SIGNATURE_LINES) {
+        let line = line.trim();
+        if let Some((head, _)) = line.split_once('{') {
+            words.push(head.trim());
+            break;
+        }
+        words.push(line.trim_end_matches(';'));
+        if line.ends_with(';') {
+            break;
+        }
+    }
+    words.iter().filter(|w| !w.is_empty()).copied().collect::<Vec<_>>().join(" ").replace("( ", "(").replace(" )", ")")
+}
+
+/// Doc comment `lines` as text: with the lines a doctest hides out of its
+/// examples, and no blank lines at its ends; `None` when there's nothing.
+fn clean(lines: &[String]) -> Option<String> {
+    let mut fenced = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if fenced && (line.trim() == "#" || line.trim_start().starts_with("# ")) {
+            continue;
+        }
+        kept.push(line);
+    }
+    let text = kept.join("\n").trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// A package's API from its type declarations under `node_modules`, or
+/// those `@types` has for it: its README, then each declaration file its
+/// types entry exports from, the exported declarations and the documented
+/// members of its classes and interfaces.
+fn npm(node_modules: &Path, name: &str) -> Option<Vec<Section>> {
+    // `@types/scope__name` for `@scope/name`.
+    let typed = format!("@types/{}", name.trim_start_matches('@').replace('/', "__"));
+    let (dir, entry) = [name, typed.as_str()].iter().find_map(|name| {
+        let dir = node_modules.join(name);
+        Some((dir.clone(), types_entry(&dir)?))
+    })?;
+    let mut sections = Vec::new();
+    if let Some(readme) = ["README.md", "readme.md", "Readme.md"].iter().find_map(|f| fs::read_to_string(dir.join(f)).ok()) {
+        sections.extend(clean(&readme.lines().map(str::to_string).collect::<Vec<_>>()).map(|text| Section { title: name.to_string(), text }));
+    }
+    // Each file the entry exports from, each once.
+    let mut files = vec![entry];
+    let mut at = 0;
+    while at < files.len() && at < FILES {
+        let file = files[at].clone();
+        at += 1;
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let folder = file.parent().unwrap_or(&dir).to_path_buf();
+        for from in text.lines().filter_map(exported_from) {
+            if let Some(next) = declaration_file(&folder.join(from))
+                && !files.contains(&next)
+            {
+                files.push(next);
+            }
+        }
+        sections.extend(ts_sections(&text));
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The declaration file a package in `dir` gives its types in.
+fn types_entry(dir: &Path) -> Option<PathBuf> {
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join("package.json")).ok()?).ok()?;
+    let exported = &manifest["exports"]["."];
+    let declared = [&manifest["types"], &manifest["typings"], &exported["types"], &exported["import"]["types"], &exported["require"]["types"]]
+        .into_iter()
+        .find_map(|v| v.as_str());
+    declared.and_then(|path| declaration_file(&dir.join(path))).or_else(|| declaration_file(&dir.join("index")))
+}
+
+/// The declaration file a module `path` names: as it is, or with its
+/// `.js` as `.d.ts`, or its folder's `index.d.ts`.
+fn declaration_file(path: &Path) -> Option<PathBuf> {
+    let text = path.to_string_lossy();
+    let stem = text.trim_end_matches(".js").trim_end_matches(".mjs").trim_end_matches(".cjs");
+    let stem = [".d.ts", ".d.mts", ".d.cts"].iter().find_map(|d| stem.strip_suffix(d)).unwrap_or(stem);
+    [format!("{stem}.d.ts"), format!("{stem}.d.mts"), format!("{stem}.d.cts"), format!("{stem}/index.d.ts")]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// The module an `export … from './x'` line exports from, when it's one
+/// of the package's own.
+fn exported_from(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if !line.starts_with("export ") {
+        return None;
+    }
+    let from = line.rsplit_once(" from ")?.1.trim().trim_end_matches(';');
+    let from = from.trim_matches(|c| c == '"' || c == '\'');
+    from.starts_with('.').then_some(from)
+}
+
+/// What a declaration file declares: each declaration at its top or in a
+/// namespace, with its JSDoc when it has one, and each documented member
+/// of its classes and interfaces, named after them.
+fn ts_sections(text: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    // The blocks a line is in: each one's depth, and the class or
+    // interface name when its members are what's declared there.
+    let mut blocks: Vec<(usize, Option<String>)> = Vec::new();
+    let mut depth = 0;
+    let mut doc: Vec<String> = Vec::new();
+    let mut in_doc = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if in_doc || item.starts_with("/**") {
+            in_doc = !item.ends_with("*/");
+            let text = item.trim_start_matches("/**").trim_end_matches("*/").trim();
+            let text = text.strip_prefix('*').map_or(text, |t| t.strip_prefix(' ').unwrap_or(t));
+            if !text.starts_with('@') || ["@example", "@param", "@returns"].iter().any(|t| text.starts_with(t)) {
+                doc.push(text.to_string());
+            }
+            continue;
+        }
+        if item.is_empty() || item.starts_with("//") {
+            continue;
+        }
+        let owner = blocks.last().and_then(|(_, owner)| owner.clone());
+        let docs = clean(&doc);
+        doc.clear();
+        let opens = item.matches('{').count();
+        let closes = item.matches('}').count();
+        let declared = if owner.is_none() { ts_declared(item) } else { None };
+        if let Some(name) = &declared {
+            let text = signature(&lines[i..]);
+            sections.push(Section { title: name.clone(), text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+        } else if let (Some(owner), Some(name), Some(docs)) = (&owner, ts_member(item), docs) {
+            let title = format!("{owner}.{name}");
+            sections.push(Section { title, text: format!("`{}`\n\n{docs}", signature(&lines[i..])) });
+        }
+        if opens > closes {
+            let members = match declared {
+                Some(name) => [" class ", " interface "].iter().any(|k| format!(" {item}").contains(k)).then_some(name),
+                None => owner,
+            };
+            blocks.push((depth, members));
+        }
+        depth = (depth + opens).saturating_sub(closes);
+        blocks.retain(|(at, _)| *at < depth);
+    }
+    sections
+}
+
+/// The name a declaration line declares, as `parse` of `export declare
+/// function parse(`, or of `function parse(` in a namespace.
+fn ts_declared(line: &str) -> Option<String> {
+    let mut rest = line;
+    for word in ["export ", "declare ", "default ", "abstract ", "async "] {
+        rest = rest.strip_prefix(word).unwrap_or(rest);
+    }
+    let (keyword, name) = rest.split_once(' ')?;
+    let kinds = ["function", "class", "interface", "type", "const", "let", "var", "enum", "namespace", "module"];
+    let name: String = name.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    (kinds.contains(&keyword) && !name.is_empty()).then_some(name)
+}
+
+/// The name a class or interface member line declares, as `parse` of
+/// `parse(data: unknown): T;` or `static create(`.
+fn ts_member(line: &str) -> Option<String> {
+    let mut rest = line;
+    for word in ["public ", "static ", "readonly ", "abstract ", "get ", "set ", "async "] {
+        rest = rest.strip_prefix(word).unwrap_or(rest);
+    }
+    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+    let after = rest[name.len()..].trim_start_matches('?');
+    (!name.is_empty() && (after.starts_with('(') || after.starts_with(':') || after.starts_with('<'))).then_some(name)
+}
+
+/// Where the project's virtualenv installs packages: the active one's, or
+/// one in `root`'s `.venv` or `venv`.
+fn site_packages(root: &Path) -> Option<PathBuf> {
+    let active = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from);
+    let venvs = active.into_iter().chain([root.join(".venv"), root.join("venv")]);
+    venvs.filter(|v| v.is_dir()).find_map(|venv| {
+        // `lib/python3.12/site-packages`, or `Lib/site-packages` on Windows.
+        let windows = venv.join("Lib").join("site-packages");
+        let lib = fs::read_dir(venv.join("lib")).ok().into_iter().flatten().flatten().map(|e| e.path().join("site-packages"));
+        lib.chain([windows]).find(|site| site.is_dir())
+    })
+}
+
+/// A distribution's API from its installed modules in `site`: each
+/// module's docstring, its public functions and classes, and the
+/// documented methods of those classes.
+fn python(site: &Path, name: &str) -> Option<Vec<Section>> {
+    let mut files = Vec::new();
+    for module in import_names(site, name) {
+        let package = site.join(&module);
+        if package.is_dir() {
+            python_files(&package, &mut files);
+        } else if let Some(file) = ["pyi", "py"].iter().map(|e| site.join(format!("{module}.{e}"))).find(|f| f.is_file()) {
+            files.push(file);
+        }
+    }
+    let mut sections = Vec::new();
+    for file in files.into_iter().take(FILES) {
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let rel = file.strip_prefix(site).unwrap_or(&file).with_extension("");
+        let parts: Vec<String> = rel.iter().map(|p| p.to_string_lossy().into_owned()).filter(|p| p != "__init__").collect();
+        sections.extend(python_sections(&text, &parts.join(".")));
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The modules distribution `name` installs in `site`: as its
+/// `top_level.txt` says, else its name as a module's.
+fn import_names(site: &Path, name: &str) -> Vec<String> {
+    let normal = |n: &str| n.to_lowercase().replace(['-', '.'], "_");
+    let info = fs::read_dir(site).ok().into_iter().flatten().flatten().map(|e| e.path()).find(|p| {
+        let file = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        file.strip_suffix(".dist-info").and_then(|f| f.rsplit_once('-')).is_some_and(|(dist, _)| normal(dist) == normal(name))
+    });
+    let listed: Vec<String> = info
+        .and_then(|info| fs::read_to_string(info.join("top_level.txt")).ok())
+        .map(|top| top.lines().map(str::trim).filter(|m| !m.is_empty() && !m.starts_with('_')).map(str::to_string).collect())
+        .unwrap_or_default();
+    if listed.is_empty() { vec![normal(name)] } else { listed }
+}
+
+/// A package's public module files under `dir`, at any depth: a stub in
+/// place of its source when it has one, and no test modules, nor private
+/// ones its `__init__` doesn't import from, as httpx's does `._client`.
+fn python_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let init = ["__init__.pyi", "__init__.py"].iter().find_map(|f| fs::read_to_string(dir.join(f)).ok()).unwrap_or_default();
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = name.split('.').next().unwrap_or_default();
+        let imported = init.contains(&format!("from .{stem} import")) || init.contains(&format!("from .{stem}."));
+        let private = name.starts_with('_') && !name.starts_with("__init__") && !imported;
+        if private || name == "tests" || name == "test" {
+            continue;
+        }
+        if path.is_dir() {
+            python_files(&path, files);
+        } else if path.extension().is_some_and(|e| e == "pyi")
+            || path.extension().is_some_and(|e| e == "py") && !path.with_extension("pyi").is_file()
+        {
+            files.push(path);
+        }
+    }
+}
+
+/// What a Python `module` file documents: its docstring, its public
+/// functions and classes with their docstrings, and the documented
+/// methods of its classes, named after them.
+fn python_sections(text: &str, module: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let first = lines.iter().position(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
+    if let Some(doc) = first.and_then(|at| docstring(&lines[at..])) {
+        sections.push(Section { title: module.to_string(), text: doc });
+    }
+    let mut class: Option<String> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim_start();
+        let top = item.len() == line.len();
+        if top && !item.is_empty() && !item.starts_with('#') && !item.starts_with('@') {
+            class = None;
+        }
+        let Some(name) = py_defined(item) else { continue };
+        if name.starts_with('_') && name != "__init__" {
+            continue;
+        }
+        // Its body's first line, past a signature over several lines.
+        let end = (i..lines.len().min(i + SIGNATURE_LINES)).find(|j| lines[*j].trim_end().ends_with(':')).unwrap_or(i);
+        let signature = lines[i..=end].iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ").trim_end_matches(':').to_string();
+        let doc = docstring(&lines[end + 1..]);
+        let indent = line.len() - item.len();
+        match (&class, indent) {
+            (_, 0) => {
+                if item.starts_with("class ") {
+                    class = Some(name.clone());
+                }
+                let text = doc.map_or(format!("`{signature}`"), |d| format!("`{signature}`\n\n{d}"));
+                sections.push(Section { title: name, text });
+            }
+            (Some(class), 1..=4) if doc.is_some() => {
+                sections.push(Section { title: format!("{class}.{name}"), text: format!("`{signature}`\n\n{}", doc.unwrap_or_default()) });
+            }
+            _ => {}
+        }
+    }
+    sections
+}
+
+/// The name a `def` or `class` line defines.
+fn py_defined(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("async ").unwrap_or(line);
+    let rest = rest.strip_prefix("def ").or_else(|| rest.strip_prefix("class "))?;
+    let name = ident(rest);
+    (!name.is_empty()).then_some(name)
+}
+
+/// The docstring `lines` start with, past blank lines, unindented.
+fn docstring(lines: &[&str]) -> Option<String> {
+    let at = lines.iter().position(|l| !l.trim().is_empty())?;
+    let first = lines[at].trim();
+    let first = first.trim_start_matches(['r', 'u', 'R', 'U']);
+    let quote = ["\"\"\"", "'''"].into_iter().find(|q| first.starts_with(q))?;
+    let rest = &first[3..];
+    if let Some((doc, _)) = rest.split_once(quote) {
+        return clean(&[doc.to_string()]);
+    }
+    let mut doc = vec![rest.to_string()];
+    for line in &lines[at + 1..] {
+        if let Some((last, _)) = line.split_once(quote) {
+            doc.push(last.to_string());
+            break;
+        }
+        doc.push(line.to_string());
+    }
+    // Indented as the code is: as much as its least indented line.
+    let indent = doc[1..].iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let doc: Vec<String> = doc.iter().enumerate().map(|(i, l)| if i == 0 { l.clone() } else { l.get(indent..).unwrap_or("").to_string() }).collect();
+    clean(&doc)
+}
+
+/// Where Go keeps the modules it downloads.
+fn go_modules() -> Option<PathBuf> {
+    if let Some(cache) = std::env::var_os("GOMODCACHE").filter(|c| !c.is_empty()) {
+        return Some(PathBuf::from(cache));
+    }
+    let gopath = match std::env::var_os("GOPATH").filter(|p| !p.is_empty()) {
+        Some(paths) => std::env::split_paths(&paths).next()?,
+        None => home()?.join("go"),
+    };
+    Some(gopath.join("pkg").join("mod"))
+}
+
+/// A Go module's API from its source in the module cache `modules`: each
+/// package's doc comment, and its exported declarations with theirs.
+fn go(modules: &Path, module: &str, version: &str) -> Option<Vec<Section>> {
+    // The cache spells a capital as `!` and the letter in lower case.
+    let escaped: String = module.chars().flat_map(|c| if c.is_uppercase() { vec!['!', c.to_ascii_lowercase()] } else { vec![c] }).collect();
+    let dir = modules.join(format!("{escaped}@{version}"));
+    let mut files = Vec::new();
+    go_files(&dir, &mut files);
+    // The module's root package first: its docs say what it is.
+    files.sort_by_key(|f| (f.parent() != Some(dir.as_path()), f.clone()));
+    let mut sections = Vec::new();
+    for file in files.into_iter().take(FILES) {
+        if fs::metadata(&file).is_ok_and(|m| m.len() > FILE_BYTES) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let rel = file.parent().and_then(|p| p.strip_prefix(&dir).ok()).map(|p| p.to_string_lossy().replace('\\', "/"));
+        let package = match rel.as_deref() {
+            Some("") | None => module.to_string(),
+            Some(rel) => format!("{module}/{rel}"),
+        };
+        sections.extend(go_sections(&text, &package));
+    }
+    // Its doc comment first, in whichever file it is.
+    if let Some(at) = sections.iter().position(|s| s.title == module) {
+        let doc = sections.remove(at);
+        sections.insert(0, doc);
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// The `.go` files of the packages under `dir` others can import: no
+/// tests, nor `internal`, `testdata` or `vendor` ones.
+fn go_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for path in entries.flatten().map(|e| e.path()) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.starts_with(['.', '_']) || ["internal", "testdata", "vendor"].contains(&name.as_str()) {
+            continue;
+        }
+        if path.is_dir() {
+            go_files(&path, files);
+        } else if name.ends_with(".go") && !name.ends_with("_test.go") {
+            files.push(path);
+        }
+    }
+}
+
+/// What a Go file of `package` declares: the package's doc comment, and
+/// each exported declaration with its own, a method named after its type.
+fn go_sections(text: &str, package: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    let mut doc: Vec<String> = Vec::new();
+    // In a `const (`, `var (` or `type (` group.
+    let mut group = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if let Some(text) = item.strip_prefix("//") {
+            doc.push(text.strip_prefix(' ').unwrap_or(text).to_string());
+            continue;
+        }
+        let docs = clean(&doc);
+        doc.clear();
+        if group {
+            group = item != ")";
+            if let (Some(name), Some(docs)) = (go_exported(item), docs) {
+                sections.push(Section { title: name, text: format!("`{item}`\n\n{docs}") });
+            }
+            continue;
+        }
+        if item.starts_with("package ") {
+            if let Some(docs) = docs.filter(|d| d.starts_with("Package ")) {
+                sections.push(Section { title: package.to_string(), text: docs });
+            }
+            continue;
+        }
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if ["const (", "var (", "type ("].contains(&item) {
+            group = true;
+            continue;
+        }
+        let Some(title) = go_declared(item) else { continue };
+        let text = signature(&lines[i..]);
+        sections.push(Section { title, text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+    }
+    sections
+}
+
+/// The name an exported declaration line declares, as `Marshal` of `func
+/// Marshal(`, or `Decoder.Decode` of `func (d *Decoder) Decode(`.
+fn go_declared(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("func ") {
+        let Some(receiver) = rest.strip_prefix('(') else { return go_exported(rest) };
+        let (receiver, rest) = receiver.split_once(')')?;
+        let ty = receiver.split_whitespace().last()?.trim_start_matches('*');
+        let ty = ty.split('[').next().unwrap_or(ty);
+        return Some(format!("{ty}.{}", go_exported(rest.trim_start())?));
+    }
+    ["type ", "const ", "var "].iter().find_map(|k| line.strip_prefix(k)).and_then(go_exported)
+}
+
+/// The exported name `text` starts with: a capital's.
+fn go_exported(text: &str) -> Option<String> {
+    let name = ident(text);
+    name.starts_with(|c: char| c.is_uppercase()).then_some(name)
+}
+
+/// The jar Maven or Gradle downloaded `group:artifact` `version` as, under
+/// `home`: its sources jar when there's one.
+fn java_jar(home: &Path, group: &str, artifact: &str, version: &str) -> Option<PathBuf> {
+    let gradle = std::env::var_os("GRADLE_USER_HOME").map_or_else(|| home.join(".gradle"), PathBuf::from);
+    let maven = home.join(".m2/repository").join(group.replace('.', "/")).join(artifact).join(version);
+    // Gradle keeps each file in a folder named for its hash.
+    let cached = gradle.join("caches/modules-2/files-2.1").join(group).join(artifact).join(version);
+    let hashed = fs::read_dir(&cached).ok().into_iter().flatten().flatten().map(|e| e.path());
+    let folders: Vec<PathBuf> = std::iter::once(maven).chain(hashed).collect();
+    let named = |file: String| folders.iter().map(|f| f.join(&file)).find(|f| f.is_file());
+    named(format!("{artifact}-{version}-sources.jar")).or_else(|| named(format!("{artifact}-{version}.jar")))
+}
+
+/// A Java library's API from its `jar`: from a sources jar, each package's
+/// docs and the public types and documented public members its Javadoc
+/// describes; from a jar of classes alone, the names of its classes.
+fn java(jar: &Path, artifact: &str) -> Option<Vec<Section>> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(jar).ok()?).ok()?;
+    let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    // Its top packages first, and each package's docs before its classes.
+    names.sort_by_key(|n| (n.matches('/').count(), !n.ends_with("package-info.java"), n.clone()));
+    let mut sections = Vec::new();
+    let sources: Vec<&String> = names.iter().filter(|n| n.ends_with(".java") && !n.ends_with("module-info.java")).collect();
+    for name in sources.iter().take(FILES) {
+        let Ok(mut file) = archive.by_name(name) else { continue };
+        if file.size() > FILE_BYTES {
+            continue;
+        }
+        let mut text = String::new();
+        if std::io::Read::read_to_string(&mut file, &mut text).is_ok() {
+            sections.extend(java_sections(&text));
+        }
+    }
+    if sources.is_empty() {
+        let classes: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.strip_suffix(".class"))
+            .filter(|n| !n.contains('$') && !n.ends_with("package-info") && !n.starts_with("META-INF"))
+            .map(|n| n.replace('/', "."))
+            .collect();
+        if !classes.is_empty() {
+            let text = format!("No sources installed; its classes:\n{}", classes.join("\n"));
+            sections.push(Section { title: artifact.to_string(), text });
+        }
+    }
+    (!sections.is_empty()).then_some(sections)
+}
+
+/// What a Java source file declares: its package's docs in a
+/// `package-info.java`, each public type with its Javadoc, and each
+/// documented public member of its types, named after them.
+fn java_sections(text: &str) -> Vec<Section> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sections = Vec::new();
+    // The types a line is in: each one's depth and name.
+    let mut types: Vec<(usize, String, bool)> = Vec::new();
+    let mut depth = 0;
+    let mut doc: Vec<String> = Vec::new();
+    let mut in_doc = false;
+    for (i, line) in lines.iter().enumerate() {
+        let item = line.trim();
+        if in_doc || item.starts_with("/**") {
+            in_doc = !item.ends_with("*/");
+            let text = item.trim_start_matches("/**").trim_end_matches("*/").trim();
+            let text = text.strip_prefix('*').map_or(text, |t| t.strip_prefix(' ').unwrap_or(t));
+            if !text.starts_with('@') || ["@param", "@return", "@throws"].iter().any(|t| text.starts_with(t)) {
+                doc.push(text.to_string());
+            }
+            continue;
+        }
+        // Annotations and comments come between an item and its Javadoc.
+        if item.is_empty() || item.starts_with('@') || item.starts_with("//") {
+            continue;
+        }
+        let docs = clean(&doc);
+        doc.clear();
+        if let Some(package) = item.strip_prefix("package ") {
+            if let Some(docs) = docs {
+                sections.push(Section { title: package.trim_end_matches(';').to_string(), text: docs });
+            }
+            continue;
+        }
+        let owner = types.last().map(|(_, name, interface)| (name.clone(), *interface));
+        let public = item.starts_with("public ") || owner.as_ref().is_some_and(|(_, interface)| *interface);
+        let declared = java_type(item).filter(|_| public);
+        if let Some((name, _)) = &declared {
+            let text = signature(&lines[i..]);
+            sections.push(Section { title: name.clone(), text: docs.map_or(format!("`{text}`"), |d| format!("`{text}`\n\n{d}")) });
+        } else if let (true, Some((owner, _)), Some(docs)) = (public, &owner, docs)
+            && let Some(name) = item.split_once('(').map(|(head, _)| ident_back(head)).filter(|n| !n.is_empty())
+        {
+            sections.push(Section { title: format!("{owner}.{name}"), text: format!("`{}`\n\n{docs}", signature(&lines[i..])) });
+        }
+        let opens = item.matches('{').count();
+        let closes = item.matches('}').count();
+        if let Some((name, interface)) = declared.filter(|_| opens > closes) {
+            types.push((depth, name, interface));
+        }
+        depth = (depth + opens).saturating_sub(closes);
+        types.retain(|(at, ..)| *at < depth);
+    }
+    sections
+}
+
+/// The type a line declares, and whether it's an interface, whose members
+/// are public: `Gson` of `public final class Gson {`.
+fn java_type(line: &str) -> Option<(String, bool)> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let at = words.iter().position(|w| ["class", "interface", "enum", "record", "@interface"].contains(w))?;
+    let modifiers = ["public", "protected", "private", "static", "final", "abstract", "sealed", "non-sealed", "strictfp"];
+    if !words[..at].iter().all(|w| modifiers.contains(w)) {
+        return None;
+    }
+    let name = ident(words.get(at + 1)?);
+    (!name.is_empty()).then(|| (name, words[at].ends_with("interface")))
+}
+
+/// The identifier `text` ends with.
+fn ident_back(text: &str) -> String {
+    let name: String = text.trim_end().chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    name.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_library_locked_at_no_version_is_only_read_where_its_installed_for_the_project() {
+        let unlocked = Dep { name: "regex".into(), version: None };
+        assert!(!readable("Rust", &unlocked) && !readable("Go", &unlocked) && !readable("Java", &unlocked));
+        assert!(readable("Python", &unlocked) && readable("JavaScript/TypeScript", &unlocked));
+        assert!(readable("Rust", &Dep { version: Some("1.13.1".into()), ..unlocked }));
+    }
+
+    #[test]
+    fn a_crate_s_api_is_its_docs_and_what_they_document() {
+        let registry = tempfile::tempdir().unwrap();
+        let index = registry.path().join("index.crates.io-1");
+        let app = index.join("app-1.2.0");
+        write(&app.join("README.md"), "# app\n\nParses arguments.");
+        write(
+            &app.join("src/lib.rs"),
+            "//! The app crate.\n#![doc = include_str!(\"../README.md\")]\n\npub use app_core::*;\npub use crate::derive::Parser;\npub use app as other_app;\n\n\
+             /// Run it.\n///\n/// ```\n/// # use app::run;\n/// run(1);\n/// ```\n#[must_use]\npub fn run(\n    times: u32,\n) -> bool {\n    true\n}\n\n\
+             pub fn undocumented() {}\n\n/// Internal.\n#[doc(hidden)]\npub fn secret() {}\n\n/// Not public.\nfn private() {}\n\n\
+             /// Parses.\npub trait Parser {\n    /// Parse the args.\n    fn parse() -> Self;\n}\n\n\
+             /// Says hello.\n#[macro_export]\nmacro_rules! hello {\n    () => {};\n}\n",
+        );
+        write(&app.join("src/derive/mod.rs"), "//! Derive reference: `#[arg(short, long)]`.\n");
+        let core = index.join("app-core-0.3.1");
+        // Docs in a block, and an `impl` in a `mod`.
+        write(
+            &core.join("src/lib.rs"),
+            "/*!\nCore of app.\n*/\n\npub(crate) mod string {\n    /// Builds.\n    pub struct Builder;\n\n    impl Builder {\n        /// Makes one.\n        pub fn new() -> Builder {\n            Builder\n        }\n    }\n}\n",
+        );
+        write(
+            &core.join("src/builder/command.rs"),
+            "pub struct Command;\n\nimpl<'a> Command {\n    /// Adds an argument.\n    pub fn arg(mut self, a: impl Into<Arg>) -> Self {\n        self\n    }\n}\n",
+        );
+        let lock = "[[package]]\nname = \"app\"\nversion = \"1.2.0\"\n\n[[package]]\nname = \"app-core\"\nversion = \"0.3.1\"\n";
+        let app = Dep { name: "app".into(), version: Some("1.2.0".into()) };
+        let sections = rust(registry.path(), lock, &app).unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        // Itself re-exported isn't read again.
+        assert_eq!(titles, ["app", "run", "Parser", "Parser::parse", "hello!", "app::derive", "app_core", "Builder", "Builder::new", "Command::arg"]);
+        assert_eq!(sections[6].text, "Core of app.");
+        assert_eq!(sections[0].text, "The app crate.\n# app\n\nParses arguments.");
+        // A doctest's hidden lines are left out of its example.
+        assert_eq!(sections[1].text, "`pub fn run(times: u32,) -> bool`\n\nRun it.\n\n```\nrun(1);\n```");
+        assert_eq!(sections[3].text, "`fn parse() -> Self`\n\nParse the args.");
+        assert!(sections.last().unwrap().text.starts_with("`pub fn arg(mut self, a: impl Into<Arg>) -> Self`"));
+        // Not installed at the version the project builds with: nothing.
+        assert_eq!(rust(registry.path(), lock, &Dep { name: "app".into(), version: Some("1.3.0".into()) }), None);
+        assert_eq!(rust(registry.path(), lock, &Dep { name: "app".into(), version: None }), None);
+    }
+
+    #[test]
+    fn a_package_s_api_is_its_types() {
+        let modules = tempfile::tempdir().unwrap();
+        let pkg = modules.path().join("greet");
+        write(&pkg.join("package.json"), r#"{"name": "greet", "types": "./dist/index.d.ts"}"#);
+        write(&pkg.join("README.md"), "# greet\n\nSays hello.");
+        write(
+            &pkg.join("dist/index.d.ts"),
+            "export * from './options';\nexport { Greeter } from \"./greeter.js\";\n\n\
+             /**\n * Greet someone.\n * @param name - who\n * @internal\n */\nexport declare function greet(name: string): string;\n\n\
+             export declare const VERSION: string;\n",
+        );
+        write(&pkg.join("dist/options.d.ts"), "/** How to greet. */\nexport interface Options {\n    /** Shout it. */\n    loud?: boolean;\n    quiet: boolean;\n}\n");
+        write(
+            &pkg.join("dist/greeter/index.d.ts"),
+            "export declare class Greeter {\n    /** Make one. */\n    static create(options?: Options): Greeter;\n    private secret;\n}\n",
+        );
+        let sections = npm(modules.path(), "greet").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["greet", "greet", "VERSION", "Options", "Options.loud", "Greeter", "Greeter.create"]);
+        assert_eq!(sections[0].text, "# greet\n\nSays hello.");
+        assert_eq!(sections[1].text, "`export declare function greet(name: string): string`\n\nGreet someone.\n@param name - who");
+        assert_eq!(sections[4].text, "`loud?: boolean`\n\nShout it.");
+        // No types of its own: those `@types` has for it.
+        let scoped = modules.path().join("@types/scope__lib");
+        write(&scoped.join("package.json"), r#"{"name": "@types/scope__lib", "types": "index.d.ts"}"#);
+        write(&scoped.join("index.d.ts"), "export type Id = string;\n");
+        assert_eq!(npm(modules.path(), "@scope/lib").unwrap()[0].title, "Id");
+        assert_eq!(npm(modules.path(), "missing"), None);
+    }
+
+    #[test]
+    fn a_package_installed_without_types_is_told_by_its_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let modules = root.path().join("node_modules");
+        let dep = |name: &str| Dep { name: name.into(), version: Some("1.0.0".into()) };
+        write(&modules.join("native/package.json"), r#"{"name": "native", "main": "lib/index.js"}"#);
+        assert!(untyped(root.path(), &dep("native")));
+        write(&modules.join("greet/package.json"), r#"{"name": "greet", "types": "index.d.ts"}"#);
+        write(&modules.join("greet/index.d.ts"), "export type Id = string;\n");
+        assert!(!untyped(root.path(), &dep("greet")));
+        // Typed by `@types`, or not installed at all, isn't.
+        write(&modules.join("@scope/lib/package.json"), r#"{"name": "@scope/lib"}"#);
+        write(&modules.join("@types/scope__lib/package.json"), r#"{"types": "index.d.ts"}"#);
+        write(&modules.join("@types/scope__lib/index.d.ts"), "export type Id = string;\n");
+        assert!(!untyped(root.path(), &dep("@scope/lib")));
+        assert!(!untyped(root.path(), &dep("missing")));
+    }
+
+    #[test]
+    fn a_python_package_s_api_is_its_docstrings() {
+        let venv = tempfile::tempdir().unwrap();
+        let site = venv.path().join(".venv/lib/python3.12/site-packages");
+        write(&site.join("Beautiful_Soup-4.12.0.dist-info/top_level.txt"), "bs4\n");
+        let init = [
+            "\"\"\"Beautiful Soup parses HTML.\"\"\"",
+            "",
+            "import re",
+            "",
+            "class BeautifulSoup(Tag):",
+            "    \"\"\"A document.",
+            "",
+            "    Parse it:",
+            "        soup = BeautifulSoup(html)",
+            "    \"\"\"",
+            "",
+            "    def find_all(self, name=None,",
+            "                 limit=None):",
+            "        \"\"\"Every tag named `name`.\"\"\"",
+            "        pass",
+            "",
+            "    def undocumented(self):",
+            "        pass",
+            "",
+            "    def _private(self):",
+            "        \"\"\"Hidden.\"\"\"",
+            "",
+            "def _helper():",
+            "    pass",
+            "",
+            "async def fetch(url: str) -> str:",
+            "    ...",
+            "",
+            "from ._api import get",
+        ];
+        write(&site.join("bs4/__init__.py"), &init.join("\n"));
+        write(&site.join("bs4/_internal.py"), "def hidden():\n    pass\n");
+        write(&site.join("bs4/_api.py"), "def get(url):\n    \"\"\"Fetch it.\"\"\"\n");
+        write(&site.join("bs4/element.py"), "def text(): ...\n");
+        write(&site.join("bs4/element.pyi"), "def text() -> str:\n    \"\"\"The text, typed.\"\"\"\n");
+        let site = site_packages(venv.path()).unwrap();
+        let sections = python(&site, "beautiful-soup").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        // A private module its `__init__` imports from is read; not others.
+        assert_eq!(titles, ["bs4", "BeautifulSoup", "BeautifulSoup.find_all", "fetch", "get", "text"]);
+        assert_eq!(sections[1].text, "`class BeautifulSoup(Tag)`\n\nA document.\n\nParse it:\n    soup = BeautifulSoup(html)");
+        assert_eq!(sections[2].text, "`def find_all(self, name=None, limit=None)`\n\nEvery tag named `name`.");
+        assert_eq!(sections[3].text, "`async def fetch(url: str) -> str`");
+        assert_eq!(sections[5].text, "`def text() -> str`\n\nThe text, typed.");
+        assert_eq!(python(&site, "requests"), None);
+    }
+
+    #[test]
+    fn a_go_module_s_api_is_its_exported_declarations() {
+        let modules = tempfile::tempdir().unwrap();
+        let toml = modules.path().join("github.com/!burnt!sushi/toml@v1.3.2");
+        write(&toml.join("doc.go"), "// Package toml reads TOML.\n//\n// Decode it.\npackage toml\n");
+        let decode = [
+            "package toml",
+            "",
+            "// Decode reads data into v.",
+            "func Decode(data string, v any) (MetaData, error) {",
+            "\treturn MetaData{}, nil",
+            "}",
+            "",
+            "func decode() {}",
+            "",
+            "// A Decoder reads a stream.",
+            "type Decoder struct {",
+            "\tr io.Reader",
+            "}",
+            "",
+            "// Decode the stream.",
+            "func (dec *Decoder) Decode(v any) (MetaData, error) {",
+            "}",
+            "",
+            "const (",
+            "\t// Version of the spec.",
+            "\tVersion = \"1.0\"",
+            "\tundocumented = 1",
+            ")",
+        ];
+        write(&toml.join("decode.go"), &decode.join("\n"));
+        write(&toml.join("decode_test.go"), "// Test it.\nfunc TestDecode(t *testing.T) {}\n");
+        write(&toml.join("internal/tz.go"), "// Zone.\nfunc Zone() {}\n");
+        write(&toml.join("cmd/tomlv/main.go"), "// Package main checks TOML.\npackage main\n");
+        let sections = go(modules.path(), "github.com/BurntSushi/toml", "v1.3.2").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        // The package's doc comment first, wherever it is.
+        assert_eq!(titles, ["github.com/BurntSushi/toml", "Decode", "Decoder", "Decoder.Decode", "Version", "github.com/BurntSushi/toml/cmd/tomlv"]);
+        assert_eq!(sections[0].text, "Package toml reads TOML.\n\nDecode it.");
+        assert_eq!(sections[1].text, "`func Decode(data string, v any) (MetaData, error)`\n\nDecode reads data into v.");
+        assert_eq!(sections[4].text, "`Version = \"1.0\"`\n\nVersion of the spec.");
+        assert_eq!(go(modules.path(), "github.com/BurntSushi/toml", "v1.4.0"), None);
+    }
+
+    /// A jar at `path` holding `files`, `(name, text)`.
+    fn jar(path: &Path, files: &[(&str, &str)]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for (name, text) in files {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn a_java_library_s_api_is_its_javadoc() {
+        let home = tempfile::tempdir().unwrap();
+        let gson = [
+            "package com.google.gson;",
+            "",
+            "/**",
+            " * Converts Java objects to JSON.",
+            " * @author someone",
+            " */",
+            "public final class Gson {",
+            "  /**",
+            "   * Serializes {@code src} to JSON.",
+            "   * @param src the object",
+            "   */",
+            "  @Deprecated",
+            "  public String toJson(Object src) {",
+            "    return null;",
+            "  }",
+            "  /** Internal. */",
+            "  String helper() { return null; }",
+            "  public void undocumented() {}",
+            "}",
+            "",
+            "/** How a field is named. */",
+            "public interface FieldNamingStrategy {",
+            "  /** The name for {@code f}. */",
+            "  String translateName(Field f);",
+            "}",
+        ];
+        let info = "/** Gson's API. */\npackage com.google.gson;\n";
+        let sources = home.path().join(".m2/repository/com/google/code/gson/gson/2.11.0/gson-2.11.0-sources.jar");
+        jar(&sources, &[("com/google/gson/Gson.java", &gson.join("\n")), ("com/google/gson/package-info.java", info), ("module-info.java", "module x {}")]);
+        let found = java_jar(home.path(), "com.google.code.gson", "gson", "2.11.0").unwrap();
+        assert_eq!(found, sources);
+        let sections = java(&found, "gson").unwrap();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["com.google.gson", "Gson", "Gson.toJson", "FieldNamingStrategy", "FieldNamingStrategy.translateName"]);
+        assert_eq!(sections[1].text, "`public final class Gson`\n\nConverts Java objects to JSON.");
+        assert_eq!(sections[2].text, "`public String toJson(Object src)`\n\nSerializes {@code src} to JSON.\n@param src the object");
+        // From Gradle's cache, without sources: its classes' names.
+        let classes = home.path().join(".gradle/caches/modules-2/files-2.1/org.slf4j/slf4j-api/2.0.13/0a1b2c/slf4j-api-2.0.13.jar");
+        jar(&classes, &[("org/slf4j/Logger.class", ""), ("org/slf4j/Logger$1.class", ""), ("META-INF/MANIFEST.MF", "")]);
+        let found = java_jar(home.path(), "org.slf4j", "slf4j-api", "2.0.13").unwrap();
+        assert_eq!(java(&found, "slf4j-api").unwrap(), [Section { title: "slf4j-api".into(), text: "No sources installed; its classes:\norg.slf4j.Logger".into() }]);
+        assert_eq!(java_jar(home.path(), "org.slf4j", "slf4j-api", "1.7.0"), None);
+    }
+
+    #[test]
+    fn an_impl_line_names_its_type() {
+        assert_eq!(impl_type("impl Command {").as_deref(), Some("Command"));
+        assert_eq!(impl_type("impl<T: Into<String>> Display for crate::Arg<T> {").as_deref(), Some("Arg"));
+        assert_eq!(impl_type("implement {"), None);
+    }
+}
