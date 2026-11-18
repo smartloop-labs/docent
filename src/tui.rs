@@ -2927,7 +2927,8 @@ impl App {
         }
     }
 
-    /// Pick the project: the one asked for, else the server's current one.
+    /// Pick the project: the one asked for, else the folder's (one made for
+    /// a folder never linked), else at home the system one, general_chat.
     /// Once chatting, the list is for `/project` instead.
     fn projects_loaded(&mut self, result: Result<Vec<serde_json::Value>, String>) {
         if !matches!(self.phase, Phase::Connecting) {
@@ -2966,11 +2967,9 @@ impl App {
                 .find(|p| field(p, "id") == *id)
                 .map(|p| (field(p, "id"), field(p, "name")))
                 .or_else(|| Some((id.clone(), id.clone()))),
-            None => projects
-                .iter()
-                .find(|p| p["current"].as_bool().unwrap_or_default())
-                .or_else(|| projects.first())
-                .map(|p| (field(p, "id"), field(p, "name"))),
+            // Only home (or above) gets here, as any other folder has a
+            // project of its own.
+            None => home_project(&projects).map(|p| (field(p, "id"), field(p, "name"))),
         };
         self.phase = Phase::Ready;
         match chosen {
@@ -5416,6 +5415,17 @@ impl App {
     }
 }
 
+/// The project chatted in at home: the system one, general_chat, never what
+/// the last folder left current; without one, the current, else the first.
+fn home_project(projects: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let flag = |p: &&serde_json::Value, k: &str| p[k].as_bool().unwrap_or_default();
+    projects
+        .iter()
+        .find(|p| flag(p, "system"))
+        .or_else(|| projects.iter().find(|p| flag(p, "current")))
+        .or_else(|| projects.first())
+}
+
 /// The project a folder never linked gets, named after it: one already so
 /// named, by id, when it has no folder of its own (`has_folder`); else a
 /// new one, numbered past any name taken.
@@ -7728,6 +7738,20 @@ mod tests {
         // One linked elsewhere leaves the name taken: the next free one.
         assert_eq!(adopted("app", &taken, |_| true), ("app-3".to_string(), None));
         assert_eq!(adopted("site", &taken, |_| true), ("site".to_string(), None));
+    }
+
+    #[test]
+    fn home_chats_in_the_system_project_not_the_last_current() {
+        let project = |id: &str, system: bool, current: bool| serde_json::json!({ "id": id, "system": system, "current": current });
+        let id = |list: &[serde_json::Value]| home_project(list).map(|p| p["id"].as_str().unwrap().to_string());
+        // The project a folder left current loses to general_chat.
+        let list = vec![project("p2", false, true), project("p1", true, false)];
+        assert_eq!(id(&list).as_deref(), Some("p1"));
+        // Without a system project, the current one, else the first.
+        let list = vec![project("p2", false, false), project("p3", false, true)];
+        assert_eq!(id(&list).as_deref(), Some("p3"));
+        assert_eq!(id(&list[..1]).as_deref(), Some("p2"));
+        assert_eq!(id(&[]), None);
     }
 
     #[test]
