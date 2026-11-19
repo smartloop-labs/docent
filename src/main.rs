@@ -943,7 +943,7 @@ pub fn device_login(client: &Client, on_code: impl FnOnce(&str, &str)) -> Result
         let Ok(status) = request_json(client, format!("{}/auth/device", api_url()), "read sign-in status") else {
             continue;
         };
-        match device_outcome(&status) {
+        match device_outcome(&status, code) {
             None => continue,
             Some(Err(e)) => return Err(e),
             Some(Ok(())) => {
@@ -955,9 +955,13 @@ pub fn device_login(client: &Client, on_code: impl FnOnce(&str, &str)) -> Result
     Err("Timed out waiting for the code to be approved".to_string())
 }
 
-/// How a device sign-in the agent reports has ended, or None while it's
-/// still waiting for approval.
-fn device_outcome(status: &serde_json::Value) -> Option<Result<(), String>> {
+/// How the device sign-in for `code` has ended, by what the agent reports,
+/// or None while it's still waiting for approval. The agent runs one at a
+/// time, so a different code means another sign-in took this one's place.
+fn device_outcome(status: &serde_json::Value, code: &str) -> Option<Result<(), String>> {
+    if status["user_code"].as_str().is_some_and(|c| c != code) {
+        return Some(Err("Sign-in was replaced by another one".to_string()));
+    }
     match status["status"].as_str().unwrap_or_default() {
         "pending" => None,
         "approved" => Some(Ok(())),
@@ -1151,16 +1155,24 @@ mod tests {
 
     #[test]
     fn device_sign_in_outcomes() {
-        let outcome = |status: serde_json::Value| super::device_outcome(&status);
-        assert_eq!(outcome(serde_json::json!({"status": "pending"})), None);
-        assert_eq!(outcome(serde_json::json!({"status": "approved"})), Some(Ok(())));
-        assert_eq!(outcome(serde_json::json!({"status": "denied"})), Some(Err("Sign-in was denied".to_string())));
-        assert!(matches!(outcome(serde_json::json!({"status": "expired"})), Some(Err(e)) if e.contains("expired")));
+        let outcome = |status: &str| super::device_outcome(&serde_json::json!({"status": status, "user_code": "BCDF-GHJK"}), "BCDF-GHJK");
+        assert_eq!(outcome("pending"), None);
+        assert_eq!(outcome("approved"), Some(Ok(())));
+        assert_eq!(outcome("denied"), Some(Err("Sign-in was denied".to_string())));
+        assert!(matches!(outcome("expired"), Some(Err(e)) if e.contains("expired")));
         assert_eq!(
-            outcome(serde_json::json!({"status": "failed", "message": "Unknown device_code."})),
+            super::device_outcome(
+                &serde_json::json!({"status": "failed", "user_code": "BCDF-GHJK", "message": "Unknown device_code."}),
+                "BCDF-GHJK"
+            ),
             Some(Err("Sign-in failed: Unknown device_code.".to_string()))
         );
-        assert!(matches!(outcome(serde_json::json!({"status": "none"})), Some(Err(e)) if e.contains("cancelled")));
+        assert!(matches!(super::device_outcome(&serde_json::json!({"status": "none"}), "BCDF-GHJK"), Some(Err(e)) if e.contains("cancelled")));
+        // Another /login started a new code: this one won't be approved.
+        assert!(matches!(
+            super::device_outcome(&serde_json::json!({"status": "pending", "user_code": "XVJH-MZFF"}), "BCDF-GHJK"),
+            Some(Err(e)) if e.contains("replaced")
+        ));
     }
 
     #[test]
