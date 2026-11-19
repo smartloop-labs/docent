@@ -839,20 +839,17 @@ const BROWSER_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// machine, so all that's left here is to wait for them to land. `on_url`
 /// is told the page opened, for when no browser comes up.
 pub fn browser_login(client: &Client, on_url: impl FnOnce(&str)) -> Result<String, String> {
-    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
-    if status["has_access_token"].as_bool().unwrap_or_default() {
-        if let Some(who) = logged_in_as(&status) {
-            return Ok(format!("{}; log out first to switch accounts", who));
-        }
+    if let Some(who) = already_signed_in(client)? {
+        return Ok(who);
     }
 
     // The page posts to 127.0.0.1, so it has to be an agent on this machine.
-    let base = base_url();
-    let host = base.split("://").nth(1).unwrap_or(&base);
-    let (name, port) = host.rsplit_once(':').unwrap_or((host, "80"));
-    if !matches!(name, "localhost" | "127.0.0.1") {
-        return Err(format!("Browser sign-in needs an agent on this machine, not {}; use --token", base));
-    }
+    let Some(port) = local_agent_port(&base_url()) else {
+        return Err(format!(
+            "Browser sign-in needs an agent on this machine, not {}; use --device or --token",
+            base_url()
+        ));
+    };
     let url = format!("{}/login?mode=desktop&port={}", app_url(), port);
     on_url(&url);
     open_browser(&url);
@@ -870,6 +867,109 @@ pub fn browser_login(client: &Client, on_url: impl FnOnce(&str)) -> Result<Strin
         }
     }
     Err("Timed out waiting for the browser sign-in".to_string())
+}
+
+/// "… ; log out first" when the agent already has a signed-in user.
+fn already_signed_in(client: &Client) -> Result<Option<String>, String> {
+    let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
+    if status["has_access_token"].as_bool().unwrap_or_default() {
+        if let Some(who) = logged_in_as(&status) {
+            return Ok(Some(format!("{}; log out first to switch accounts", who)));
+        }
+    }
+    Ok(None)
+}
+
+/// The port of an agent at *base* on this machine, or None for one elsewhere.
+fn local_agent_port(base: &str) -> Option<String> {
+    let host = base.split("://").nth(1).unwrap_or(base);
+    let (name, port) = host.rsplit_once(':').unwrap_or((host, "80"));
+    matches!(name, "localhost" | "127.0.0.1").then(|| port.to_string())
+}
+
+/// Whether plain `/login` should sign in with a code instead of the
+/// browser: the browser hand-off needs the agent on this machine, and a
+/// browser here for the user to see.
+pub fn prefers_device_login() -> bool {
+    let env = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    device_login_needed(
+        local_agent_port(&base_url()).is_some(),
+        env("SSH_CONNECTION") || env("SSH_TTY"),
+        cfg!(target_os = "linux") && !env("DISPLAY") && !env("WAYLAND_DISPLAY"),
+    )
+}
+
+fn device_login_needed(local_agent: bool, over_ssh: bool, no_display: bool) -> bool {
+    !local_agent || over_ssh || no_display
+}
+
+/// What the platform knows Docent Code by; the approval page names it.
+const DEVICE_CLIENT_ID: &str = "docent-code";
+
+/// Sign in with a code (RFC 8628), for when no browser here can: the agent
+/// asks the platform for a code, `on_code` shows it with the page to enter
+/// it on (from any device), and the agent collects the tokens once it's
+/// approved. Docent only ever talks to the agent.
+pub fn device_login(client: &Client, on_code: impl FnOnce(&str, &str)) -> Result<String, String> {
+    if let Some(who) = already_signed_in(client)? {
+        return Ok(who);
+    }
+
+    let response = client
+        .post(format!("{}/auth/device", api_url()))
+        .json(&serde_json::json!({ "client_id": DEVICE_CLIENT_ID }))
+        .send()
+        .map_err(|e| format!("Failed to start sign-in: {}", e))?;
+    if !response.status().is_success() {
+        return Err(error_message("start sign-in", response));
+    }
+    let started: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("Failed to parse response as JSON: {}", e))?;
+    let code = started["user_code"].as_str().unwrap_or_default();
+    let url = started["verification_uri_complete"]
+        .as_str()
+        .or_else(|| started["verification_uri"].as_str())
+        .unwrap_or_default();
+    on_code(code, url);
+
+    // The agent gives up at the platform's deadline; a little longer here
+    // so its verdict, not this timeout, is what's reported.
+    let expires_in = started["expires_in"].as_u64().unwrap_or(600);
+    let deadline = std::time::Duration::from_secs(expires_in + 10);
+    let polling = std::time::Instant::now();
+    while polling.elapsed() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let Ok(status) = request_json(client, format!("{}/auth/device", api_url()), "read sign-in status") else {
+            continue;
+        };
+        match device_outcome(&status) {
+            None => continue,
+            Some(Err(e)) => return Err(e),
+            Some(Ok(())) => {
+                let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
+                return Ok(logged_in_as(&status).unwrap_or_else(|| "Logged in".to_string()));
+            }
+        }
+    }
+    Err("Timed out waiting for the code to be approved".to_string())
+}
+
+/// How a device sign-in the agent reports has ended, or None while it's
+/// still waiting for approval.
+fn device_outcome(status: &serde_json::Value) -> Option<Result<(), String>> {
+    match status["status"].as_str().unwrap_or_default() {
+        "pending" => None,
+        "approved" => Some(Ok(())),
+        "denied" => Some(Err("Sign-in was denied".to_string())),
+        "expired" => Some(Err("The code expired before it was approved; /login to try again".to_string())),
+        "failed" => Some(Err(format!(
+            "Sign-in failed: {}",
+            status["message"].as_str().unwrap_or("the platform refused it")
+        ))),
+        // Cancelled: a sign-out, or another sign-in started in its place.
+        _ => Some(Err("Sign-in was cancelled".to_string())),
+    }
 }
 
 /// Where `/upgrade` goes: the web app's checkout hand-off, which sends a
@@ -1032,6 +1132,35 @@ mod tests {
         assert!(matches!(parse(&["agent", "status"]).command, Some(Commands::Agent { .. })));
         // Options before a subcommand belong to the chat, not to `agent`.
         assert!(Args::try_parse_from(["docent", "-s", "abc", "agent", "status"]).is_err());
+    }
+
+    #[test]
+    fn browser_sign_in_needs_an_agent_here() {
+        assert_eq!(super::local_agent_port("http://localhost:8001").as_deref(), Some("8001"));
+        assert_eq!(super::local_agent_port("http://127.0.0.1:9000").as_deref(), Some("9000"));
+        assert_eq!(super::local_agent_port("https://agent.example.com:8001"), None);
+    }
+
+    #[test]
+    fn login_uses_a_code_where_the_browser_cant_reach() {
+        assert!(!super::device_login_needed(true, false, false), "a desktop with the agent here");
+        assert!(super::device_login_needed(false, false, false), "an agent elsewhere");
+        assert!(super::device_login_needed(true, true, false), "over SSH");
+        assert!(super::device_login_needed(true, false, true), "no display");
+    }
+
+    #[test]
+    fn device_sign_in_outcomes() {
+        let outcome = |status: serde_json::Value| super::device_outcome(&status);
+        assert_eq!(outcome(serde_json::json!({"status": "pending"})), None);
+        assert_eq!(outcome(serde_json::json!({"status": "approved"})), Some(Ok(())));
+        assert_eq!(outcome(serde_json::json!({"status": "denied"})), Some(Err("Sign-in was denied".to_string())));
+        assert!(matches!(outcome(serde_json::json!({"status": "expired"})), Some(Err(e)) if e.contains("expired")));
+        assert_eq!(
+            outcome(serde_json::json!({"status": "failed", "message": "Unknown device_code."})),
+            Some(Err("Sign-in failed: Unknown device_code.".to_string()))
+        );
+        assert!(matches!(outcome(serde_json::json!({"status": "none"})), Some(Err(e)) if e.contains("cancelled")));
     }
 
     #[test]

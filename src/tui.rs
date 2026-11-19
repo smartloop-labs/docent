@@ -4241,7 +4241,9 @@ impl App {
         let command = words.next().unwrap_or_default();
         match command {
             "/login" => match words.next() {
+                None if crate::prefers_device_login() => self.device_login(),
                 None => self.browser_login(),
+                Some("--device") => self.device_login(),
                 Some("--token") => self.token_entry = true,
                 Some(token) => self.login(token.to_string()),
             },
@@ -4425,6 +4427,26 @@ impl App {
             let notify = tx.clone();
             let result = crate::browser_login(&client, |url| {
                 let _ = notify.send(AppEvent::Notice(format!("Sign in in the browser: {}", url)));
+            });
+            let _ = tx.send(match result {
+                Ok(who) => AppEvent::Notice(who),
+                Err(e) => AppEvent::Error(e),
+            });
+            refresh_models(&client, &tx, project);
+            send_usage(&client, &tx);
+            let _ = tx.send(AppEvent::Account(crate::account(&client)));
+        });
+    }
+
+    /// Sign in with a code entered on any device's browser, for when none
+    /// here can (over SSH, or an agent elsewhere); then refresh as a token
+    /// sign-in does.
+    fn device_login(&mut self) {
+        let project = self.project.clone();
+        self.spawn(move |client, tx| {
+            let notify = tx.clone();
+            let result = crate::device_login(&client, |code, url| {
+                let _ = notify.send(AppEvent::Notice(format!("To sign in, open {} and confirm the code {}", url, code)));
             });
             let _ = tx.send(match result {
                 Ok(who) => AppEvent::Notice(who),
@@ -6721,7 +6743,7 @@ fn is_document(path: &std::path::Path) -> bool {
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 13] = [
     ("/help", "shortcuts and commands"),
-    ("/login", "sign in in the browser (--token to paste one)"),
+    ("/login", "sign in in the browser (--device for a code, --token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
@@ -6814,7 +6836,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
-        ("/login", "sign in in the browser (--token to paste one)"),
+        ("/login", "sign in in the browser (--device for a code, --token to paste one)"),
         ("/logout", "log out"),
         ("/usage", "credits used this month"),
         ("/upgrade", "Pro or Plus plan: more credits a month"),
