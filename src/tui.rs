@@ -4742,15 +4742,16 @@ impl App {
         lines
     }
 
-    /// The welcome card: the logo on the left, and on the right the
+    /// The welcome card: the logo on the left, its O a lantern (Docent's
+    /// mark), and on the right the
     /// project, the agent and the versions; first commands under them.
     ///
     /// ```text
     /// ╭───────────────────────────────────────────────────────────────────────────╮
     /// │                                                                           │
-    /// │ █▀▀▀▄ ▄▀▀▀▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  notes                     │
-    /// │ █   █ █   █ █     █▀▀▀  █ ▀▄█   █               5 docs · 2 connections    │
-    /// │ ▀▀▀▀   ▀▀▀   ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      model    qwen3.5-2b +1 more        │
+    /// │ █▀▀▀▄ ▄▄█▄▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀    project  notes                     │
+    /// │ █   █ █ █ █ █     █▀▀▀  █ ▀▄█   █               5 docs · 2 connections    │
+    /// │ ▀▀▀▀  ▀▀▀▀▀  ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀      model    qwen3.5-2b +1 more        │
     /// │ Frontier quality. Local first.         agent    ▰▰▰▱▱▱▱▱▱▱ 31% memory     │
     /// │ by Smartloop · ? for shortcuts         account  mehfuz@smartloop.ai       │
     /// │                                                 CLI 1.0.42 · agent 1.2.10 │
@@ -4837,9 +4838,23 @@ impl App {
         let border = dim();
         let right = self.card_details();
         // Styled per span: the rows are taken apart into spans below.
+        // The DOCENT banner with the lantern in place of its O: the same
+        // width, so the card's layout doesn't change.
+        let lantern = lantern();
         let mut left: Vec<Line<'static>> = crate::BANNER
             .iter()
-            .map(|row| Line::from(Span::styled(*row, Style::new().fg(pink()))))
+            .zip(lantern)
+            .map(|(row, lantern)| {
+                let chars: Vec<char> = row.chars().collect();
+                let part = |range: std::ops::Range<usize>| {
+                    let text: String = chars.get(range).map(|c| c.iter().collect()).unwrap_or_default();
+                    Span::styled(text, Style::new().fg(pink()))
+                };
+                let mut spans = vec![part(0..LANTERN_AT)];
+                spans.extend(lantern.spans);
+                spans.push(part(LANTERN_AT + LANTERN[0].len()..chars.len()));
+                Line::from(spans)
+            })
             .collect();
         left.push(Line::from(Span::styled("Frontier quality. Local first.", dim())));
         left.push(Line::from(Span::styled("by Smartloop · ? for shortcuts", dim())));
@@ -6976,6 +6991,51 @@ fn dim() -> Style {
 
 /// Smartloop brand pink (#e55d9c), in 24-bit color where the terminal
 /// supports it and the nearest 256-color shade elsewhere.
+/// Docent's mark, a lit lantern (smartloop.ai draws a larger cut of it in
+/// src/components/DocentMark): `#` frame, `o` fire, `.` nothing. A ring, a
+/// roof, the glass with a flame inside and a base, as wide as the banner's
+/// letters so the spacing stays even.
+const LANTERN: [&str; 6] = [
+    "..#..",
+    "#####",
+    "#.o.#",
+    "#.o.#",
+    "#####",
+    ".....",
+];
+
+/// Where the lantern goes in the banner: in place of the O, the five
+/// columns after "█▀▀▀▄ ".
+const LANTERN_AT: usize = 6;
+
+/// The lantern as half-block rows, two pixels to a cell: the top one in the
+/// foreground and the bottom one in the background, so frame and fire can
+/// share a cell. The frame is pink like the banner, the fire yellow.
+fn lantern() -> Vec<Line<'static>> {
+    let color = |c: u8| match c {
+        b'#' => Some(pink()),
+        b'o' => Some(Color::Yellow),
+        _ => None,
+    };
+    LANTERN
+        .chunks(2)
+        .map(|pair| {
+            let top = pair[0].as_bytes();
+            let bottom = pair.get(1).map(|r| r.as_bytes());
+            let cells: Vec<Span<'static>> = (0..top.len())
+                .map(|x| match (color(top[x]), bottom.and_then(|r| color(r[x]))) {
+                    (None, None) => Span::raw(" "),
+                    (Some(t), None) => Span::styled("▀", Style::new().fg(t)),
+                    (None, Some(b)) => Span::styled("▄", Style::new().fg(b)),
+                    (Some(t), Some(b)) if t == b => Span::styled("█", Style::new().fg(t)),
+                    (Some(t), Some(b)) => Span::styled("▀", Style::new().fg(t).bg(b)),
+                })
+                .collect();
+            Line::from(cells)
+        })
+        .collect()
+}
+
 fn pink() -> Color {
     let truecolor = std::env::var("COLORTERM")
         .map(|v| v.contains("truecolor") || v.contains("24bit"))
@@ -8573,6 +8633,18 @@ mod tests {
     }
 
     #[test]
+    fn the_welcome_card_lights_the_lantern_in_docent() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let text = screen(&app, 80, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        // The lantern stands in for the O, the banner as wide as ever.
+        let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▄█▄▄ ▄▀▀▀▀ █▀▀▀▀ █▄  █ ▀▀█▀▀")).expect(&text);
+        assert!(rows[banner + 1].contains("█   █ █ █ █ █     █▀▀▀  █ ▀▄█   █"), "{}", text);
+        assert!(rows[banner + 2].contains("▀▀▀▀  ▀▀▀▀▀  ▀▀▀▀ ▀▀▀▀▀ ▀   ▀   ▀"), "{}", text);
+    }
+
+    #[test]
     fn the_banner_opens_the_conversation_and_scrolls_away() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8580,7 +8652,7 @@ mod tests {
         let text = screen(&app, 80, 24);
         let rows: Vec<&str> = text.lines().collect();
         // Short: the banner sits just above the prompt.
-        let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▀▀▀▄")).expect(&text);
+        let banner = rows.iter().position(|r| r.contains("█▀▀▀▄ ▄▄█▄▄")).expect(&text);
         assert!(rows[banner].contains("project  Default"), "{}", text);
         assert!(rows[banner + 1].contains("         0 docs · 0 connections"), "{}", text);
         assert!(rows[banner + 2].contains("model    …"), "{}", text);
@@ -8626,7 +8698,7 @@ mod tests {
             app.entries.push(Entry::Notice(format!("line {}", i)));
         }
         let text = screen(&app, 80, 24);
-        assert!(!text.contains("█▀▀▀▄ ▄▀▀▀▄"), "{}", text);
+        assert!(!text.contains("█▀▀▀▄ ▄▄█▄▄"), "{}", text);
         assert!(text.contains("line 39"), "{}", text);
     }
 
@@ -8733,7 +8805,7 @@ mod tests {
             app.scroll(WHEEL_LINES as i32);
         }
         assert_eq!(app.scroll_back, limit);
-        assert!(screen(&app, 80, 24).contains("█▀▀▀▄ ▄▀▀▀▄"), "the top shows the welcome card");
+        assert!(screen(&app, 80, 24).contains("█▀▀▀▄ ▄▄█▄▄"), "the top shows the welcome card");
         app.scroll(-1000);
         assert_eq!(app.scroll_back, 0);
         assert!(screen(&app, 80, 24).contains("line 59"));
