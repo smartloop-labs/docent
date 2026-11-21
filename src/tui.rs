@@ -3448,8 +3448,12 @@ impl App {
 
     /// A clicked action: `stop/<id>` ends shell run `id`, as `x` in `/tasks` does,
     /// without a notice, as the run's entry says it's stopped; `show/<id>`
-    /// expands the run under the prompt.
+    /// expands the run under the prompt; `copy/upgrade` copies the command
+    /// the update notice offers, as the footer can't be selected over.
     fn act(&mut self, action: &str) {
+        if action == "copy/upgrade" {
+            return self.copy(crate::update::upgrade_command().to_string());
+        }
         let (what, id) = action.split_once('/').unwrap_or_default();
         let Ok(id) = id.parse::<usize>() else { return };
         match what {
@@ -5372,20 +5376,36 @@ impl App {
 
     /// A newer release asks to be installed, in place of the key hints:
     /// the longest wording that fits `width`, down to the version alone.
+    /// The command is underlined and followed by ⧉, "⧉ copy" where
+    /// there's room; a click on either copies it.
     fn update_notice(&self, width: usize) -> Option<Vec<Span<'static>>> {
         let version = self.update.as_ref()?;
         let command = crate::update::upgrade_command();
+        const HINT: &str = " copy";
+        let long = format!("docent {} is available (you have {}) · upgrade: ", version, env!("CARGO_PKG_VERSION"));
+        let short = format!("docent {} is available · upgrade: ", version);
         let wordings = [
-            (format!("docent {} is available (you have {}) · upgrade: ", version, env!("CARGO_PKG_VERSION")), Some(command)),
-            (format!("docent {} is available · upgrade: ", version), Some(command)),
-            (format!("docent {} is available · rerun the installer to upgrade", version), None),
-            (format!("docent {} available", version), None),
+            (long.clone(), Some(command), Some(HINT)),
+            (short.clone(), Some(command), Some(HINT)),
+            (long, Some(command), None),
+            (short, Some(command), None),
+            (format!("docent {} is available · rerun the installer to upgrade", version), None, None),
+            (format!("docent {} available", version), None, None),
         ];
-        let size = |(text, command): &(String, Option<&str>)| 2 + text.chars().count() + command.map_or(0, |c| c.chars().count());
-        let (text, command) = wordings.iter().find(|w| size(w) <= width).unwrap_or(&wordings[wordings.len() - 1]).clone();
+        let size = |(text, command, hint): &(String, Option<&str>, Option<&str>)| {
+            // The command's " ⧉" counts with it.
+            2 + text.chars().count() + command.map_or(0, |c| c.chars().count() + 2) + hint.map_or(0, |h| h.chars().count())
+        };
+        let (text, command, hint) = wordings.iter().find(|w| size(w) <= width).unwrap_or(&wordings[wordings.len() - 1]).clone();
         let mut spans = vec![Span::styled("↑ ", Style::new().fg(Color::Yellow)), Span::styled(text, Style::new().fg(Color::Yellow))];
         if let Some(command) = command {
-            spans.push(Span::styled(command, key_style()));
+            let copy = |style: Style| crate::links::action(style, "copy/upgrade");
+            spans.push(Span::styled(command, copy(key_style().add_modifier(Modifier::UNDERLINED))));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("⧉", copy(key_style())));
+            if let Some(hint) = hint {
+                spans.push(Span::styled(hint, copy(dim())));
+            }
         }
         Some(spans)
     }
@@ -9211,6 +9231,39 @@ mod tests {
         assert!(text.contains("docent 9.9.9 is available"), "{}", text);
         let narrow = screen(&app, 30, 24);
         assert!(narrow.contains("docent 9.9.9 available"), "{}", narrow);
+    }
+
+    #[test]
+    fn a_click_on_the_upgrade_command_copies_it() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.apply(AppEvent::Update("9.9.9".into()));
+        let command = crate::update::upgrade_command();
+        let text = screen(&app, 140, 24);
+        assert!(text.contains(&format!("{} ⧉ copy", command)), "{}", text);
+        // Narrower, the icon stays after the command.
+        let narrower = screen(&app, 90, 24);
+        assert!(narrower.contains(&format!("{} ⧉", command)) && !narrower.contains("⧉ copy"), "{}", narrower);
+        // Clicks land on the screen as last drawn.
+        let text = screen(&app, 140, 24);
+        let rows: Vec<&str> = text.lines().collect();
+        let y = rows.iter().position(|r| r.contains(command)).expect(&text);
+        let x = rows[y][..rows[y].find(command).unwrap()].chars().count() as u16 + 3;
+        let mouse = |kind| MouseEvent { kind, column: x, row: y as u16, modifiers: KeyModifiers::NONE };
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.copied.map(|(n, _)| n), Some(command.chars().count()));
+        assert!(app.opened.is_none());
+        // So does a click on the icon, once the flash is gone.
+        app.copied = None;
+        screen(&app, 140, 24);
+        let x = rows[y][..rows[y].find('⧉').unwrap()].chars().count() as u16;
+        let mouse = |kind| MouseEvent { kind, column: x, row: y as u16, modifiers: KeyModifiers::NONE };
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+        app.mouse(mouse(MouseEventKind::Up(MouseButton::Left)));
+        assert_eq!(app.copied.map(|(n, _)| n), Some(command.chars().count()));
+        assert!(app.opened.is_none());
+        assert!(screen(&app, 140, 24).contains(&format!("Copied {} characters", command.chars().count())));
     }
 
     #[test]
