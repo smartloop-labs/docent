@@ -7570,7 +7570,7 @@ mod tests {
         let reply = |app: &mut App, text: &str, calls: Vec<chat::ToolCall>| {
             app.apply(AppEvent::Chat(ChatEvent::Content(text.into())));
             app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let key = |app: &mut App, code: KeyCode| app.key(KeyEvent::new(code, KeyModifiers::NONE));
         let run_of = |app: &App| app.tooling.as_ref().and_then(|t| t.calls.iter().find_map(|c| c.run)).expect("a call runs");
@@ -7690,7 +7690,7 @@ mod tests {
                 calls: Vec::new(),
             });
             app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let last_round = |app: &App| app.tooling.as_ref().unwrap().rounds.last().cloned().unwrap();
 
@@ -7748,7 +7748,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let mut app = app();
         app.phase = Phase::Ready;
@@ -7904,7 +7904,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         turn(&mut app, "Noted.\n\n```remember\nUse pnpm, not npm\n```\n");
         assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
@@ -8223,7 +8223,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8273,7 +8273,7 @@ mod tests {
             whole: Vec::new(),
             calls: Vec::new(),
         });
-        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         // The whole file is written; the one with a comment for lines isn't.
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), old);
         assert_eq!(std::fs::read_to_string(dir.path().join("b.rs")).unwrap(), "fn b() {}\n");
@@ -8680,7 +8680,7 @@ mod tests {
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
-            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
+            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
@@ -10018,7 +10018,7 @@ mod tests {
             model: Some("sl-mini".into()),
             text: "Your documents cover the roadmap.".into(),
             citations: vec!["roadmap.pdf".into()],
-            stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2) }),
+            stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
@@ -10280,7 +10280,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.entries.push(Entry::User("make it bold".into()));
-        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1) };
+        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1), cut_off: false };
         app.entries.push(Entry::Reply(Reply { text, root: Some(dir.path().to_path_buf()), stats: Some(stats), ..Default::default() }));
         let _ = screen(&app, 120, 40);
         // Drawn again with nothing new, it isn't laid out again.

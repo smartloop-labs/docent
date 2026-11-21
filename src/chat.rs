@@ -85,6 +85,9 @@ pub enum ChatEvent {
 pub struct TurnStats {
     pub tokens: u64,
     pub elapsed: Duration,
+    /// It ended on `finish_reason: "length"`: the model's output limit cut
+    /// it off, so it may stop partway through a file or a command.
+    pub cut_off: bool,
 }
 
 impl TurnStats {
@@ -363,6 +366,7 @@ async fn stream_turn_once(
     // though they count in the turn's size.
     let (mut tokens, mut shown): (u64, u64) = (0, 0);
     let mut calls = ToolCalls::default();
+    let mut cut_off = false;
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| (format!("Failed to read stream: {}", e), shown))?;
 
@@ -378,7 +382,8 @@ async fn stream_turn_once(
                     tokens += 1;
                     calls.push(&delta["tool_calls"]);
                 }
-                if event["choices"][0]["finish_reason"].is_string() {
+                if let Some(reason) = finish_reason(&event) {
+                    cut_off = reason == "length";
                     break;
                 }
             }
@@ -404,7 +409,13 @@ async fn stream_turn_once(
         on(ChatEvent::ToolCalls(calls.finish()));
     }
 
-    Ok(TurnStats { tokens, elapsed: started.elapsed() })
+    Ok(TurnStats { tokens, elapsed: started.elapsed(), cut_off })
+}
+
+/// Why the reply a chunk `event` belongs to ended, when it's the last:
+/// `"stop"`, `"tool_calls"`, or `"length"` at the model's output limit.
+fn finish_reason(event: &serde_json::Value) -> Option<&str> {
+    event["choices"][0]["finish_reason"].as_str()
 }
 
 /// The folder a turn of `project_id` works in: its commands run there and
@@ -627,6 +638,14 @@ mod tests {
         // that's another project's.
         assert_eq!(making_dir_in("p2", elsewhere.path(), None), Some(elsewhere.path().to_path_buf()));
         assert_eq!(making_dir_in("p2", folder.path(), None), None);
+    }
+
+    #[test]
+    fn a_chunk_tells_why_the_reply_ended() {
+        assert_eq!(finish_reason(&json!({"choices": [{"delta": {"content": "a"}, "finish_reason": null}]})), None);
+        assert_eq!(finish_reason(&json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})), Some("stop"));
+        assert_eq!(finish_reason(&json!({"choices": [{"delta": {}, "finish_reason": "length"}]})), Some("length"));
+        assert_eq!(finish_reason(&json!({"object": "chat.status"})), None);
     }
 
     #[test]
