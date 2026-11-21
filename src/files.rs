@@ -1596,6 +1596,11 @@ pub fn elides(old: &str, new: &str) -> bool {
 /// the file again.
 pub const ELIDED: &str = "it leaves lines out, a comment standing in for them, so it wasn't written over the file";
 
+/// Why a file a reply was cut off in partway through isn't written, as
+/// told to the agent when it's asked for the change again.
+pub const CUT: &str = "the reply stopped partway through it, at the model's output limit, so it wasn't written; give \
+the change as edit blocks, never the whole file again";
+
 /// Whether a reply's `new` contents of a file hold less than the `old`
 /// file there: not all of it, so not a file to write over it.
 pub fn partial(old: &str, new: &str) -> bool {
