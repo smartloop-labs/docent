@@ -593,7 +593,8 @@ impl Reply {
             // The reply up to this block, as edits and appends are made on
             // the files as they were before it, and on its blocks before.
             let upto: Vec<&str> = self.text.lines().take(block.end).collect();
-            let found = files::extract_with(&upto.join("\n"), |p| self.old(p));
+            // Up to a block done in the whole reply: it ends there.
+            let found = files::extract_with(&upto.join("\n"), true, |p| self.old(p));
             let Some(file) = found.files.into_iter().find(|f| f.path == block.file.path) else { continue };
             // Read as it was before it's written over: the reply's diffs and
             // its report are against that.
@@ -2498,21 +2499,38 @@ impl App {
     /// A reply's files `found` and `commands`, in `root`: written and
     /// checked, as a coding harness writes its edits, then the commands
     /// asked about.
-    fn reply_done(&mut self, root: std::path::PathBuf, found: files::Extracted, mut whole: Vec<String>, commands: Vec<String>) {
+    fn reply_done(
+        &mut self,
+        root: std::path::PathBuf,
+        mut found: files::Extracted,
+        mut whole: Vec<String>,
+        commands: Vec<String>,
+        cut_off: bool,
+    ) {
+        if cut_off {
+            self.entries.push(Entry::Warning(
+                "The reply stopped at the model's output limit, so it may be incomplete".to_string(),
+            ));
+        }
+        // Cut off partway through a file, the reply leaves it as it is. One
+        // there already is asked for again as edit blocks, as a failed edit
+        // is: given whole, it would likely be cut off again. A new one can't
+        // be given as edits, so it's only said.
+        let (there, new): (Vec<String>, Vec<String>) = std::mem::take(&mut found.cut).into_iter().partition(|p| root.join(p).is_file());
+        found.failed.extend(there.into_iter().map(|p| (p, files::CUT.to_string())));
+        if !new.is_empty() {
+            self.entries.push(Entry::Warning(format!(
+                "Not written, as the reply stopped partway through: {}; ask again, for less at a time",
+                new.join(", ")
+            )));
+        }
         // Asked to make something in an empty folder, a small model may say
         // what it made without giving the files: asked once more for them.
         // One calling tools may only be looking around first.
         let calling = self.tooling.as_ref().is_some_and(|t| !t.calls.is_empty());
-        if found.files.is_empty() && found.failed.is_empty() && !calling && !self.files_asked && files::is_empty_folder(&root) {
+        if found.files.is_empty() && found.failed.is_empty() && new.is_empty() && !calling && !self.files_asked && files::is_empty_folder(&root) {
             self.files_asked = true;
             return self.ask_for_files();
-        }
-        // Cut off partway through a file, the reply leaves it as it is.
-        if !found.cut.is_empty() {
-            self.entries.push(Entry::Warning(format!(
-                "Not written, as the reply stopped partway through: {}; ask again, for less at a time",
-                found.cut.join(", ")
-            )));
         }
         // An edited file is the file there with the edits made: all of it.
         whole.extend(found.edited);
@@ -2992,7 +3010,7 @@ impl App {
                                 }
                                 // The files as they were before the reply,
                                 // some of its own being written already.
-                                let found = files::extract_with(&reply.text, |p| reply.old(p));
+                                let found = files::extract_with(&reply.text, !stats.cut_off, |p| reply.old(p));
                                 let mut commands = files::commands(&reply.text);
                                 // A reply that called tools runs those: its
                                 // fenced commands, if any, only illustrate.
@@ -3023,7 +3041,7 @@ impl App {
                                     Ok(added) => self.entries.push(Entry::Notice(format!("Remembered: {}", added.join("; ")))),
                                     Err(e) => self.entries.push(Entry::Error(format!("Couldn't save to {}: {}", files::MEMORY, e))),
                                 }
-                                self.reply_done(root, found, turn.whole, commands);
+                                self.reply_done(root, found, turn.whole, commands, stats.cut_off);
                                 self.tool_round_done();
                             } else if !turn.calls.is_empty()
                                 && let Some(tooling) = &mut self.tooling
@@ -7570,7 +7588,7 @@ mod tests {
         let reply = |app: &mut App, text: &str, calls: Vec<chat::ToolCall>| {
             app.apply(AppEvent::Chat(ChatEvent::Content(text.into())));
             app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let key = |app: &mut App, code: KeyCode| app.key(KeyEvent::new(code, KeyModifiers::NONE));
         let run_of = |app: &App| app.tooling.as_ref().and_then(|t| t.calls.iter().find_map(|c| c.run)).expect("a call runs");
@@ -7690,7 +7708,7 @@ mod tests {
                 calls: Vec::new(),
             });
             app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let last_round = |app: &App| app.tooling.as_ref().unwrap().rounds.last().cloned().unwrap();
 
@@ -7748,7 +7766,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let mut app = app();
         app.phase = Phase::Ready;
@@ -7904,7 +7922,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         turn(&mut app, "Noted.\n\n```remember\nUse pnpm, not npm\n```\n");
         assert_eq!(files::memory(dir.path()), ["Use pnpm, not npm"]);
@@ -8223,7 +8241,7 @@ mod tests {
                 whole: Vec::new(),
                 calls: Vec::new(),
             });
-            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         };
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8250,6 +8268,53 @@ mod tests {
     }
 
     #[test]
+    fn a_file_cut_off_at_the_output_limit_is_asked_for_again_as_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        std::fs::write(dir.path().join("a.rs"), old).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        app.always_run = true;
+        // The whole file, stopped mid-line, as at the model's output limit;
+        // a new file after it, cut off too. The agent was shown a.rs whole.
+        let reply = "I'll give the whole file.\n\n`a.rs`\n```rust\nfn a() { 1 }\nfn b";
+        app.entries.push(Entry::Reply(Reply { text: reply.into(), ..Default::default() }));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: Some(dir.path().to_path_buf()),
+            whole: vec!["a.rs".into()],
+            calls: Vec::new(),
+        });
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: true })));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), old);
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("The reply stopped at the model's output limit"))));
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not changed, a.rs: the reply stopped partway through it"))));
+        // Asked for again, as edit blocks.
+        assert_eq!(app.edit_round, 1);
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::User(u) if u == "Redo the edits to a.rs")));
+        app.stop_turn();
+    }
+
+    #[test]
+    fn a_new_file_cut_off_is_only_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        let found = files::Extracted { cut: vec!["new.rs".into()], ..Default::default() };
+        app.reply_done(dir.path().into(), found, Vec::new(), Vec::new(), true);
+        assert!(!dir.path().join("new.rs").exists());
+        assert!(app.entries.iter().any(|e| matches!(e, Entry::Warning(w) if w.starts_with("Not written, as the reply stopped partway through: new.rs"))));
+        assert_eq!(app.edit_round, 0);
+    }
+
+    #[test]
     fn a_file_given_with_lines_left_out_is_asked_for_again() {
         let dir = tempfile::tempdir().unwrap();
         let old = "fn a() {}\nfn b() {}\nfn c() {}\n";
@@ -8273,7 +8338,7 @@ mod tests {
             whole: Vec::new(),
             calls: Vec::new(),
         });
-        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1) })));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
         // The whole file is written; the one with a comment for lines isn't.
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), old);
         assert_eq!(std::fs::read_to_string(dir.path().join("b.rs")).unwrap(), "fn b() {}\n");
@@ -8434,12 +8499,12 @@ mod tests {
         let asked = |app: &App| {
             app.entries.iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("No files came with that reply"))).count()
         };
-        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()]);
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()], false);
         assert_eq!(asked(&app), 1);
         // The reply's commands wait for the files rather than run alone.
         assert!(app.commands.is_none() && app.ask.is_none());
         // Still none: asked once only, and its commands go ahead.
-        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()]);
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["which cargo".into()], false);
         assert_eq!(asked(&app), 1);
         assert!(app.ask.is_some());
     }
@@ -8454,12 +8519,12 @@ mod tests {
             app.entries.iter().filter(|e| matches!(e, Entry::Notice(n) if n.starts_with("No Cargo.toml came"))).count()
         };
         let main = files::Extracted { files: vec![file("main.rs", "fn main() {}\n")], ..Default::default() };
-        app.reply_done(dir.path().into(), main, Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), main, Vec::new(), Vec::new(), false);
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "fn main() {}\n");
         assert_eq!(asked(&app), 1);
         // Asked once: a second reply without it isn't asked about again.
         let again = files::Extracted { files: vec![file("src/main.rs", "fn main() {}\n")], ..Default::default() };
-        app.reply_done(dir.path().into(), again, Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), again, Vec::new(), Vec::new(), false);
         assert_eq!(asked(&app), 1);
     }
 
@@ -8469,7 +8534,7 @@ mod tests {
         std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
         let mut app = app();
         app.phase = Phase::Ready;
-        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new(), false);
         assert!(!app.entries.iter().any(|e| matches!(e, Entry::Notice(n) if n.starts_with("No files came"))));
     }
 
@@ -8482,11 +8547,11 @@ mod tests {
         app.fix_round = 1;
         let said = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Warning(w) if w.starts_with("The fix changed no file"))).count();
         // Its command, `git checkout` say, may yet change them.
-        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["git checkout -- notes.md".into()]);
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), vec!["git checkout -- notes.md".into()], false);
         assert_eq!(said(&app), 0);
         assert!(app.ask.is_some());
         app.ask = None;
-        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new());
+        app.reply_done(dir.path().into(), files::Extracted::default(), Vec::new(), Vec::new(), false);
         assert_eq!(said(&app), 1);
     }
 
@@ -8503,6 +8568,7 @@ mod tests {
             files::Extracted { files: vec![file("main.rs", "new\n"), file("a.rs", "a\n")], ..Default::default() },
             Vec::new(),
             vec!["git add -A".into()],
+            false,
         );
         assert_eq!(std::fs::read_to_string(dir.path().join("main.rs")).unwrap(), "new\n");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "a\n");
@@ -8680,7 +8746,7 @@ mod tests {
                    Signature blocks are left blank for both parties."
                 .into(),
             citations: vec!["mutual-nda-template.docx".into()],
-            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14) }),
+            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
@@ -10018,7 +10084,7 @@ mod tests {
             model: Some("sl-mini".into()),
             text: "Your documents cover the roadmap.".into(),
             citations: vec!["roadmap.pdf".into()],
-            stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2) }),
+            stats: Some(TurnStats { tokens: 12, elapsed: Duration::from_secs(2), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
@@ -10280,7 +10346,7 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.entries.push(Entry::User("make it bold".into()));
-        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1) };
+        let stats = TurnStats { tokens: 10, elapsed: Duration::from_secs(1), cut_off: false };
         app.entries.push(Entry::Reply(Reply { text, root: Some(dir.path().to_path_buf()), stats: Some(stats), ..Default::default() }));
         let _ = screen(&app, 120, 40);
         // Drawn again with nothing new, it isn't laid out again.
