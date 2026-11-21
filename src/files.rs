@@ -737,7 +737,7 @@ pub struct Extracted {
 /// `extract_in` for the file it adds to.
 #[cfg(test)]
 pub fn extract(reply: &str) -> Vec<File> {
-    gather(reply, |_| None).files
+    gather(reply, true, |_| None).files
 }
 
 /// `extract` for a reply about the folder `root`: a heredoc written with
@@ -745,19 +745,20 @@ pub fn extract(reply: &str) -> Vec<File> {
 /// an edit block changes it, or what the reply gave of it before.
 #[cfg(test)]
 pub fn extract_in(root: &Path, reply: &str) -> Extracted {
-    gather(reply, |path| fs::read_to_string(root.join(path)).ok())
+    gather(reply, true, |path| fs::read_to_string(root.join(path)).ok())
 }
 
 /// `extract` for a reply about files as `before` gives them, by path, as
-/// they were before any of its files were written.
-pub fn extract_with(reply: &str, before: impl Fn(&str) -> Option<String>) -> Extracted {
-    gather(reply, before)
+/// they were before any of its files were written; `ended` as `blocks_of`
+/// has it.
+pub fn extract_with(reply: &str, ended: bool, before: impl Fn(&str) -> Option<String>) -> Extracted {
+    gather(reply, ended, before)
 }
 
-fn gather(reply: &str, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
+fn gather(reply: &str, ended: bool, on_disk: impl Fn(&str) -> Option<String>) -> Extracted {
     let mut files: Vec<File> = Vec::new();
     let (mut edited, mut failed, mut cut) = (Vec::new(), Vec::new(), Vec::new());
-    for block in blocks(reply) {
+    for block in blocks_of(reply, ended) {
         // Never closed, the reply stopped partway through it: written, the
         // file would lose all it didn't get to.
         if !block.closed {
@@ -1037,8 +1038,16 @@ fn splice(lines: &[&str], from: usize, to: usize, replace: &str) -> String {
     out
 }
 
-/// Every block of `reply` that gives a file, in order, with its lines.
+/// Every block of `reply` that gives a file, in order, with its lines,
+/// as it stands while it's still coming in: see `blocks_of`.
 pub fn blocks(reply: &str) -> Vec<Block> {
+    blocks_of(reply, false)
+}
+
+/// `blocks` for a reply that has `ended`: all of it came, not cut off at
+/// the model's output limit. A block indented rather than fenced has no
+/// line of its own to end it, so one it ends in is done only then.
+fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
     let lines: Vec<&str> = reply.lines().collect();
     let mut blocks: Vec<Block> = Vec::new();
     let mut above: Option<(usize, &str)> = None;
@@ -1066,12 +1075,15 @@ pub fn blocks(reply: &str) -> Vec<Block> {
             }
             // A path on a line of its own, then a block indented by four
             // spaces rather than fenced, as markdown also has it, is that
-            // file too.
+            // file too. It has ended once a line that isn't indented comes
+            // after it, or the reply has; running to the end of a reply
+            // still coming in, or cut off, more of it may be missing.
             if let Some(path) = label_path(line).or_else(|| file_label(line))
                 && let Some((content, next)) = indented_block(&lines, i)
             {
                 let fence = (i..next).find(|k| !lines[*k].trim().is_empty()).unwrap_or(i);
-                blocks.push(Block { file: File { path, content }, fence, end: next, append: false, closed: true, edit: None });
+                let closed = next < lines.len() || ended;
+                blocks.push(Block { file: File { path, content }, fence, end: next, append: false, closed, edit: None });
                 i = next;
                 above = None;
                 continue;
@@ -2120,8 +2132,16 @@ mod tests {
         // A path line with prose after it names nothing.
         assert!(extract("File: a.rs\nnot code\n    nor this\n").is_empty());
         // A fence left open is the reply cut off in it: not taken.
-        let open = extract_with("`a.rs`\n```rust\nfn f() {}\n", |_| None);
+        let open = extract_with("`a.rs`\n```rust\nfn f() {}\n", true, |_| None);
         assert!(open.files.is_empty() && open.cut == ["a.rs"], "{:?}", open.cut);
+        // So is an indented block a cut-off reply ends in, or one still
+        // coming in: nothing after it shows it ended.
+        let cut = "File: a.rs\n\n    fn f() {}\n    fn g";
+        let open = extract_with(cut, false, |_| None);
+        assert!(open.files.is_empty() && open.cut == ["a.rs"], "{:?}", open.cut);
+        assert!(!blocks(cut)[0].closed);
+        // All of the reply come, it ended there.
+        assert_eq!(extract_with(cut, true, |_| None).files[0].content, "fn f() {}\nfn g\n");
     }
 
     #[test]
@@ -2470,7 +2490,7 @@ mod tests {
     fn an_edit_with_explores_line_numbers_still_applies() {
         let file = "let a = 1;\nlet b = 2;\n\nlet c = 3;\n";
         let numbered = "```edit app.js\n<<<<<<< SEARCH\n    2  let b = 2;\n\n    4  let c = 3;\n=======\n    2  let b = 20;\n\n    4  let c = 3;\n>>>>>>> REPLACE\n```\n";
-        let found = extract_with(numbered, |_| Some(file.into()));
+        let found = extract_with(numbered, true, |_| Some(file.into()));
         assert!(found.failed.is_empty(), "{:?}", found.failed);
         assert_eq!(found.files[0].content, "let a = 1;\nlet b = 20;\n\nlet c = 3;\n");
         // Code that only starts with a number is left as it is.
@@ -2479,7 +2499,7 @@ mod tests {
         // The example the agent is shown applies.
         let example = EDIT_EXAMPLE.split_once("\n\n").unwrap().1;
         let app = "const speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\n";
-        let done = extract_with(example, |_| Some(app.into()));
+        let done = extract_with(example, true, |_| Some(app.into()));
         assert_eq!(done.files[0].content, app.replace("speed = 3", "speed = 5"));
     }
 
@@ -2497,12 +2517,12 @@ mod tests {
     fn a_file_the_reply_was_cut_off_in_isnt_taken() {
         // At the token limit, partway through the second file.
         let reply = "```sh\ncat > a.txt <<'EOF'\nwhole\nEOF\n```\n\n```sh\ncat > index.html <<'EOF'\n<html>\n<script>\nctx";
-        let found = extract_with(reply, |_| None);
+        let found = extract_with(reply, true, |_| None);
         assert_eq!(found.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["a.txt"]);
         assert_eq!(found.cut, ["index.html"]);
         // An edit cut off is left too, not half made.
         let edit = "```edit app.js\n<<<<<<< SEARCH\nold\n=======\nne";
-        let found = extract_with(edit, |_| Some("old\n".into()));
+        let found = extract_with(edit, true, |_| Some("old\n".into()));
         assert!(found.files.is_empty() && found.cut == ["app.js"], "{:?}", found.cut);
     }
 
@@ -2517,7 +2537,7 @@ mod tests {
     fn a_fence_inside_an_edit_is_the_files() {
         let readme = "# App\n\n```sh\nnpm start\n```\n";
         let reply = "```edit README.md\n<<<<<<< SEARCH\n```sh\nnpm start\n```\n=======\n```sh\nnpm run dev\n```\n>>>>>>> REPLACE\n```\n\nDone.\n";
-        let got = extract_with(reply, |_| Some(readme.to_string()));
+        let got = extract_with(reply, true, |_| Some(readme.to_string()));
         assert!(got.failed.is_empty(), "{:?}", got.failed);
         assert_eq!(got.files[0].content, "# App\n\n```sh\nnpm run dev\n```\n");
         assert!(blocks(reply)[0].closed);
@@ -2531,7 +2551,7 @@ mod tests {
     fn an_edit_block_opened_with_four_backticks_holds_three() {
         let readme = "# App\n\n```sh\nnpm start\n```\n";
         let reply = "````edit README.md\n<<<<<<< SEARCH\n```sh\nnpm start\n```\n=======\n```sh\nnpm run dev\n```\n>>>>>>> REPLACE\n````\n";
-        let got = extract_with(reply, |_| Some(readme.to_string()));
+        let got = extract_with(reply, true, |_| Some(readme.to_string()));
         assert!(got.failed.is_empty(), "{:?}", got.failed);
         assert_eq!(got.files[0].content, "# App\n\n```sh\nnpm run dev\n```\n");
     }
@@ -2541,13 +2561,13 @@ mod tests {
         // Underlined with seven: the split whose search is in the file.
         let readme = "Docent\n=======\n\nOld intro.\n";
         let reply = "```edit README.md\n<<<<<<< SEARCH\nDocent\n=======\n\nOld intro.\n=======\nDocent\n=======\n\nNew intro.\n>>>>>>> REPLACE\n```\n";
-        let got = extract_with(reply, |_| Some(readme.to_string()));
+        let got = extract_with(reply, true, |_| Some(readme.to_string()));
         assert!(got.failed.is_empty(), "{:?}", got.failed);
         assert_eq!(got.files[0].content, "Docent\n=======\n\nNew intro.\n");
         // Underlined with more than seven: never a divider.
         let readme = "Smartloop\n=========\n\nOld.\n";
         let reply = "```edit README.md\n<<<<<<< SEARCH\nSmartloop\n=========\n\nOld.\n=======\nSmartloop\n=========\n\nNew.\n>>>>>>> REPLACE\n```\n";
-        let got = extract_with(reply, |_| Some(readme.to_string()));
+        let got = extract_with(reply, true, |_| Some(readme.to_string()));
         assert!(got.failed.is_empty(), "{:?}", got.failed);
         assert_eq!(got.files[0].content, "Smartloop\n=========\n\nNew.\n");
     }

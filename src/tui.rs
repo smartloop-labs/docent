@@ -593,7 +593,8 @@ impl Reply {
             // The reply up to this block, as edits and appends are made on
             // the files as they were before it, and on its blocks before.
             let upto: Vec<&str> = self.text.lines().take(block.end).collect();
-            let found = files::extract_with(&upto.join("\n"), |p| self.old(p));
+            // Up to a block done in the whole reply: it ends there.
+            let found = files::extract_with(&upto.join("\n"), true, |p| self.old(p));
             let Some(file) = found.files.into_iter().find(|f| f.path == block.file.path) else { continue };
             // Read as it was before it's written over: the reply's diffs and
             // its report are against that.
@@ -2992,7 +2993,7 @@ impl App {
                                 }
                                 // The files as they were before the reply,
                                 // some of its own being written already.
-                                let found = files::extract_with(&reply.text, |p| reply.old(p));
+                                let found = files::extract_with(&reply.text, !stats.cut_off, |p| reply.old(p));
                                 let mut commands = files::commands(&reply.text);
                                 // A reply that called tools runs those: its
                                 // fenced commands, if any, only illustrate.
