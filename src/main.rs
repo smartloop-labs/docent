@@ -20,6 +20,7 @@ mod mcp;
 mod prerun;
 mod progress;
 mod skills;
+mod summary;
 mod tui;
 mod update;
 mod usage;

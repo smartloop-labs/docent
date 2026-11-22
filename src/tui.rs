@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills};
+use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills, summary};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -893,6 +893,11 @@ fn segments(text: &str) -> Vec<(bool, String, usize)> {
     out
 }
 
+/// A reply's prose, its code blocks and files left out.
+fn prose_of(text: &str) -> String {
+    segments(text).into_iter().filter(|(code, ..)| !code).map(|(_, prose, _)| prose).collect::<Vec<_>>().join("\n")
+}
+
 /// `markdown` laid out at `width`, links and bare web addresses clickable.
 fn prose_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let options = tui_markdown::Options::new(Markdown).table_width(width).table_row_dividers(true);
@@ -1590,6 +1595,9 @@ struct App {
     /// The last turn's tool calling, when it works in a folder of the
     /// user's.
     tooling: Option<Tooling>,
+    /// What the user's last prompt has done so far, across its tool and
+    /// fix rounds, summarized once it settles.
+    task: Option<summary::TaskRecord>,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
@@ -1693,6 +1701,7 @@ impl App {
             ask: None,
             always_run: false,
             tooling: None,
+            task: None,
             command_round: 0,
             look_up: false,
             pre_run: None,
@@ -2221,6 +2230,9 @@ impl App {
         for (path, created, added, removed) in reported {
             let what = if created { "created" } else { "updated" };
             self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, path, added, removed)));
+            if let Some(task) = &mut self.task {
+                task.file(path, created, added, removed);
+            }
         }
         for e in &early {
             if !written.contains(&e.path) {
@@ -2455,6 +2467,9 @@ impl App {
             AfterCheck::Fix(_) if check.tests && self.test_round >= TEST_ROUNDS => AfterCheck::OutOfRounds,
             outcome => outcome,
         };
+        if let Some(task) = &mut self.task {
+            task.check(&check.command, outcome == AfterCheck::Passed);
+        }
         match outcome {
             AfterCheck::Passed => {
                 let fixed = if self.fix_round > 0 { format!(" after {} fix(es)", self.fix_round) } else { String::new() };
@@ -2803,6 +2818,12 @@ impl App {
     /// with other commands or with files, for a few rounds only. Done, it
     /// isn't asked anything: what was printed rides with the next prompt.
     fn ran(&mut self, id: usize, project: String, output: String, ended: Option<Ended>) {
+        if let Some(ended) = ended
+            && let Some(command) = self.shell_of(id).map(|s| s.command.clone())
+            && let Some(task) = &mut self.task
+        {
+            task.command(&command, ended.code(), &strip_ansi(&output));
+        }
         if self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.run == Some(id))) {
             return self.tool_ran(id, project, output, ended);
         }
@@ -2939,6 +2960,7 @@ impl App {
     fn stop_turn(&mut self) {
         self.commands = None;
         self.tooling = None;
+        self.task = None;
         if self.pre_run.take().is_some() {
             self.entries.push(Entry::Notice("Stopped reading the API; the prompt wasn't sent".to_string()));
         }
@@ -3016,6 +3038,9 @@ impl App {
                     match result {
                         Ok(stats) => {
                             reply.stats = Some(stats);
+                            if let Some(task) = &mut self.task {
+                                task.reply(&prose_of(&reply.text));
+                            }
                             if let Some(root) = turn.files_dir {
                                 if reply.root.is_none() {
                                     reply.root = Some(root.clone());
@@ -4401,6 +4426,7 @@ impl App {
         self.failures.clear();
         self.look_up = true;
         self.reference = None;
+        self.task = Some(summary::TaskRecord::new(&input));
         self.send_turn(input, message, files, making);
     }
 
