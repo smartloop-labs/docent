@@ -206,7 +206,7 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 
 | Command | Does |
 | --- | --- |
-| `/login`, `/logout` | sign in in the browser (`--device` for a code to enter on any device, `--token` to paste one; over SSH `/login` uses a code) |
+| `/login`, `/logout` | sign in with a code you confirm in any browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
 | `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `text,vision,reasoning`; `auto` goes back to the catalog's |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |

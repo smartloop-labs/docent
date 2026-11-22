@@ -1573,6 +1573,9 @@ struct App {
     /// The project's enabled models, once read; empty asks for one on the
     /// card.
     enabled_models: Option<Vec<String>>,
+    /// Models' display names by code name, from the last list read, for
+    /// showing "Qwen3.5 4B" where the agent says `qwen3.5-4b`.
+    model_labels: std::collections::HashMap<String, String>,
     /// What the check said each time it failed this turn, to tell a round
     /// that brought back errors already seen.
     failures: Vec<String>,
@@ -1685,6 +1688,7 @@ impl App {
             early: Vec::new(),
             window: None,
             enabled_models: None,
+            model_labels: std::collections::HashMap::new(),
             commands: None,
             ask: None,
             always_run: false,
@@ -1855,20 +1859,29 @@ impl App {
         });
     }
 
+    /// How to show the model the agent calls `name`: its display name once
+    /// the list has been read, else `name` as it is.
+    fn model_label(&self, name: &str) -> String {
+        self.model_labels.get(name).cloned().unwrap_or_else(|| name.to_string())
+    }
+
     /// Download `name` and enable it, or with `cloud`, run it in the cloud
     /// instead.
     fn enable_model(&mut self, name: String, cloud: bool) {
         let Some((project, _)) = self.project.clone() else { return };
+        let label = self.model_label(&name);
         if self.downloads.iter().any(|d| d.model == name && !d.finished) {
             return;
         }
         let id = self.downloads.len();
         self.downloads.push(Download { model: name.clone(), list: StepList::new(), finished: false, cancelling: false });
+        // Said in the conversation; its progress is in /models.
+        self.entries.push(Entry::Notice(if cloud { format!("Enabling {} in the cloud", label) } else { format!("Downloading {}", label) }));
         self.spawn(move |client, tx| {
             let mut list = Remote::new(tx.clone(), move |e| AppEvent::Download(id, e));
             crate::enable_steps(&mut list, &client, &project, &name, cloud);
             let _ = tx.send(AppEvent::DownloadDone(id));
-            let _ = tx.send(AppEvent::Notice(format!("Model {} enabled", name)));
+            let _ = tx.send(AppEvent::Notice(format!("{} enabled", label)));
         });
     }
 
@@ -1881,11 +1894,12 @@ impl App {
             return;
         }
         download.cancelling = true;
+        let label = self.model_label(&name);
         self.spawn(move |client, tx| {
             let event = match crate::cancel_download(&client, &name) {
                 Ok(true) => return,
                 // Nothing running: it finished before the cancel landed.
-                Ok(false) => AppEvent::Notice(format!("{} had already finished downloading", name)),
+                Ok(false) => AppEvent::Notice(format!("{} had already finished downloading", label)),
                 Err(e) => AppEvent::Error(e),
             };
             let _ = tx.send(event);
@@ -1894,9 +1908,10 @@ impl App {
 
     fn disable_model(&mut self, name: String) {
         let Some((project, _)) = self.project.clone() else { return };
+        let label = self.model_label(&name);
         self.spawn(move |client, tx| {
             let event = match crate::patch_project_model(&client, &project, &name, false) {
-                Ok(()) => AppEvent::Notice(format!("Model {} disabled", name)),
+                Ok(()) => AppEvent::Notice(format!("{} disabled", label)),
                 Err(e) => AppEvent::Error(e),
             };
             let _ = tx.send(event);
@@ -2960,18 +2975,15 @@ impl App {
             AppEvent::Models(result) => {
                 if let Ok(list) = &result {
                     self.window = list.iter().filter(|m| m.enabled).filter_map(|m| m.context).max();
-                    self.enabled_models = Some(list.iter().filter(|m| m.enabled).map(|m| m.name.clone()).collect());
+                    self.model_labels.extend(
+                        list.iter().filter(|m| !m.display_name.is_empty()).map(|m| (m.name.clone(), m.display_name.clone())),
+                    );
+                    self.enabled_models = Some(list.iter().filter(|m| m.enabled).map(|m| m.label().to_string()).collect());
                     if !std::mem::replace(&mut self.models_checked, true)
                         && let Some(nudge) = model_nudge(list)
                     {
+                        // Only said: the user opens /models and picks.
                         self.entries.push(Entry::Warning(nudge));
-                        // Opened for them, unless another panel is up, with
-                        // the recommended model selected.
-                        if matches!(self.overlay, Overlay::None) {
-                            let pick = recommended_pick(list).map(|m| m.name.clone());
-                            let at = pick.and_then(|name| panel_models(list.clone()).iter().position(|m| m.name == name));
-                            self.overlay = Overlay::Models { rows: None, selected: at.unwrap_or(0) };
-                        }
                     }
                 }
                 if let Overlay::Models { rows, selected } = &mut self.overlay {
@@ -3065,7 +3077,7 @@ impl App {
                 self.load_usage();
             }
             AppEvent::Download(id, StepEvent::Warn(text)) => {
-                let model = self.downloads[id].model.clone();
+                let model = self.model_label(&self.downloads[id].model);
                 self.entries.push(Entry::Warning(format!("{}: {}", model, text)));
             }
             AppEvent::Download(id, event) => {
@@ -3380,7 +3392,8 @@ impl App {
                 if step == "model"
                     && let Some(name) = selected_model(&message)
                 {
-                    reply.model = Some(name);
+                    // Fields, not model_label(): turn and reply hold self.
+                    reply.model = Some(self.model_labels.get(&name).cloned().unwrap_or(name));
                 }
                 if step == "streaming" {
                     // The agent's "Generating response" says nothing a
@@ -3610,10 +3623,11 @@ impl App {
         }
         let reload = matches!(self.overlay, Overlay::Models { .. });
         let project = self.project.clone();
+        let label = self.model_label(&name);
         self.spawn(move |client, tx| {
             let _ = tx.send(match crate::set_model_thinking(&client, &name, on) {
-                Ok(true) => AppEvent::Notice(format!("{} reasoning on: it thinks before it answers", name)),
-                Ok(false) => AppEvent::Notice(format!("{} reasoning off: it answers without thinking first, sooner", name)),
+                Ok(true) => AppEvent::Notice(format!("{} reasoning on: it thinks before it answers", label)),
+                Ok(false) => AppEvent::Notice(format!("{} reasoning off: it answers without thinking first, sooner", label)),
                 Err(e) => AppEvent::Error(e),
             });
             if reload && let Some((id, _)) = project {
@@ -4263,9 +4277,7 @@ impl App {
         let command = words.next().unwrap_or_default();
         match command {
             "/login" => match words.next() {
-                None if crate::prefers_device_login() => self.device_login(),
-                None => self.browser_login(),
-                Some("--device") => self.device_login(),
+                None | Some("--device") => self.device_login(),
                 Some("--token") => self.token_entry = true,
                 Some(token) => self.login(token.to_string()),
             },
@@ -4441,28 +4453,8 @@ impl App {
     }
 
 
-    /// Sign in on app.smartloop.ai in the browser, then refresh the models
-    /// panel as a token sign-in does.
-    fn browser_login(&mut self) {
-        let project = self.project.clone();
-        self.spawn(move |client, tx| {
-            let notify = tx.clone();
-            let result = crate::browser_login(&client, |url| {
-                let _ = notify.send(AppEvent::Notice(format!("Sign in in the browser: {}", url)));
-            });
-            let _ = tx.send(match result {
-                Ok(who) => AppEvent::Notice(who),
-                Err(e) => AppEvent::Error(e),
-            });
-            refresh_models(&client, &tx, project);
-            send_usage(&client, &tx);
-            let _ = tx.send(AppEvent::Account(crate::account(&client)));
-        });
-    }
-
-    /// Sign in with a code entered on any device's browser, for when none
-    /// here can (over SSH, or an agent elsewhere); then refresh as a token
-    /// sign-in does.
+    /// Sign in with a code entered on any device's browser, then refresh as
+    /// a token sign-in does.
     fn device_login(&mut self) {
         let project = self.project.clone();
         self.spawn(move |client, tx| {
@@ -4500,37 +4492,29 @@ impl App {
                 };
                 let row = row.clone();
                 let signed_out = self.account == Some(None);
-                if row.enabled && !(signed_out && row.cloud) {
-                    // Always allowed, even for a model the plan no longer covers.
-                    self.disable_model(row.name);
-                } else if locked(&row, signed_out) {
-                    self.entries.push(Entry::Error(if self.search.is_some() {
-                        format!("{} needs the pro plan; /upgrade to use it", row.name)
+                match enter_action(&row, signed_out) {
+                    EnterAction::Disable => self.disable_model(row.name),
+                    EnterAction::Locked => self.entries.push(Entry::Error(if self.search.is_some() {
+                        format!("{} needs the pro plan; /upgrade to use it", row.label())
                     } else {
-                        format!("{} needs a sign-in; /login first", row.name)
-                    }));
-                } else if row.cloud_copy || cloud_instead(&row) {
-                    // The cloud copy, not a download.
-                    self.enable_model(row.name, true);
-                } else if needs_download(&row) {
+                        format!("{} needs a sign-in; /login first", row.label())
+                    })),
+                    EnterAction::Enable(cloud) => self.enable_model(row.name, cloud),
                     // Enter never downloads: a model is fetched only when
                     // asked for with ctrl+d.
-                    if !self.downloads.iter().any(|d| d.model == row.name && !d.finished) {
-                        self.entries.push(Entry::Notice(format!("{} isn't downloaded; ctrl+d downloads it", row.name)));
+                    EnterAction::NeedsDownload => {
+                        if !self.downloads.iter().any(|d| d.model == row.name && !d.finished) {
+                            self.entries.push(Entry::Notice(format!("{} isn't downloaded; ctrl+d downloads it", row.label())));
+                        }
                     }
-                } else {
-                    self.enable_model(row.name, false);
                 }
             }
             KeyCode::Char('d') if ctrl => {
-                // Download the local copy (and enable it).  Only a model
-                // with one, not yet downloaded.
-                // One too big for this machine with a cloud copy isn't
-                // offered as a download: Enter runs it in the cloud.
+                // Download the local copy (and enable it). One too big for
+                // this machine with a cloud copy isn't offered as a
+                // download: Enter runs it in the cloud.
                 if let Some(row) = rows.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.get(*selected)).cloned()
-                    && downloadable(&row)
-                    && row.accessible
-                    && !cloud_instead(&row)
+                    && can_download(&row)
                 {
                     self.enable_model(row.name, false);
                 }
@@ -4627,7 +4611,7 @@ impl App {
         let hints = self.hint_lines(frame.area().width as usize);
         let room = frame.area().height.saturating_sub(12);
         // The commands still running are listed over the key hints.
-        let under = match self.panel_height() {
+        let under = match self.panel_height(frame.area().width) {
             Some(height) => height.min(room),
             None if hints.is_empty() => (1 + self.jobs.len().min(room as usize)) as u16,
             None => hints.len().max(1) as u16,
@@ -4704,10 +4688,15 @@ impl App {
     }
 
     /// Rows an open panel needs under the prompt, border included.
-    fn panel_height(&self) -> Option<u16> {
+    fn panel_height(&self, width: u16) -> Option<u16> {
         let rows = match &self.overlay {
             Overlay::None => return None,
-            Overlay::Models { rows: Some(Ok(list)), .. } => list.len(),
+            // The header, then each model's row, on as many lines as it
+            // takes (the panel's left padding off the width).
+            Overlay::Models { rows: Some(Ok(list)), selected } => {
+                let inner = (width as usize).saturating_sub(1);
+                1 + self.model_table(list, *selected, inner).1.len() + model_key(inner).len()
+            }
             Overlay::Models { .. } => 1,
             Overlay::Mcp { rows: Some(Ok(list)), .. } => list.len().max(1),
             Overlay::Mcp { .. } => 1,
@@ -4770,18 +4759,6 @@ impl App {
                 lines.push(working(what, detail));
             }
             _ => {}
-        }
-        for d in self.downloads.iter().filter(|d| !d.finished) {
-            let mut spans = vec![
-                Span::styled("↓ ", dim()),
-                Span::raw(format!("{} ", d.model)),
-            ];
-            match d.list.active() {
-                Some(StepRow { bytes: Some((done, total)), .. }) => spans.extend(bar_spans(*done, *total, 20)),
-                Some(step) => spans.push(Span::styled(format!("{}…", step.label), dim())),
-                None => spans.push(Span::styled("starting…", dim())),
-            }
-            lines.push(Line::from(spans));
         }
         lines
     }
@@ -5430,13 +5407,177 @@ impl App {
 
     /// The project's models as a list, like Claude Code's model picker:
     /// the selected one marked, each with its state and what it can do.
+    /// The models panel's table for `width` columns: its header, the rows'
+    /// lines, and the first and last line of the `selected` model's row. A
+    /// row has the name (☁ when it can run in the cloud), size, state, what
+    /// it can do and a note; one too wide breaks its capabilities and note
+    /// onto more lines, under the capabilities.
+    fn model_table(&self, list: &[ModelRow], selected: usize, width: usize) -> (Line<'static>, Vec<Line<'static>>, (usize, usize)) {
+        let signed_out = self.account == Some(None);
+        // A column kept free for the scrollbar.
+        let avail = width.saturating_sub(1);
+        let parts: Vec<(String, String, String)> = list.iter().map(model_parts).collect();
+        let caps = |m: &ModelRow| capability_icons(&m.capabilities);
+        // ☁: it can also run in the cloud. A cloud-only one says "cloud"
+        // in its Size instead.
+        let name = |m: &ModelRow, n: &str| if both_ways(m) { format!("{} ☁", n) } else { n.to_string() };
+        let col = |items: &mut dyn Iterator<Item = usize>, title: &str| items.max().unwrap_or(0).max(title.chars().count()) + 2;
+        let name_w = col(&mut list.iter().zip(&parts).map(|(m, p)| name(m, &p.1).chars().count()), "Model");
+        let size_w = col(&mut parts.iter().map(|p| p.2.chars().count()), "Params");
+        // On disk, as Ollama lists it, or for one not down yet, about what
+        // it would take; "cloud" for a model only there.
+        let disk = |m: &ModelRow| model_disk_size(m).unwrap_or_default();
+        let disk_w = if list.iter().any(|m| model_disk_size(m).is_some()) { col(&mut list.iter().map(|m| disk(m).chars().count()), "Size") } else { 0 };
+        let caps_w = col(&mut list.iter().map(|m| caps(m).chars().count()), "Caps");
+        // The selection mark and the download icon, then the columns.
+        let caps_at = 4 + name_w + size_w + disk_w;
+        let pad = |text: &str, w: usize| format!("{:<w$}", text, w = w);
+        let header = Line::from(vec![Span::styled(
+            format!(
+                "    {}{}{}{}Note",
+                pad("Model", name_w),
+                pad("Params", size_w),
+                pad(if disk_w > 0 { "Size" } else { "" }, disk_w),
+                pad("Caps", caps_w)
+            ),
+            dim().add_modifier(Modifier::BOLD),
+        )]);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut chosen_lines = (0, 0);
+        for (i, (m, (_, label, size))) in list.iter().zip(&parts).enumerate() {
+            let chosen = i == selected;
+            // The state in color: on, green; locked, dim; else plain, the
+            // selected one bold.
+            let mut look = if m.enabled && !locked(m, signed_out) {
+                Style::new().fg(Color::Green)
+            } else if locked(m, signed_out) {
+                dim()
+            } else {
+                Style::new()
+            };
+            if chosen {
+                look = look.bold();
+            }
+            let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished);
+            // Its local copy: ● on disk, ↓ still to download; none for a
+            // model only in the cloud.
+            let icon = if downloading.is_some() {
+                Span::styled("↓ ", Style::new().fg(pink()))
+            } else if !m.local {
+                Span::raw("  ")
+            } else if m.downloaded {
+                Span::styled("● ", dim())
+            } else {
+                Span::styled("↓ ", dim())
+            };
+            let mut spans = vec![
+                Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
+                icon,
+                Span::styled(pad(&name(m, label), name_w), look),
+                Span::styled(pad(size, size_w), look.remove_modifier(Modifier::BOLD)),
+                Span::styled(pad(&disk(m), disk_w), dim()),
+            ];
+            // One note at most, the one that matters most.
+            let note: Option<(String, Style)> = if let Some(d) = downloading {
+                Some((
+                    match d.list.active() {
+                        Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => format!("downloading {}%", done * 100 / total),
+                        _ => format!("downloading {}", self.spinner()),
+                    },
+                    Style::new().fg(pink()),
+                ))
+            } else if locked(m, signed_out) {
+                // Signed in but still locked: the plan, not the sign-in, is what's missing.
+                Some(((if self.search.is_some() { "pro plan" } else { "sign in to use" }).to_string(), Style::new().fg(Color::Yellow)))
+            } else if cloud_instead(m) && !m.enabled {
+                Some(("too big here: runs in cloud".to_string(), dim()))
+            } else if m.local && !m.fits && !m.downloaded && !(m.enabled && m.cloud) {
+                Some(("too big".to_string(), Style::new().fg(Color::Yellow)))
+            } else if m.local && m.recommended && !m.enabled {
+                Some(("recommended".to_string(), Style::new().fg(Color::Green)))
+            } else {
+                None
+            };
+            let mut more = Vec::new();
+            if m.thinking == Some(false) {
+                more.push("reasoning off");
+            }
+            if m.overridden {
+                more.push("capabilities set here");
+            }
+            let more = more.join(" · ");
+            // The capabilities, the note and the rest, each a group of words.
+            let mut groups: Vec<(String, Style)> = vec![(caps(m), dim())];
+            let has_note = note.is_some();
+            if let Some(note) = note {
+                groups.push(note);
+            }
+            if !more.is_empty() {
+                groups.push((if has_note { format!("· {}", more) } else { more }, dim()));
+            }
+            let tail: usize = groups.iter().skip(1).map(|(t, _)| t.chars().count() + 1).sum();
+            chosen_lines.0 = if chosen { lines.len() } else { chosen_lines.0 };
+            if caps_at + caps_w + tail <= avail {
+                // Fits: in its columns.
+                for (j, (text, style)) in groups.into_iter().enumerate() {
+                    let text = match j {
+                        0 => pad(&text, caps_w),
+                        1 if has_note => text,
+                        _ => format!(" {}", text),
+                    };
+                    spans.push(Span::styled(text, style));
+                }
+                lines.push(Line::from(spans));
+            } else {
+                // Too wide: word by word, a line under the capabilities for
+                // what doesn't fit, or further left when that leaves little.
+                // The note under its column when the capabilities fit.
+                let note_at = caps_at + caps_w;
+                let (indent, rest) = if note_at + 12 <= avail {
+                    let mut rest = groups.into_iter();
+                    if let Some((text, style)) = rest.next() {
+                        spans.push(Span::styled(pad(&text, caps_w), style));
+                    }
+                    (note_at, rest.collect::<Vec<_>>())
+                } else if avail.saturating_sub(caps_at) >= 16 {
+                    (caps_at, groups)
+                } else {
+                    (4, groups)
+                };
+                let mut used = if indent == note_at { note_at } else { caps_at };
+                let mut gap = "";
+                for (text, style) in rest.into_iter().filter(|(t, _)| !t.is_empty()) {
+                    for word in text.split(' ') {
+                        let need = gap.len() + word.chars().count();
+                        if used + need > avail && used > indent {
+                            lines.push(Line::from(std::mem::take(&mut spans)));
+                            spans.push(Span::raw(" ".repeat(indent)));
+                            used = indent;
+                            gap = "";
+                        }
+                        let piece = format!("{}{}", gap, word);
+                        used += piece.chars().count();
+                        spans.push(Span::styled(piece, style));
+                        gap = " ";
+                    }
+                    gap = "  ";
+                }
+                lines.push(Line::from(spans));
+            }
+            if chosen {
+                chosen_lines.1 = lines.len() - 1;
+            }
+        }
+        (header, lines, chosen_lines)
+    }
+
     fn draw_models(&self, frame: &mut Frame, area: Rect, rows: &Option<Result<Vec<ModelRow>, String>>, selected: usize) {
         let chosen = match rows {
             Some(Ok(list)) => list.get(selected),
             _ => None,
         };
         let downloading =
-            chosen.is_some_and(|m| !m.cloud_copy && self.downloads.iter().any(|d| d.model == m.name && !d.finished));
+            chosen.is_some_and(|m| self.downloads.iter().any(|d| d.model == m.name && !d.finished));
         let signed_out = self.account == Some(None);
         let block = panel(&models_footer(chosen, downloading, signed_out));
         frame.render_widget(Clear, area);
@@ -5445,84 +5586,31 @@ impl App {
             Some(Err(e)) => return frame.render_widget(Paragraph::new(e.clone()).block(block).wrap(Wrap { trim: false }), area),
             Some(Ok(list)) => list,
         };
-        // In columns: the name, its state, what it can do, then a note; the
-        // local models first, then those that run in the cloud, marked ☁.
-        let label = |m: &ModelRow| if in_cloud(m) { format!("{} ☁", m.name) } else { m.name.clone() };
-        let name_width = list.iter().map(|m| label(m).chars().count()).max().unwrap_or(0) + 2;
-        let caps_width = list.iter().map(|m| m.capabilities.chars().count()).max().unwrap_or(0) + 2;
-        let lines: Vec<Line> = list
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let chosen = i == selected;
-                let mut spans = vec![
-                    Span::styled(if chosen { "› " } else { "  " }, Style::new().fg(pink()).bold()),
-                    Span::styled(
-                        format!("{:<w$}", label(m), w = name_width),
-                        if chosen { Style::new().fg(pink()).bold() } else { Style::new() },
-                    ),
-                ];
-                let downloading = self.downloads.iter().find(|d| d.model == m.name && !d.finished && !m.cloud_copy);
-                let state = match downloading.and_then(|d| d.list.active()) {
-                    Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => {
-                        Span::styled(format!("downloading {}%", done * 100 / total), Style::new().fg(pink()))
-                    }
-                    Some(_) => Span::styled(format!("downloading {}", self.spinner()), Style::new().fg(pink())),
-                    None if locked(m, signed_out) => Span::styled("disabled", dim()),
-                    None if m.enabled => Span::styled("✓ enabled", Style::new().fg(Color::Green)),
-                    None if m.cloud || cloud_instead(m) => Span::styled("disabled", dim()),
-                    None if m.downloaded => Span::styled("downloaded", dim()),
-                    None => Span::styled("↓ not downloaded", dim()),
-                };
-                let state_width = state.width();
-                spans.push(state);
-                spans.push(Span::raw(" ".repeat(18usize.saturating_sub(state_width))));
-                spans.push(Span::styled(format!("{:<w$}", m.capabilities, w = caps_width), dim()));
-                // One note at most, the one that matters most.
-                let note = if locked(m, signed_out) {
-                    // Signed in but still locked: the plan, not the sign-in, is what's missing.
-                    Some((if self.search.is_some() { "(pro plan)" } else { "(sign in to use)" }, Style::new().fg(Color::Yellow)))
-                } else if !m.fits && !m.cloud && !m.downloaded {
-                    Some(("(too big)", Style::new().fg(Color::Yellow)))
-                } else if m.recommended && !m.cloud {
-                    Some(("(recommended)", Style::new().fg(Color::Green)))
-                } else if m.fits && !m.cloud {
-                    Some(("(fits)", dim()))
-                } else {
-                    None
-                };
-                if let Some((note, style)) = note {
-                    spans.push(Span::styled(note, style));
-                }
-                let mut more = Vec::new();
-                if m.thinking == Some(false) {
-                    more.push("(reasoning off)");
-                }
-                if m.overridden {
-                    more.push("(capabilities set here)");
-                }
-                for (i, text) in more.into_iter().enumerate() {
-                    let gap = if note.is_some() || i > 0 { " " } else { "" };
-                    spans.push(Span::styled(format!("{}{}", gap, text), dim()));
-                }
-                Line::from(spans)
-            })
-            .collect();
-        // More than fits the room under the prompt scrolls, keeping the
-        // selected model in view, with a scrollbar to say there's more.
         let inner = block.inner(area);
+        let (header, lines, (first, last)) = self.model_table(list, selected, inner.width as usize);
+        // The header stays put; more rows than fit the room under it
+        // scroll, keeping the selected model in view, with a scrollbar to
+        // say there's more.
+        frame.render_widget(block, area);
+        let key = model_key(inner.width as usize);
+        let [head, body, key_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(key.len() as u16)]).areas(inner);
+        frame.render_widget(Paragraph::new(header), head);
+        frame.render_widget(Paragraph::new(key), key_area);
         let total = lines.len();
-        let skip = (selected + 1).saturating_sub(inner.height as usize);
-        frame.render_widget(Paragraph::new(lines).block(block).scroll((skip.min(u16::MAX as usize) as u16, 0)), area);
-        if total > inner.height as usize {
-            let mut state = ScrollbarState::new(total.saturating_sub(inner.height as usize)).position(skip);
+        let room = body.height as usize;
+        // The selected model's last line in view, then its first.
+        let skip = (last + 1).saturating_sub(room).min(first);
+        frame.render_widget(Paragraph::new(lines).scroll((skip.min(u16::MAX as usize) as u16, 0)), body);
+        if total > room {
+            let mut state = ScrollbarState::new(total.saturating_sub(room)).position(skip);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"))
                 .track_symbol(Some("│"))
                 .thumb_symbol("┃")
                 .style(dim());
-            frame.render_stateful_widget(bar, inner, &mut state);
+            frame.render_stateful_widget(bar, body, &mut state);
         }
     }
 
@@ -5940,7 +6028,7 @@ fn model_nudge(models: &[ModelRow]) -> Option<String> {
     Some(match recommended_pick(models) {
         Some(m) => format!(
             "No models enabled yet: pick at least one. Recommended for your system: {} · /models (ctrl+o)",
-            m.name
+            m.label()
         ),
         None => "No models enabled yet: pick at least one · /models (ctrl+o)".to_string(),
     })
@@ -6781,7 +6869,7 @@ fn is_document(path: &std::path::Path) -> bool {
 /// `/exit` and `/q` also quit, but aren't hinted.
 const COMMANDS: [(&str, &str); 13] = [
     ("/help", "shortcuts and commands"),
-    ("/login", "sign in in the browser (--device for a code, --token to paste one)"),
+    ("/login", "sign in with a code (--token to paste one)"),
     ("/logout", "log out"),
     ("/models", "enable, disable and download models"),
     ("/mcp", "MCP servers; /mcp add <url> to connect one"),
@@ -6874,7 +6962,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("/models <name> caps <list|auto>", "set a model's capabilities here, over the catalog's"),
         ("/models <name> thinking on|off", "reasoning first, or a sooner answer (ctrl+t in /models)"),
         ("/status", "account, model, agent and versions"),
-        ("/login", "sign in in the browser (--device for a code, --token to paste one)"),
+        ("/login", "sign in with a code (--token to paste one)"),
         ("/logout", "log out"),
         ("/usage", "credits used this month"),
         ("/upgrade", "Pro or Plus plan: more credits a month"),
@@ -6926,45 +7014,193 @@ fn locked(m: &ModelRow, signed_out: bool) -> bool {
     !m.accessible || (signed_out && m.cloud)
 }
 
-/// Whether `m` shows with the cloud models, after the local ones, marked
-/// ☁: a cloud model, or one that would run there as it's too big for this
-/// machine.
-fn in_cloud(m: &ModelRow) -> bool {
-    m.cloud || cloud_instead(m)
+/// Whether `m` runs both ways: a local copy to download and a cloud copy
+/// to run there, in one row of the models panel.
+fn both_ways(m: &ModelRow) -> bool {
+    m.local && (m.cloud_ready || m.cloud || m.cloud_variant)
 }
 
-/// The models panel's entries: a model served both ways once with the local
-/// models, to download and run here, and once with the cloud ones, to run
-/// there, each on only when it runs that way, the cloud one locked when the
-/// plan doesn't cover it; then
-/// grouped, local then cloud, each otherwise in the catalog's order. The
-/// selection indexes this list.
+/// Whether the plan covers running `m` in the cloud: a both-ways model whose
+/// cloud copy is covered or already on there.
+fn cloud_covered(m: &ModelRow) -> bool {
+    m.cloud_ready || m.cloud
+}
+
+/// What Enter does to the selected model in the models panel.
+#[derive(Debug, PartialEq)]
+enum EnterAction {
+    Disable,
+    /// Locked by the plan or a sign-in.
+    Locked,
+    /// Turn it on, with `true` in the cloud instead of the local copy.
+    Enable(bool),
+    /// Nothing to turn on until ctrl+d downloads it.
+    NeedsDownload,
+}
+
+/// Enter turns a model off when it's on; otherwise on as it can run: a
+/// cloud model as it is, a downloaded one here, and one served both ways
+/// in the cloud. It never downloads: ctrl+d does.
+fn enter_action(m: &ModelRow, signed_out: bool) -> EnterAction {
+    if m.enabled && !(signed_out && m.cloud) {
+        // Always allowed, even for a model the plan no longer covers.
+        EnterAction::Disable
+    } else if locked(m, signed_out) {
+        EnterAction::Locked
+    } else if !m.local || m.downloaded {
+        EnterAction::Enable(false)
+    } else if both_ways(m) && cloud_covered(m) {
+        if signed_out { EnterAction::Locked } else { EnterAction::Enable(true) }
+    } else {
+        EnterAction::NeedsDownload
+    }
+}
+
+/// Whether ctrl+d downloads `m`'s local copy (and turns it on): one not
+/// downloaded yet, unless it's too big here and runs in the cloud instead.
+fn can_download(m: &ModelRow) -> bool {
+    downloadable(m) && m.local && m.accessible && !cloud_instead(m)
+}
+
+/// The models panel's entries: one per model, grouped by family (Qwen,
+/// Gemma, …) in the order the family's best entry comes, a family with a
+/// model recommended for this machine first and cloud-only ones last; in a
+/// family, by version then size. The selection indexes this list.
 fn panel_models(list: Vec<ModelRow>) -> Vec<ModelRow> {
-    let mut entries: Vec<ModelRow> = list
-        .into_iter()
-        .flat_map(|m| {
-            if !(m.local && (m.cloud_ready || m.cloud || m.cloud_variant)) {
-                return vec![m];
-            }
-            let covered = m.cloud_ready || m.cloud;
-            let local = ModelRow { enabled: m.enabled && !m.cloud, cloud: false, cloud_ready: false, ..m.clone() };
-            let cloud = ModelRow {
-                enabled: m.cloud,
-                cloud: true,
-                local: false,
-                downloaded: false,
-                recommended: false,
-                cloud_copy: true,
-                accessible: m.accessible && covered,
-                ..m
-            };
-            vec![local, cloud]
-        })
-        .collect();
-    // Local: the recommended first, then the rest, those too big for this
-    // machine to download last.
-    entries.sort_by_key(|m| (in_cloud(m), !in_cloud(m) && !m.recommended, !in_cloud(m) && !m.fits && !m.downloaded));
+    let rank = |m: &ModelRow| (!m.local, !m.recommended, !m.fits && !m.downloaded && !cloud_covered(m));
+    let mut families: Vec<(String, (bool, bool, bool))> = Vec::new();
+    for m in &list {
+        let family = model_parts(m).0.to_lowercase();
+        match families.iter_mut().find(|(f, _)| *f == family) {
+            Some((_, best)) => *best = (*best).min(rank(m)),
+            None => families.push((family, rank(m))),
+        }
+    }
+    // Stable: families tied keep the catalog's order.
+    families.sort_by_key(|(_, best)| *best);
+    let mut entries = list;
+    entries.sort_by(|a, b| {
+        let (fa, va, _) = model_parts(a);
+        let (fb, vb, _) = model_parts(b);
+        let at = |f: &str| families.iter().position(|(n, _)| *n == f.to_lowercase());
+        at(&fa)
+            .cmp(&at(&fb))
+            .then_with(|| va.to_lowercase().cmp(&vb.to_lowercase()))
+            .then_with(|| a.size_b.unwrap_or(0.0).total_cmp(&b.size_b.unwrap_or(0.0)))
+    });
     entries
+}
+
+/// A model's name in the panel's parts: its family ("Qwen"), its name
+/// without the size ("Qwen3 Coder"), and its size ("30B"), from the display
+/// name "Qwen3 Coder 30B A3B". The size comes from the catalog when the name
+/// carries none; only the first size counts, without a prefix.
+fn model_parts(m: &ModelRow) -> (String, String, String) {
+    let mut words: Vec<&str> = m.label().split_whitespace().collect();
+    let mut sizes = Vec::new();
+    while words.len() > 1 && words.last().is_some_and(|w| size_word(w)) {
+        sizes.insert(0, words.pop().unwrap_or_default());
+    }
+    let first = words.first().copied().unwrap_or_default();
+    let split = first.find(|c: char| !c.is_alphabetic()).unwrap_or(first.len());
+    let family = if split == 0 { first } else { &first[..split] };
+    let name = words.join(" ");
+    // The first size only, without its prefix: "30B A3B" is 30B, an
+    // effective "E4B" 4B.
+    let size = sizes
+        .first()
+        .filter(|w| !w.starts_with(['A', 'a']))
+        .map(|w| w.trim_start_matches(['E', 'e']).to_string())
+        .or_else(|| m.size_b.map(format_params))
+        .unwrap_or_default();
+    (family.to_string(), name, size)
+}
+
+/// Bytes per parameter of a 4-bit quantization (Q4_K_M, ~4.8 bits), what
+/// the catalog's local models come as.
+const BYTES_PER_PARAM: f64 = 0.6;
+
+/// What `m` takes on disk: measured once downloaded, else guessed from its
+/// parameters and marked `~`; "cloud" for a model with no local copy.
+fn model_disk_size(m: &ModelRow) -> Option<String> {
+    if !m.local {
+        return Some("cloud".to_string());
+    }
+    if let Some(bytes) = m.disk_bytes {
+        return Some(format_size(bytes));
+    }
+    // A guess, so whole numbers only.
+    let mb = m.size_b.filter(|_| m.local)? * 1e9 * BYTES_PER_PARAM / (1024.0 * 1024.0);
+    Some(if mb >= 1024.0 { format!("~{:.0} GB", mb / 1024.0) } else { format!("~{:.0} MB", mb) })
+}
+
+/// What a model can do, as LM Studio badges it: an icon each in a fixed
+/// slot (✦ reasoning, ◉ vision, ⚒ tools), so they line up down
+/// the list, then any other capability by name. "text", which every model
+/// has, is left out, and so is "thinking": that it writes out its thoughts
+/// first is what ctrl+t turns off, not a skill the planner routes by.
+fn capability_icons(capabilities: &str) -> String {
+    let has: Vec<&str> = capabilities.split(", ").map(str::trim).filter(|c| !c.is_empty()).collect();
+    let mut out: Vec<String> = CAPABILITY_ICONS
+        .iter()
+        .map(|(icon, names, _)| if names.iter().any(|n| has.contains(n)) { icon.to_string() } else { " ".to_string() })
+        .collect();
+    let known = |c: &str| c == "text" || c == "thinking" || CAPABILITY_ICONS.iter().any(|(_, names, _)| names.contains(&c));
+    let rest: Vec<&str> = has.iter().copied().filter(|c| !known(c)).collect();
+    if !rest.is_empty() {
+        out.push(rest.join(", "));
+    }
+    out.join(" ").trim_end().to_string()
+}
+
+/// What the models panel's icons mean, under its list: the capabilities,
+/// then the download state (☁ needs no key), item by item onto as many lines
+/// as `width` takes.
+fn model_key(width: usize) -> Vec<Line<'static>> {
+    let mut items: Vec<(&str, &str)> = CAPABILITY_ICONS.iter().map(|(icon, _, name)| (*icon, *name)).collect();
+    items.extend([("●", "downloaded"), ("↓", "not downloaded")]);
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let mut used = 2;
+    for (icon, name) in items {
+        let item = 2 + name.chars().count();
+        let gap = if used > 2 { 3 } else { 0 };
+        if used > 2 && used + gap + item > width.saturating_sub(1) {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(Span::raw("  "));
+            used = 2;
+        }
+        if used > 2 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(icon, dim()));
+        spans.push(Span::styled(format!(" {}", name), dim()));
+        used += if used > 2 { 3 } else { 0 } + item;
+    }
+    lines.push(Line::from(spans));
+    lines
+}
+
+/// The capability icons, the capabilities each stands for, and its name in
+/// the panel's key.
+const CAPABILITY_ICONS: &[(&str, &[&str], &str)] = &[
+    ("✦", &["reasoning"], "reasoning"),
+    ("◉", &["vision"], "vision"),
+    ("⚒", &["tools"], "tools"),
+];
+
+/// A word of a model name that gives its size: `27B`, `2.4T`, `E4B`
+/// (effective) or `A3B` (active).
+fn size_word(word: &str) -> bool {
+    let w = word.strip_prefix(['E', 'A', 'e', 'a']).unwrap_or(word);
+    let Some(number) = w.strip_suffix(['B', 'T', 'b']) else { return false };
+    !number.is_empty() && number.chars().all(|c| c.is_ascii_digit() || c == '.') && number.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Billions of parameters as `27B`, `30.5B` or `2.4T`.
+fn format_params(size_b: f64) -> String {
+    let short = |n: f64| format!("{:.1}", n).trim_end_matches(".0").to_string();
+    if size_b >= 1000.0 { format!("{}T", short(size_b / 1000.0)) } else { format!("{}B", short(size_b)) }
 }
 
 /// Whether `m` is too big for this machine but the plan covers its cloud
@@ -6973,36 +7209,22 @@ fn cloud_instead(m: &ModelRow) -> bool {
     m.local && !m.fits && !m.cloud && !m.downloaded && m.cloud_ready
 }
 
-/// Whether `m` runs only once downloaded, so Enter can't turn it on: a
-/// model that isn't on in the cloud and has no local copy yet. A cloud
-/// model, or one downloaded, is turned on as it is.
-fn needs_download(m: &ModelRow) -> bool {
-    !m.cloud && !m.downloaded
-}
-
 /// The model list's footer: the keys that apply to the selected model.
 /// Enter turns it on or off and never downloads; ctrl+d downloads a model's
-/// local copy (and turns it on), a model that needs one only so.  While it
-/// downloads, ctrl+x cancels it.
+/// local copy (and turns it on).  While it downloads, ctrl+x cancels it.
 fn models_footer(selected: Option<&ModelRow>, downloading: bool, signed_out: bool) -> Vec<Span<'static>> {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     match selected {
         Some(_) if downloading => keys.push(("ctrl+x", "cancel download")),
-        // Locked: nothing to turn on, though a local copy can still come.
-        Some(m) if locked(m, signed_out) => {
-            if downloadable(m) && m.local && m.accessible {
-                keys.push(("ctrl+d", "download & enable"));
-            }
-        }
-        Some(m) if cloud_instead(m) && !m.enabled => keys.push(("enter", "enable")),
         Some(m) => {
-            if m.enabled {
-                keys.push(("enter", "disable"));
-            } else if !needs_download(m) {
-                keys.push(("enter", "enable"));
+            match enter_action(m, signed_out) {
+                EnterAction::Disable => keys.push(("enter", "disable")),
+                EnterAction::Enable(true) => keys.push(("enter", "enable in cloud")),
+                EnterAction::Enable(false) => keys.push(("enter", "enable")),
+                EnterAction::Locked | EnterAction::NeedsDownload => {}
             }
-            if downloadable(m) {
-                keys.push(("ctrl+d", if m.enabled { "download" } else { "download & enable" }));
+            if can_download(m) {
+                keys.push(("ctrl+d", if m.enabled && !m.cloud { "download" } else { "download & enable" }));
             }
         }
         None => keys.extend([("↑↓", "select"), ("enter", "enable/disable")]),
@@ -7112,6 +7334,21 @@ mod tests {
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The color `text` is drawn in, where it last shows on the screen (an
+    /// open panel's, under the conversation).
+    fn color_of(app: &App, width: u16, height: u16, text: &str) -> Option<Color> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first = text.chars().next()?.to_string();
+        (0..height).rev().find_map(|y| {
+            let row: Vec<&str> = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+            let at = (0..row.len()).find(|&x| row[x..].concat().starts_with(text))?;
+            debug_assert_eq!(row[at], first);
+            Some(buffer[(at as u16, y)].fg)
+        })
     }
 
     fn app() -> App {
@@ -8152,9 +8389,11 @@ mod tests {
             local: true,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking,
+            display_name: String::new(),
             fits: true,
         };
         app.overlay = Overlay::Models {
@@ -8162,7 +8401,7 @@ mod tests {
             selected: 0,
         };
         let text = screen(&app, 120, 24);
-        assert!(text.contains("(fits) (reasoning off)"), "{}", text);
+        assert!(text.contains("reasoning off"), "{}", text);
         assert!(text.contains("[ctrl+t] reasoning on"), "{}", text);
         app.key_models(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(last(&app), "Turning thinker reasoning on");
@@ -8208,14 +8447,16 @@ mod tests {
             local: false,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: true,
         }];
         app.overlay = Overlay::Models { rows: Some(Ok(rows)), selected: 0 };
         let text = screen(&app, 100, 24);
-        assert!(text.contains("general, coding") && text.contains("(capabilities set here)"), "{}", text);
+        assert!(text.contains("coding, general") && text.contains("capabilities set here"), "{}", text);
     }
 
     #[test]
@@ -9214,9 +9455,11 @@ mod tests {
             local: false,
             recommended,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: true,
         };
         let list = vec![
@@ -9250,9 +9493,11 @@ mod tests {
             local: false,
             recommended,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: true,
         };
         app.apply(AppEvent::Models(Ok(vec![row("big", false, false), row("small", true, false)])));
@@ -9333,10 +9578,11 @@ mod tests {
     }
 
     #[test]
-    fn the_models_panel_lists_local_models_then_cloud_ones_marked() {
-        let row = |name: &str, cloud: bool| ModelRow {
+    fn the_models_panel_groups_models_by_family_one_row_each() {
+        let row = |name: &str, display: &str, cloud: bool| ModelRow {
             name: name.into(),
-            capabilities: "general".into(),
+            display_name: display.into(),
+            capabilities: "text, reasoning, tools".into(),
             overridden: false,
             context: None,
             access: "free".into(),
@@ -9347,38 +9593,70 @@ mod tests {
             local: !cloud,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
             fits: true,
         };
         // Served both ways, too big here, the plan covering its cloud copy.
-        let both = ModelRow { cloud_ready: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
+        let both = ModelRow { cloud_ready: true, fits: false, downloaded: false, size_b: Some(27.3), ..row("qwen3.8-27b", "Qwen3.8 27B", false) };
+        let coder = ModelRow { downloaded: false, size_b: Some(30.5), ..row("qwen3-coder-30b-a3b", "Qwen3 Coder 30B A3B", false) };
+        let small = ModelRow { recommended: true, ..row("qwen3.5-2b", "Qwen3.5 2B", false) };
+        let glm = ModelRow { size_b: Some(744.0), ..row("glm-5.3", "GLM 5.3", true) };
+        let max = ModelRow { size_b: Some(2400.0), ..row("qwen4-max", "Qwen4 Max", true) };
+        let gemma = row("gemma4-e4b", "Gemma 4 E4B", false);
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "Default".into()));
         app.overlay = Overlay::Models { rows: None, selected: 0 };
-        app.apply(AppEvent::Models(Ok(vec![row("big", true), row("small", false), both, row("huge", true)])));
+        app.apply(AppEvent::Models(Ok(vec![glm, both, gemma, coder, max, small])));
         let Overlay::Models { rows: Some(Ok(list)), .. } = &app.overlay else { panic!("no models") };
         let names: Vec<&str> = list.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["small", "qwen-27b", "big", "qwen-27b", "huge"]);
-        // Its Local entry is a download, marked too big; its Cloud one runs there.
-        let (local, cloud) = (&list[1], &list[3]);
-        assert!(!local.cloud && !local.cloud_copy && downloadable(local) && !cloud_instead(local));
-        assert!(cloud.cloud && cloud.cloud_copy && !downloadable(cloud) && !cloud.enabled);
-        let text = screen(&app, 120, 24);
-        assert!(!text.contains(" Local\n") && !text.contains(" Cloud\n"), "no headings: {}", text);
-        assert!(text.contains("qwen-27b    ↓ not downloaded"), "{}", text);
-        assert!(text.contains("(too big)"), "{}", text);
-        assert!(text.contains("qwen-27b ☁  disabled"), "{}", text);
-        assert!(text.contains("big ☁       disabled"), "{}", text);
+        // Qwen first, as it has the recommended model; one row per model,
+        // by version, then Gemma, then the cloud-only GLM.
+        assert_eq!(names, ["qwen3-coder-30b-a3b", "qwen3.5-2b", "qwen3.8-27b", "qwen4-max", "gemma4-e4b", "glm-5.3"]);
+        let text = screen(&app, 140, 44);
+        let rows: Vec<&str> = text.lines().collect();
+        let head = rows.iter().position(|r| r.contains("Caps")).expect(&text);
+        let line = |needle: &str| rows[head..].iter().find(|r| r.contains(needle)).map(|r| r.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_else(|| panic!("no {}: {}", needle, text));
+        assert!(line("Caps").starts_with("Model Params Size Caps Note"), "{}", text);
+        assert_eq!(line("Coder"), "› ↓ Qwen3 Coder 30B ~17 GB ✦ ⚒", "no A3B; its size guessed from its parameters");
+        assert_eq!(line("Qwen3.5"), "● Qwen3.5 2B ✦ ⚒ recommended");
+        assert_eq!(line("Qwen3.8"), "↓ Qwen3.8 ☁ 27B ~15 GB ✦ ⚒ too big here: runs in cloud");
+        assert_eq!(line("Max"), "Qwen4 Max 2.4T cloud ✦ ⚒", "size from the catalog; nothing on disk in the cloud");
+        assert_eq!(line("Gemma"), "● Gemma 4 4B ✦ ⚒");
+        assert_eq!(line("GLM"), "GLM 5.3 744B cloud ✦ ⚒");
+        assert!(text.contains("✦ reasoning   ◉ vision   ⚒ tools   ● downloaded   ↓ not downloaded"), "the key: {}", text);
+        // Narrow, the key wraps, and nothing of it is lost.
+        let key: Vec<String> = model_key(40).iter().map(|l| l.to_string()).collect();
+        assert!(key.len() > 1 && key.iter().all(|l| l.chars().count() < 40), "{:?}", key);
+        assert!(key.concat().contains("↓ not downloaded") && !key.concat().contains("☁"), "{:?}", key);
+        // Off, a name is plain.
+        assert_eq!(color_of(&app, 140, 44, "Qwen3.5"), Some(Color::Reset));
 
-        // In a short pane the list scrolls to keep the selected model in view.
-        if let Overlay::Models { selected, .. } = &mut app.overlay {
-            *selected = 4;
-        }
-        let text = screen(&app, 120, 16);
-        assert!(text.contains("› huge ☁"), "{}", text);
+        // Too narrow for a row, its note breaks onto a line under its column.
+        let narrow = screen(&app, 60, 44);
+        let rows: Vec<&str> = narrow.lines().collect();
+        let at = rows.iter().position(|r| r.contains("Qwen3.8")).expect(&narrow);
+        assert!(rows[at].trim_end().ends_with("too big here: runs"), "{}", narrow);
+        let column = |row: &str, text: &str| row.find(text).map(|i| row[..i].chars().count());
+        assert_eq!(column(rows[at + 1], "in cloud"), column(rows[at], "too big"), "{}", narrow);
+
+        // On the both-ways row, Enter runs it in the cloud.
+        let select = |app: &mut App, i| {
+            if let Overlay::Models { selected, .. } = &mut app.overlay {
+                *selected = i;
+            }
+        };
+        select(&mut app, 2);
+        assert!(screen(&app, 140, 44).contains("[enter] enable in cloud  [ctrl+r]"));
+
+        // In a short pane the list scrolls to keep the selected model in
+        // view, the header staying put.
+        select(&mut app, 5);
+        let text = screen(&app, 140, 19);
+        assert!(text.contains("›   GLM 5.3") && text.contains("Caps"), "{}", text);
         assert!(text.contains('↑') && text.contains('┃'), "a scrollbar says there's more: {}", text);
         let at = |app: &App| match &app.overlay {
             Overlay::Models { selected, .. } => *selected,
@@ -9387,38 +9665,116 @@ mod tests {
         app.key_models(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(at(&app), 0);
         app.key_models(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(at(&app), 4, "a page down stops at the last");
+        assert_eq!(at(&app), 5, "a page down stops at the last");
         app.key_models(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(at(&app), 0);
-        app.key_models(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(at(&app), 4);
         // With room for all of them, no scrollbar.
-        let text = screen(&app, 120, 30);
+        let text = screen(&app, 140, 44);
         assert!(!text.contains('┃'), "{}", text);
 
-        // On in the cloud, only its Cloud entry reads enabled.
-        let on = ModelRow { cloud: true, enabled: true, cloud_ready: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
-        let split = panel_models(vec![on]);
-        assert_eq!((split[0].enabled, split[1].enabled), (false, true));
+        // On in the cloud, its one row says so.
+        let on = ModelRow { cloud: true, enabled: true, cloud_ready: true, fits: false, downloaded: false, ..row("qwen3.8-27b", "Qwen3.8 27B", false) };
+        app.overlay = Overlay::Models { rows: Some(Ok(vec![on])), selected: 0 };
+        let text = screen(&app, 140, 24);
+        assert!(text.contains("Qwen3.8 ☁") && text.contains("[enter] disable"), "{}", text);
+        assert_eq!(color_of(&app, 140, 24, "Qwen3.8 ☁"), Some(Color::Green), "on: green");
 
         // Signed out, or off the plan: the catalog still says there's a cloud
-        // copy, which shows locked, asking for a sign-in.
-        let locked_copy = ModelRow { cloud_variant: true, fits: false, downloaded: false, ..row("qwen-27b", false) };
-        let mut out = super::tests::app();
-        out.phase = Phase::Ready;
-        out.account = Some(None);
-        out.project = Some(("p1".into(), "Default".into()));
-        out.overlay = Overlay::Models { rows: None, selected: 0 };
-        out.apply(AppEvent::Models(Ok(vec![locked_copy])));
-        let text = screen(&out, 120, 24);
-        assert!(text.contains("qwen-27b    ↓ not downloaded"), "{}", text);
-        assert!(text.contains("qwen-27b ☁  disabled"), "{}", text);
-        assert!(text.contains("(sign in to use)"), "{}", text);
-        if let Overlay::Models { selected, .. } = &mut out.overlay {
-            *selected = 1;
-        }
-        out.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(out.entries.last(), Some(Entry::Error(e)) if e.contains("/login")), "Enter asks for a sign-in");
+        // copy; Enter has nothing to turn on, ctrl+d downloads it.
+        let locked_copy = ModelRow { cloud_variant: true, downloaded: false, ..row("qwen3.8-27b", "Qwen3.8 27B", false) };
+        assert_eq!(enter_action(&locked_copy, true), EnterAction::NeedsDownload);
+        assert!(can_download(&locked_copy));
+    }
+
+    #[test]
+    fn a_download_is_told_in_the_conversation_not_the_status_line() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        app.enable_model("qwen3.5-2b".into(), false);
+        assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Downloading qwen3.5-2b"));
+        assert!(app.status_lines().is_empty());
+    }
+
+    #[test]
+    fn capabilities_show_as_icons_in_fixed_slots() {
+        assert_eq!(capability_icons("text, reasoning, vision, thinking, tools"), "✦ ◉ ⚒");
+        assert_eq!(capability_icons("text, tools"), "    ⚒");
+        // Set by hand, not the catalog's: by name.
+        assert_eq!(capability_icons("coding, dp"), "      coding, dp");
+        assert_eq!(capability_icons("tools, coding"), "    ⚒ coding");
+        assert_eq!(capability_icons("text"), "");
+        // Thinking alone isn't reasoning: Gemma 4 E2B only sees.
+        assert_eq!(capability_icons("text, vision, thinking"), "  ◉");
+    }
+
+    #[test]
+    fn a_downloaded_model_shows_its_size_on_disk() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let row = |name: &str, display: &str, disk: Option<u64>| ModelRow {
+            name: name.into(),
+            display_name: display.into(),
+            capabilities: "text, vision".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: disk.is_some(),
+            enabled: false,
+            cloud: false,
+            local: true,
+            recommended: false,
+            cloud_ready: false,
+            size_b: None,
+            disk_bytes: disk,
+            cloud_variant: false,
+            thinking: None,
+            fits: true,
+        };
+        let list = vec![row("qwen3.5-2b", "Qwen3.5 2B", Some(1_932_735_283)), row("gemma4-e4b", "Gemma 4 E4B", None)];
+        app.overlay = Overlay::Models { rows: Some(Ok(list)), selected: 0 };
+        let text = screen(&app, 120, 24);
+        let lines: Vec<String> = text.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+        assert!(lines.iter().any(|l| l == "Model Params Size Caps Note"), "{}", text);
+        assert!(lines.iter().any(|l| l == "› ● Qwen3.5 2B 1.8 GB ◉"), "{}", text);
+        assert!(lines.iter().any(|l| l == "↓ Gemma 4 4B ◉"), "{}", text);
+    }
+
+    #[test]
+    fn model_names_split_into_family_name_and_size() {
+        let parts = |display: &str, size_b| {
+            let m = ModelRow {
+                name: "code".into(),
+                display_name: display.into(),
+                capabilities: String::new(),
+                overridden: false,
+                context: None,
+                access: String::new(),
+                accessible: true,
+                downloaded: false,
+                enabled: false,
+                cloud: false,
+                local: true,
+                recommended: false,
+                cloud_ready: false,
+                size_b,
+                disk_bytes: None,
+                cloud_variant: false,
+                thinking: None,
+                fits: true,
+            };
+            model_parts(&m)
+        };
+        let p = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+        assert_eq!(parts("Qwen3 Coder 30B A3B", Some(30.5)), p("Qwen", "Qwen3 Coder", "30B"));
+        assert_eq!(parts("Gemma 4 E4B", None), p("Gemma", "Gemma 4", "4B"));
+        assert_eq!(parts("Qwen2 VL 2B", None), p("Qwen", "Qwen2 VL", "2B"));
+        assert_eq!(parts("MiniMax M3", Some(428.0)), p("MiniMax", "MiniMax M3", "428B"));
+        assert_eq!(parts("Qwen4 Max", Some(2400.0)), p("Qwen", "Qwen4 Max", "2.4T"));
+        assert_eq!(parts("SLP Orchestra Mini", Some(1.0)), p("SLP", "SLP Orchestra Mini", "1B"));
+        assert_eq!(parts("", Some(27.3)), p("code", "code", "27.3B"), "no display name: the code name");
     }
 
     #[test]
@@ -9439,9 +9795,11 @@ mod tests {
             local: true,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: false,
         };
         let ready = ModelRow { cloud_ready: true, ..big("qwen-ready") };
@@ -9454,16 +9812,15 @@ mod tests {
         };
 
         let text = screen(&app, 120, 24);
-        assert!(text.contains("qwen-ready ☁  disabled"), "{}", text);
-        assert!(text.contains("[enter] enable  [ctrl+r]"), "{}", text);
+        assert!(text.contains("too big here: runs in cloud"), "{}", text);
+        assert!(text.contains("[enter] enable in cloud  [ctrl+r]"), "{}", text);
         assert!(!text.contains("ctrl+d"), "not offered as a download: {}", text);
 
         // With no cloud copy to use (none, or not on the pro plan) it can
         // still be downloaded, marked too big.
         select(&mut app, 1);
         let text = screen(&app, 120, 24);
-        assert!(text.contains("llama-big     ↓ not downloaded"), "{}", text);
-        assert!(text.contains("(too big)"), "{}", text);
+        assert!(text.lines().any(|l| l.contains("› ↓ llama-big") && l.contains("too big") && !l.contains("runs in cloud")), "{}", text);
         assert!(text.contains("[ctrl+d] download & enable"), "{}", text);
     }
 
@@ -9486,15 +9843,17 @@ mod tests {
             local: true,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: true,
         };
         app.overlay = Overlay::Models { rows: Some(Ok(vec![row])), selected: 0 };
         let text = screen(&app, 120, 24);
-        assert!(text.contains("qwen3.8-27b ☁  disabled"), "{}", text);
-        assert!(text.contains("(sign in to use)"), "{}", text);
+        assert!(text.contains("sign in to use"), "{}", text);
+        assert_ne!(color_of(&app, 120, 24, "qwen3.8-27b"), Some(Color::Green), "locked: not green");
         assert!(!text.contains("[enter]"), "{}", text);
         assert!(text.contains("[ctrl+d] download & enable"), "its local copy can still come: {}", text);
         app.key_models(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -9503,7 +9862,49 @@ mod tests {
         // Signed in, it's on as before.
         app.account = Some(Some("me".into()));
         let text = screen(&app, 120, 24);
-        assert!(text.contains("✓ enabled") && !text.contains("sign in to use"), "{}", text);
+        assert!(!text.contains("sign in to use"), "{}", text);
+        assert_eq!(color_of(&app, 120, 24, "qwen3.8-27b"), Some(Color::Green), "{}", text);
+    }
+
+    #[test]
+    fn models_show_by_their_display_names() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "Default".into()));
+        let model = |name: &str, display: &str, enabled| ModelRow {
+            name: name.into(),
+            display_name: display.into(),
+            capabilities: "coding".into(),
+            overridden: false,
+            context: None,
+            access: "free".into(),
+            accessible: true,
+            downloaded: true,
+            enabled,
+            cloud: false,
+            local: true,
+            recommended: false,
+            cloud_ready: false,
+            size_b: None,
+            disk_bytes: None,
+            cloud_variant: false,
+            thinking: None,
+            fits: true,
+        };
+        let list = vec![model("qwen3-coder-30b-a3b", "Qwen3 Coder 30B A3B", true), model("plain-name", "", false)];
+        app.apply(AppEvent::Models(Ok(list.clone())));
+        assert_eq!(app.model_label("qwen3-coder-30b-a3b"), "Qwen3 Coder 30B A3B");
+        assert_eq!(app.model_label("plain-name"), "plain-name", "no display name: the code name");
+        assert_eq!(app.enabled_models.as_deref(), Some(&["Qwen3 Coder 30B A3B".to_string()][..]));
+        app.overlay = Overlay::Models { rows: Some(Ok(list)), selected: 0 };
+        let text = screen(&app, 100, 24);
+        let flat = |t: &str| t.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect::<Vec<_>>();
+        let lines = flat(&text);
+        assert!(lines.iter().any(|l| l.starts_with("› ● Qwen3 Coder 30B coding")), "{}", text);
+        assert_eq!(color_of(&app, 100, 24, "Qwen3 Coder"), Some(Color::Green));
+        let panel = &text[text.find("Caps").expect(&text)..];
+        assert!(!panel.contains("qwen3-coder-30b-a3b") && !panel.contains("A3B"), "{}", text);
+        assert!(lines.iter().any(|l| l.starts_with("● plain-name coding")), "{}", text);
     }
 
     #[test]
@@ -9521,28 +9922,30 @@ mod tests {
             downloaded,
             enabled,
             cloud: false,
-            local: false,
+            local: true,
             recommended: false,
             cloud_ready: false,
-            cloud_copy: false,
+            size_b: None,
+            disk_bytes: None,
             cloud_variant: false,
             thinking: None,
+            display_name: String::new(),
             fits: true,
         };
-        let cloud = ModelRow { cloud: true, ..model("sonnet", false, false) };
-        let both = ModelRow { local: true, ..model("qwen3.8-27b", false, false) };
+        let cloud = ModelRow { cloud: true, local: false, ..model("sonnet", false, false) };
+        let both = model("qwen3.8-27b", false, false);
         app.overlay = Overlay::Models {
             rows: Some(Ok(vec![model("gemma4-e4b", false, false), model("qwen3.5-2b", true, true), cloud, both])),
             selected: 1,
         };
         let text = screen(&app, 100, 24);
-        // Rows stay plain: name, state, capabilities.
-        assert!(text.contains("  gemma4-e4b   ↓ not downloaded  general, vision"), "{}", text);
-        assert!(text.contains("› qwen3.5-2b   ✓ enabled"), "{}", text);
-        assert!(text.contains("  sonnet ☁     disabled"), "{}", text);
-        // The footer says where the selected model runs, and its keys.
+        // A row each: version, size, where it runs, state, capabilities.
+        let lines: Vec<String> = text.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+        assert!(lines.iter().any(|l| l == "↓ gemma4-e4b ◉ general"), "{}", text);
+        assert!(lines.iter().any(|l| l == "› ● qwen3.5-2b ◉ general"), "{}", text);
+        assert!(lines.iter().any(|l| l == "sonnet cloud ◉ general"), "{}", text);
+        assert_eq!(color_of(&app, 100, 24, "qwen3.5-2b"), Some(Color::Green), "on: green");
         assert!(text.contains("[enter] disable  [ctrl+r] refresh"), "{}", text);
-        assert!(!text.contains("local") && !text.contains("cloud ["), "no place in the footer: {}", text);
         let select = |app: &mut App, i| {
             if let Overlay::Models { selected, .. } = &mut app.overlay {
                 *selected = i;
@@ -9562,7 +9965,6 @@ mod tests {
         let text = screen(&app, 100, 24);
         assert!(!text.contains("[ctrl+d]") && !text.contains("[enter]") && text.contains("[ctrl+x] cancel download"), "{}", text);
         assert!(text.contains("[ctrl+r] refresh"), "{}", text);
-        assert!(!text.contains("Capabilities") && !text.contains("Models"), "{}", text);
     }
 
     #[test]

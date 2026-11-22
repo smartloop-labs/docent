@@ -415,7 +415,11 @@ fn project_model_state(
 /// One model as `model list` and the TUI show it.
 #[derive(Debug, Clone)]
 pub struct ModelRow {
+    /// The code name commands and the agent take, e.g. `qwen3.5-4b`.
     pub name: String,
+    /// What people read, e.g. "Qwen3.5 4B": the catalog's `display_name`,
+    /// empty when it has none.
+    pub display_name: String,
     pub capabilities: String,
     /// Whether the capabilities were set here, over the catalog's.
     pub overridden: bool,
@@ -441,9 +445,11 @@ pub struct ModelRow {
     /// Its local copy fits this machine's memory, as far as its size is
     /// known; one of unknown size is taken to fit.
     pub fits: bool,
-    /// The models panel's Cloud entry of a model served both ways, which
-    /// also has a Local entry: Enter runs it in the cloud.
-    pub cloud_copy: bool,
+    /// Its size in billions of parameters, when the catalog says.
+    pub size_b: Option<f64>,
+    /// What its downloaded files take on disk, when the agent is on this
+    /// machine to look.
+    pub disk_bytes: Option<u64>,
     /// Whether it reasons before it answers: `None` for a model that can't,
     /// so it has nothing to turn on or off.
     pub thinking: Option<bool>,
@@ -460,8 +466,31 @@ pub fn model_rows(client: &Client, project_id: &str) -> Result<Vec<ModelRow>, St
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|model| model_row(model, state.get(model["name"].as_str().unwrap_or_default()), total_gb))
+        .map(|model| {
+            let mut row = model_row(model, state.get(model["name"].as_str().unwrap_or_default()), total_gb);
+            if row.downloaded {
+                row.disk_bytes = model["model_id"].as_str().and_then(model_disk_bytes);
+            }
+            row
+        })
         .collect())
+}
+
+/// What the files of `model_id` take in the workspace's `models/`, as
+/// Ollama's list shows: only for the agent this CLI runs, on this machine.
+fn model_disk_bytes(model_id: &str) -> Option<u64> {
+    if !is_local() || model_id.is_empty() || model_id.split('/').any(|part| part == "..") {
+        return None;
+    }
+    let dir = framework::find_workspace()?.join("models").join(model_id);
+    let bytes: u64 = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum();
+    (bytes > 0).then_some(bytes)
 }
 
 /// One catalog `model` as a row, with the project's `entry` for it, on a
@@ -496,9 +525,18 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
         cloud_ready: local && model["cloud"].as_bool().unwrap_or_default(),
         cloud_variant: local && model["cloud_variant"].as_bool().unwrap_or_default(),
         fits: fits(model["param_size_b"].as_f64(), total_gb),
-        cloud_copy: false,
+        size_b: model["param_size_b"].as_f64().filter(|n| *n > 0.0),
+        disk_bytes: None,
         thinking: model["thinking"].as_bool(),
+        display_name: model["display_name"].as_str().unwrap_or_default().trim().to_string(),
         name,
+    }
+}
+
+impl ModelRow {
+    /// The name to show: the display name, or the code name without one.
+    pub fn label(&self) -> &str {
+        if self.display_name.is_empty() { &self.name } else { &self.display_name }
     }
 }
 
@@ -823,52 +861,6 @@ fn logged_in_as(status: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// The web app the browser signs in on, overridable for staging.
-pub fn app_url() -> String {
-    std::env::var("SMARTLOOP_APP_URL")
-        .unwrap_or_else(|_| "https://app.smartloop.ai".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// How long the browser has to finish signing in.
-const BROWSER_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Sign in on app.smartloop.ai, as the desktop app does: its login page, in
-/// desktop mode, hands the tokens to the agent's `/v1/auth/callback` on this
-/// machine, so all that's left here is to wait for them to land. `on_url`
-/// is told the page opened, for when no browser comes up.
-pub fn browser_login(client: &Client, on_url: impl FnOnce(&str)) -> Result<String, String> {
-    if let Some(who) = already_signed_in(client)? {
-        return Ok(who);
-    }
-
-    // The page posts to 127.0.0.1, so it has to be an agent on this machine.
-    let Some(port) = local_agent_port(&base_url()) else {
-        return Err(format!(
-            "Browser sign-in needs an agent on this machine, not {}; use --device or --token",
-            base_url()
-        ));
-    };
-    let url = format!("{}/login?mode=desktop&port={}", app_url(), port);
-    on_url(&url);
-    open_browser(&url);
-
-    let started = std::time::Instant::now();
-    while started.elapsed() < BROWSER_LOGIN_TIMEOUT {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let Ok(status) = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status") else {
-            continue;
-        };
-        if status["has_access_token"].as_bool().unwrap_or_default() {
-            if let Some(who) = logged_in_as(&status) {
-                return Ok(who);
-            }
-        }
-    }
-    Err("Timed out waiting for the browser sign-in".to_string())
-}
-
 /// "… ; log out first" when the agent already has a signed-in user.
 fn already_signed_in(client: &Client) -> Result<Option<String>, String> {
     let status = request_json(client, format!("{}/auth/status", api_url()), "read sign-in status")?;
@@ -880,33 +872,10 @@ fn already_signed_in(client: &Client) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// The port of an agent at *base* on this machine, or None for one elsewhere.
-fn local_agent_port(base: &str) -> Option<String> {
-    let host = base.split("://").nth(1).unwrap_or(base);
-    let (name, port) = host.rsplit_once(':').unwrap_or((host, "80"));
-    matches!(name, "localhost" | "127.0.0.1").then(|| port.to_string())
-}
-
-/// Whether plain `/login` should sign in with a code instead of the
-/// browser: the browser hand-off needs the agent on this machine, and a
-/// browser here for the user to see.
-pub fn prefers_device_login() -> bool {
-    let env = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    device_login_needed(
-        local_agent_port(&base_url()).is_some(),
-        env("SSH_CONNECTION") || env("SSH_TTY"),
-        cfg!(target_os = "linux") && !env("DISPLAY") && !env("WAYLAND_DISPLAY"),
-    )
-}
-
-fn device_login_needed(local_agent: bool, over_ssh: bool, no_display: bool) -> bool {
-    !local_agent || over_ssh || no_display
-}
-
 /// What the platform knows Docent Code by; the approval page names it.
 const DEVICE_CLIENT_ID: &str = "docent-code";
 
-/// Sign in with a code (RFC 8628), for when no browser here can: the agent
+/// Sign in with a code (RFC 8628), the one way `/login` signs in: the agent
 /// asks the platform for a code, `on_code` shows it with the page to enter
 /// it on (from any device), and the agent collects the tokens once it's
 /// approved. Docent only ever talks to the agent.
@@ -1136,21 +1105,6 @@ mod tests {
         assert!(matches!(parse(&["agent", "status"]).command, Some(Commands::Agent { .. })));
         // Options before a subcommand belong to the chat, not to `agent`.
         assert!(Args::try_parse_from(["docent", "-s", "abc", "agent", "status"]).is_err());
-    }
-
-    #[test]
-    fn browser_sign_in_needs_an_agent_here() {
-        assert_eq!(super::local_agent_port("http://localhost:8001").as_deref(), Some("8001"));
-        assert_eq!(super::local_agent_port("http://127.0.0.1:9000").as_deref(), Some("9000"));
-        assert_eq!(super::local_agent_port("https://agent.example.com:8001"), None);
-    }
-
-    #[test]
-    fn login_uses_a_code_where_the_browser_cant_reach() {
-        assert!(!super::device_login_needed(true, false, false), "a desktop with the agent here");
-        assert!(super::device_login_needed(false, false, false), "an agent elsewhere");
-        assert!(super::device_login_needed(true, true, false), "over SSH");
-        assert!(super::device_login_needed(true, false, true), "no display");
     }
 
     #[test]
