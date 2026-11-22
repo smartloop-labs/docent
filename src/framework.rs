@@ -458,37 +458,41 @@ fn project_dir_in(config: &serde_json::Value, project: &str) -> Option<PathBuf> 
         .map(PathBuf::from)
 }
 
-/// The workspace SLP is using: `config.json`'s workspace id, or the only
-/// UUID-named directory under the home that has a `models/` dir.
+/// The workspace SLP is using, waiting a while for a new agent to make it.
 fn workspace_dir() -> Option<PathBuf> {
-    let home = install_dir();
     for _ in 0..30 {
-        if let Some(id) = fs::read_to_string(home.join("config.json"))
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|c| c["workspace"]["id"].as_str().map(str::to_string))
-        {
-            return Some(home.join(id));
-        }
-
-        let candidates: Vec<PathBuf> = fs::read_dir(&home)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.len() == 36 && n.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-                    && p.join("models").is_dir()
-            })
-            .collect();
-        if candidates.len() == 1 {
-            return candidates.into_iter().next();
+        if let Some(dir) = find_workspace() {
+            return Some(dir);
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     None
+}
+
+/// The workspace SLP is using, as it stands: `config.json`'s workspace id,
+/// or the only UUID-named directory under the home that has a `models/` dir.
+pub fn find_workspace() -> Option<PathBuf> {
+    let home = install_dir();
+    if let Some(id) = fs::read_to_string(home.join("config.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|c| c["workspace"]["id"].as_str().map(str::to_string))
+    {
+        return Some(home.join(id));
+    }
+    let candidates: Vec<PathBuf> = fs::read_dir(&home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.len() == 36 && n.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                && p.join("models").is_dir()
+        })
+        .collect();
+    if candidates.len() == 1 { candidates.into_iter().next() } else { None }
 }
 
 /// Download the embedding GGUF to `<workspace>/models/embeddings/`, where SLP
