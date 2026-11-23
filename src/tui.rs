@@ -1216,14 +1216,12 @@ struct PreRun {
 /// A turn's native tool calling: the reply asks for `bash` calls, they run
 /// as a reply's fenced commands do, asked about first unless auto-approve
 /// is on, and their results go back in a turn of their own so the agent
-/// goes on, for `TOOL_ROUNDS` rounds at most.
+/// goes on until it's done.
 #[derive(Default)]
 struct Tooling {
     sent: Sent,
     /// The assistant and tool messages of the rounds so far.
     rounds: Vec<serde_json::Value>,
-    /// Rounds sent back so far.
-    round: u32,
     /// The last reply's calls, waiting on their results.
     calls: Vec<Call>,
     /// The command whose run failed last, to tell one failing again.
@@ -2935,8 +2933,8 @@ impl App {
     /// The last reply's tool calls, once each has its result and nothing
     /// else is going on (its files' check, a question about its commands,
     /// another turn), go back to the agent in a turn of their own, which
-    /// carries on the same request. That's done `TOOL_ROUNDS` times at
-    /// most, and not when a command failed twice running: then the results
+    /// carries on the same request. That's not done when a command failed
+    /// twice running: then the results
     /// ride with the next prompt instead, as a `!command`'s do.
     fn tool_round_done(&mut self) {
         let ready = self.tooling.as_ref().is_some_and(|t| !t.calls.is_empty() && t.calls.iter().all(|c| c.result.is_some()));
@@ -2946,12 +2944,7 @@ impl App {
         let Some(mut tooling) = self.tooling.take() else { return };
         let Some((project, _)) = self.project.clone() else { return };
         let calls = std::mem::take(&mut tooling.calls);
-        let stop = tooling.stop.take().or_else(|| {
-            (tooling.round >= TOOL_ROUNDS).then(|| {
-                format!("Stopped after {} tool rounds; the output is above, and goes with your next prompt", TOOL_ROUNDS)
-            })
-        });
-        if let Some(why) = stop {
+        if let Some(why) = tooling.stop.take() {
             self.entries.push(Entry::Warning(why));
             self.shell_context.extend(calls.into_iter().filter_map(|c| c.context));
             self.scroll_back = 0;
@@ -2964,7 +2957,6 @@ impl App {
                 "content": call.result.unwrap_or_default(),
             }));
         }
-        tooling.round += 1;
         let (sent, rounds) = (tooling.sent.clone(), tooling.rounds.clone());
         self.tooling = Some(tooling);
         self.start_turn(project, sent, Vec::new(), rounds);
@@ -5408,9 +5400,7 @@ impl App {
             if !self.queued.is_empty() && self.input.is_empty() {
                 keys.push(("↑", "unqueue"));
             }
-            if self.always_run {
-                keys.push(("tab", "auto-approve on"));
-            }
+            keys.push(("tab", if self.always_run { "auto-approve on" } else { "auto-approve off" }));
             if !self.jobs.is_empty() {
                 keys.push((tasks_key(), "running"));
             }
@@ -6134,9 +6124,6 @@ const SHELL_SHOWN: usize = 20;
 const MODELS_PAGE: usize = 5;
 /// How many times a reply's failed command is sent back to be fixed.
 const COMMAND_ROUNDS: u32 = 3;
-/// How many times a reply's tool calls go back with their results, per
-/// prompt: the agent looks around, builds and tests, a step a round.
-const TOOL_ROUNDS: u32 = 12;
 /// Characters before a chunk looked at again for tool-call markup, so a
 /// tag split between two chunks is still found.
 const MARKUP_TAIL: usize = 64;
@@ -7966,7 +7953,6 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Reply(_))) && app.entries.len() == entries + 1);
         assert!(app.shell_context.is_empty());
         let tooling = app.tooling.as_ref().unwrap();
-        assert_eq!(tooling.round, 1);
         assert_eq!(tooling.rounds[1], serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "Exit code: 0\nCompiling app\nFinished"}));
         assert_eq!(tooling.rounds[2]["tool_call_id"], "call_2");
 
@@ -7985,7 +7971,6 @@ mod tests {
         reply(&mut app, "", vec![call("call_4", "bash", r#"{"command":"cargo test"}"#)]);
         app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "test failed".into(), Some(Ended::Exited(101))));
         assert_eq!(last_round(&app)["content"], "Exit code: 101\ntest failed");
-        assert_eq!(app.tooling.as_ref().unwrap().round, 3);
         reply(&mut app, "", vec![call("call_5", "bash", r#"{"command":"cargo test"}"#)]);
         app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "test failed".into(), Some(Ended::Exited(101))));
         assert!(app.turn.is_none(), "no round after the same failure twice");
@@ -8006,24 +7991,6 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git status"));
         assert!(app.tooling.as_ref().unwrap().calls.is_empty());
 
-        // The rounds stop at the cap, as they do after a repeated failure.
-        app.tooling.as_mut().unwrap().round = TOOL_ROUNDS;
-        app.entries.push(Entry::Reply(Reply::default()));
-        app.turn = Some(Turn {
-            started: Instant::now(),
-            task: runtime.spawn(async {}),
-            entry: app.entries.len() - 1,
-            tokens: 0,
-            activity: None,
-            files_dir: Some(dir.path().to_path_buf()),
-            whole: Vec::new(),
-            calls: Vec::new(),
-        });
-        reply(&mut app, "", vec![call("call_6", "bash", r#"{"command":"ls"}"#)]);
-        app.apply(AppEvent::Ran(run_of(&app), "p1".into(), "src".into(), Some(Ended::Exited(0))));
-        assert!(app.turn.is_none());
-        assert!(matches!(app.entries.last(), Some(Entry::Warning(w)) if w.starts_with("Stopped after 12 tool rounds")));
-        assert_eq!(app.shell_context.len(), 1);
     }
 
     #[test]
@@ -8074,7 +8041,6 @@ mod tests {
         assert!(result.contains("    1  fn main() {}"), "{}", result);
         let tooling = app.tooling.as_ref().unwrap();
         assert_eq!(tooling.sent.whole, ["src/main.rs"]);
-        assert_eq!(tooling.round, 2);
         assert_eq!(app.turn.as_ref().unwrap().whole, ["src/main.rs"]);
 
         // A web search waits for its pages, with no question, then goes on.
@@ -10728,7 +10694,7 @@ mod tests {
         assert!(rows[status].ends_with("(0s · 40 tokens)"), "{}", text);
         assert!(rows[status + 1].starts_with("────"), "{}", text);
         assert!(rows[status + 2].starts_with('>'), "{}", text);
-        assert!(rows[23].contains("[enter] queue  [esc] interrupt  [?] shortcuts"), "{}", text);
+        assert!(rows[23].contains("[enter] queue  [esc] interrupt  [tab] auto-approve off  [?] shortcuts"), "{}", text);
     }
 
     #[test]
