@@ -445,6 +445,9 @@ enum Entry {
     Error(String),
     /// What a settled task did, under the last of its entries.
     Summary(String),
+    /// A prompt's work all done: how long it took, from the prompt to its
+    /// settling and any summary, and the tokens its replies streamed.
+    Finished(Duration, u64),
 }
 
 /// A file a reply wrote as it streamed: what it was before (`None`, new)
@@ -1598,8 +1601,14 @@ struct App {
     /// What the user's last prompt has done so far, across its tool and
     /// fix rounds, summarized once it settles.
     task: Option<summary::TaskRecord>,
+    /// When the user's last prompt was sent, and the tokens its replies
+    /// have streamed since, for the line that ends it: timed to that line,
+    /// so a summary's wait counts, as the next prompt waits on it too.
+    task_started: Instant,
+    task_tokens: u64,
     /// The summary asked for, by id, with the plain one that stands in
-    /// should it not come; the next prompt waits for it.
+    /// should it not come; the task's `Entry::Finished` goes under it. The
+    /// next prompt waits for it.
     summarizing: Option<(usize, String)>,
     /// Summaries asked for, for their ids.
     summaries: usize,
@@ -1707,6 +1716,8 @@ impl App {
             always_run: false,
             tooling: None,
             task: None,
+            task_started: Instant::now(),
+            task_tokens: 0,
             summarizing: None,
             summaries: 0,
             command_round: 0,
@@ -3041,6 +3052,7 @@ impl App {
                     if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                     match result {
                         Ok(stats) => {
+                            self.task_tokens += stats.tokens;
                             reply.stats = Some(stats);
                             if let Some(task) = &mut self.task {
                                 task.reply(&prose_of(&reply.text));
@@ -4438,6 +4450,8 @@ impl App {
         self.look_up = true;
         self.reference = None;
         self.task = Some(summary::TaskRecord::new(&input));
+        self.task_started = Instant::now();
+        self.task_tokens = 0;
         self.send_turn(input, message, files, making);
     }
 
@@ -4466,8 +4480,9 @@ impl App {
             && !self.entries.iter().any(|e| matches!(e, Entry::Shell(s) if !s.background && s.ended.is_none()))
     }
 
-    /// The user's task, once nothing more of it is coming, is summarized
-    /// when it changed or checked files: by the agent, or plainly from the
+    /// The user's task, once nothing more of it is coming, ends on a line
+    /// saying how long it took. One that changed or checked files is
+    /// summarized above that line: by the agent, or plainly from the
     /// record should it not answer.
     fn settle(&mut self) {
         let calling = self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.result.is_none()));
@@ -4475,10 +4490,12 @@ impl App {
             return;
         }
         let Some(task) = self.task.take() else { return };
-        let Some((project, _)) = self.project.clone() else { return };
-        if !task.worth_summarizing() {
+        let project = self.project.clone().map(|(project, _)| project);
+        let Some(project) = project.filter(|_| task.worth_summarizing()) else {
+            self.entries.push(self.finished());
+            self.scroll_back = 0;
             return;
-        }
+        };
         self.summaries += 1;
         let id = self.summaries;
         self.summarizing = Some((id, task.plain()));
@@ -4495,7 +4512,14 @@ impl App {
     fn summarized(&mut self, id: usize, text: Option<String>) {
         let Some((_, plain)) = self.summarizing.take_if(|(asked, _)| *asked == id) else { return };
         self.entries.push(Entry::Summary(text.unwrap_or(plain)));
+        self.entries.push(self.finished());
         self.scroll_back = 0;
+    }
+
+    /// The line the user's last prompt ends on: how long since it was
+    /// sent, and the tokens its replies streamed.
+    fn finished(&self) -> Entry {
+        Entry::Finished(self.task_started.elapsed(), self.task_tokens)
     }
 
     /// Send the next queued prompt once the one before it is all done.
@@ -5048,6 +5072,7 @@ impl App {
                     lines.push(Line::from(std::iter::once(Span::raw("  ")).chain(line.spans).collect::<Vec<_>>()));
                 }
             }
+            Entry::Finished(took, tokens) => lines.push(Line::styled(finished_line(*took, *tokens), dim())),
         }
     }
 
@@ -5954,6 +5979,7 @@ fn entry_version(entry: &Entry) -> u64 {
         Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) | Entry::Summary(text) => {
             text.hash(&mut h)
         }
+        Entry::Finished(took, tokens) => (took, tokens).hash(&mut h),
     }
     h.finish()
 }
@@ -6528,12 +6554,23 @@ fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<
             let what = if shell.background { "  … running in the background" } else { "  … running" };
             vec![Span::styled(what, dim()), Span::styled("  ✕ stop", stop)]
         }
-        Some(Ended::Exited(0)) => vec![Span::styled("  ✓ done", Style::new().fg(Color::Green))],
+        // Only what went wrong is said: the task's `Finished` line ends it.
+        Some(Ended::Exited(0)) => return,
         Some(Ended::Exited(c)) => vec![Span::styled(format!("  ✗ exited with {}", c), Style::new().fg(Color::Red))],
         Some(Ended::Killed) => vec![Span::styled("  ✗ killed by a signal", Style::new().fg(Color::Red))],
         Some(Ended::Stopped) => vec![Span::styled("  ■ stopped", Style::new().fg(Color::Yellow))],
     };
     lines.push(Line::from(end));
+}
+
+/// The line a prompt's work ends on: "■ Finished in 1min 12s · 4321 tokens".
+fn finished_line(took: Duration, tokens: u64) -> String {
+    let took = format_duration(took);
+    match tokens {
+        0 => format!("■ Finished in {took}"),
+        1 => format!("■ Finished in {took} · 1 token"),
+        n => format!("■ Finished in {took} · {n} tokens"),
+    }
 }
 
 /// The reply's commands, to allow or skip: each script's lines. The keys
@@ -7525,7 +7562,8 @@ mod tests {
         assert_eq!((output.as_str(), ended), (format!("{}echo hello\nhello", TRACE).as_str(), Some(Ended::Exited(0))));
         app.apply(AppEvent::Shell(shell.id, output, ended));
         let text = screen(&app, 80, 24);
-        assert!(text.contains("! echo hello") && text.contains("  │ hello") && text.contains("  ✓ done"), "{}", text);
+        // Done, it says nothing more: only what went wrong is said.
+        assert!(text.contains("! echo hello") && text.contains("  │ hello") && !text.contains("done"), "{}", text);
         // The shell's trace of the one command is the entry's first line again.
         assert!(!text.contains("$ echo hello"), "{}", text);
         assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\n$ echo hello\nhello\n```"]);
@@ -7615,6 +7653,24 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_block_says_how_it_ended_only_when_that_was_not_a_success() {
+        let last = |ended: Option<Ended>, background: bool| {
+            let shell = Shell { id: 1, command: "make".into(), output: String::new(), ended, background, detached: false };
+            let mut lines = Vec::new();
+            shell_lines(&shell, "⠋", SHELL_SHOWN, &mut lines);
+            lines.last().map(|l| l.to_string()).unwrap_or_default()
+        };
+        assert_eq!(last(None, false), "  … running  ✕ stop");
+        assert_eq!(last(None, true), "  … running in the background  ✕ stop");
+        // A success says nothing more: the command is the block's last line.
+        assert_eq!(last(Some(Ended::Exited(0)), false), "! make");
+        assert_eq!(last(Some(Ended::Exited(0)), true), "! make");
+        assert_eq!(last(Some(Ended::Exited(2)), false), "  ✗ exited with 2");
+        assert_eq!(last(Some(Ended::Killed), false), "  ✗ killed by a signal");
+        assert_eq!(last(Some(Ended::Stopped), true), "  ■ stopped");
+    }
+
+    #[test]
     fn a_script_shows_each_command_over_what_it_printed() {
         let script = "git fetch --prune\ngit branch -a";
         let mut shell = Shell { id: 1, command: script.into(), output: String::new(), ended: None, background: false, detached: false };
@@ -7631,7 +7687,7 @@ mod tests {
         shell.ended = Some(Ended::Exited(0));
         assert_eq!(
             rows(&shell),
-            ["! git fetch --prune", "  │ From github.com:x/y", "  │  - [deleted] old", "$ git branch -a", "  │ * main", "  ✓ done"]
+            ["! git fetch --prune", "  │ From github.com:x/y", "  │  - [deleted] old", "$ git branch -a", "  │ * main"]
         );
         // bash marks a nested `$(...)` with one more marker; a `+` or `$`
         // in the output itself is output.
@@ -8085,11 +8141,14 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "app".into()));
-        // A plain answer is its own summary.
+        // A plain answer is its own summary: it ends on how long it took.
         app.task = Some(summary::TaskRecord::new("what is this?"));
         turn(&mut app, "A Rust project.");
         app.settle();
         assert!(app.task.is_none() && app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 1))));
+        assert!(screen(&app, 80, 30).contains("■ Finished in 0s · 1 token"));
+        app.task_tokens = 0;
         // A task that writes a file isn't summarized while it's checked.
         app.task = Some(summary::TaskRecord::new("add main"));
         turn(&mut app, "Done.\n\n`src/main.rs`\n```rust\nfn main() {}\n```\n");
@@ -8106,15 +8165,85 @@ mod tests {
         assert!(screen(&app, 80, 30).contains("Summarizing… (esc skips)"));
         app.settle();
         assert_eq!(app.summaries, 1, "asked once");
-        // The agent's summary goes under the task.
+        // The agent's summary goes under the task, over its finished line.
         app.apply(AppEvent::Summary(asked, Some("Added src/main.rs; it builds and its tests pass.".into())));
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == "Added src/main.rs; it builds and its tests pass."));
+        let at = app.entries.len() - 2;
+        assert!(matches!(&app.entries[at], Entry::Summary(s) if s == "Added src/main.rs; it builds and its tests pass."));
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 1))));
         assert!(app.idle());
         let text = screen(&app, 80, 30);
         assert!(text.contains("■ Summary") && text.contains("  Added src/main.rs; it builds"), "{}", text);
+        assert!(text.find("■ Summary") < text.rfind("■ Finished in"), "{}", text);
         // Asked again, it's not said twice.
         app.apply(AppEvent::Summary(asked, Some("again".into())));
         assert_eq!(summaries(&app), 1);
+    }
+
+    #[test]
+    fn a_prompts_tokens_add_up_over_its_turns_and_start_again_with_the_next() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let turn = |app: &mut App, tokens: u64| {
+            app.entries.push(Entry::Reply(Reply::default()));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: None,
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens, elapsed: Duration::from_secs(1), cut_off: false })));
+        };
+        let finished = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Finished(..))).count();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        // Left over from the prompt before: a new prompt starts again.
+        app.task_tokens = 7;
+        app.send_prompt("what is this?".into(), Vec::new());
+        assert!(app.task.is_some() && app.task_tokens == 0);
+        // A tool round and the answer: one prompt, its tokens summed.
+        turn(&mut app, 3);
+        turn(&mut app, 4);
+        app.settle();
+        // With no project, nothing's summarized, but it still ends.
+        assert!(app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 7))));
+        assert!(screen(&app, 80, 30).contains("■ Finished in 0s · 7 tokens"));
+        // Settled, it isn't said again.
+        app.settle();
+        assert_eq!(finished(&app), 1);
+    }
+
+    #[test]
+    fn a_task_that_asks_back_ends_unsummarized_and_a_stopped_one_not_at_all() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        // It changed a file, but waits on the user: no summary, the line.
+        let mut task = summary::TaskRecord::new("add a prefix");
+        task.file("src/main.rs", false, 2, 1);
+        task.reply("Which prefix format do you use?");
+        app.task = Some(task);
+        app.settle();
+        assert!(app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(..))));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Summary(_))));
+        // Stopped partway, it didn't finish: no line.
+        let entries = app.entries.len();
+        app.task = Some(summary::TaskRecord::new("add main"));
+        app.stop_turn();
+        app.settle();
+        assert_eq!(app.entries.len(), entries);
+    }
+
+    #[test]
+    fn the_finished_line_says_how_long_and_how_many_tokens() {
+        assert_eq!(finished_line(Duration::from_secs(5), 0), "■ Finished in 5s");
+        assert_eq!(finished_line(Duration::from_secs(5), 1), "■ Finished in 5s · 1 token");
+        assert_eq!(finished_line(Duration::from_secs(72), 4321), "■ Finished in 1min 12s · 4321 tokens");
     }
 
     #[test]
@@ -8129,11 +8258,12 @@ mod tests {
         let (asked, _) = app.summarizing.clone().expect("asked");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let plain = "Updated Cargo.toml (+1 −1).";
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
+        let summary = |app: &App| matches!(&app.entries[app.entries.len() - 2], Entry::Summary(s) if s == plain);
+        assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
         assert!(app.summarizing.is_none() && app.idle());
         // The agent's, coming late, goes nowhere.
         app.apply(AppEvent::Summary(asked, Some("late".into())));
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
+        assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
     }
 
     #[test]

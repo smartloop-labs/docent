@@ -211,10 +211,8 @@ touches anything outside your files:
       4 +fn greet(name: &str) { println!("hello, {name}"); }
 
 ! cargo check --quiet
-  ✓ done
 
 ! cargo test --quiet
-  ✓ done
 
 ? Run these in the folder?
   $ git commit -am "greet takes a name"
