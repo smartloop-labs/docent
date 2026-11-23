@@ -49,7 +49,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::chat::{self, ChatEvent, TurnStats};
 use crate::progress::{self, Steps, format_duration, format_size};
 use crate::usage::{CreditUsage, SearchUsage};
-use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills};
+use crate::{ModelRow, apidocs, docent, files, framework, lsp, mcp, prerun, skills, summary};
 
 const TICK: Duration = Duration::from_millis(100);
 /// How often the welcome card's agent state is re-read.
@@ -193,6 +193,9 @@ enum AppEvent {
     Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
     /// The pre-run skill's lookup is done: the turn it held goes now.
     PreRun(Box<PreRun>),
+    /// The agent's summary of a settled task, by the ask's id; `None` when
+    /// it couldn't give one.
+    Summary(usize, Option<String>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -440,6 +443,8 @@ enum Entry {
     Notice(String),
     Warning(String),
     Error(String),
+    /// What a settled task did, under the last of its entries.
+    Summary(String),
 }
 
 /// A file a reply wrote as it streamed: what it was before (`None`, new)
@@ -891,6 +896,11 @@ fn segments(text: &str) -> Vec<(bool, String, usize)> {
         out.push((false, lines[prose..].join("\n"), prose));
     }
     out
+}
+
+/// A reply's prose, its code blocks and files left out.
+fn prose_of(text: &str) -> String {
+    segments(text).into_iter().filter(|(code, ..)| !code).map(|(_, prose, _)| prose).collect::<Vec<_>>().join("\n")
 }
 
 /// `markdown` laid out at `width`, links and bare web addresses clickable.
@@ -1590,6 +1600,14 @@ struct App {
     /// The last turn's tool calling, when it works in a folder of the
     /// user's.
     tooling: Option<Tooling>,
+    /// What the user's last prompt has done so far, across its tool and
+    /// fix rounds, summarized once it settles.
+    task: Option<summary::TaskRecord>,
+    /// The summary asked for, by id, with the plain one that stands in
+    /// should it not come; the next prompt waits for it.
+    summarizing: Option<(usize, String)>,
+    /// Summaries asked for, for their ids.
+    summaries: usize,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
@@ -1693,6 +1711,9 @@ impl App {
             ask: None,
             always_run: false,
             tooling: None,
+            task: None,
+            summarizing: None,
+            summaries: 0,
             command_round: 0,
             look_up: false,
             pre_run: None,
@@ -1722,6 +1743,7 @@ impl App {
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(TICK);
         while !self.quit {
+            self.settle();
             self.send_queued();
             terminal
                 .draw(|frame| self.draw(frame))
@@ -2221,6 +2243,9 @@ impl App {
         for (path, created, added, removed) in reported {
             let what = if created { "created" } else { "updated" };
             self.entries.push(Entry::Notice(format!("  {} {} (+{} −{})", what, path, added, removed)));
+            if let Some(task) = &mut self.task {
+                task.file(path, created, added, removed);
+            }
         }
         for e in &early {
             if !written.contains(&e.path) {
@@ -2455,6 +2480,9 @@ impl App {
             AfterCheck::Fix(_) if check.tests && self.test_round >= TEST_ROUNDS => AfterCheck::OutOfRounds,
             outcome => outcome,
         };
+        if let Some(task) = &mut self.task {
+            task.check(&check.command, outcome == AfterCheck::Passed);
+        }
         match outcome {
             AfterCheck::Passed => {
                 let fixed = if self.fix_round > 0 { format!(" after {} fix(es)", self.fix_round) } else { String::new() };
@@ -2803,6 +2831,12 @@ impl App {
     /// with other commands or with files, for a few rounds only. Done, it
     /// isn't asked anything: what was printed rides with the next prompt.
     fn ran(&mut self, id: usize, project: String, output: String, ended: Option<Ended>) {
+        if let Some(ended) = ended
+            && let Some(command) = self.shell_of(id).map(|s| s.command.clone())
+            && let Some(task) = &mut self.task
+        {
+            task.command(&command, ended.code(), &strip_ansi(&output));
+        }
         if self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.run == Some(id))) {
             return self.tool_ran(id, project, output, ended);
         }
@@ -2939,6 +2973,8 @@ impl App {
     fn stop_turn(&mut self) {
         self.commands = None;
         self.tooling = None;
+        self.task = None;
+        self.summarizing = None;
         if self.pre_run.take().is_some() {
             self.entries.push(Entry::Notice("Stopped reading the API; the prompt wasn't sent".to_string()));
         }
@@ -3007,6 +3043,7 @@ impl App {
                 }
             }
             AppEvent::Chat(event) => self.chat_event(event),
+            AppEvent::Summary(id, text) => self.summarized(id, text),
             AppEvent::TurnDone(result) => {
                 let Some(turn) = self.turn.take() else { return };
                     // A turn can add a skill ("save this as a skill"); read the
@@ -3016,6 +3053,9 @@ impl App {
                     match result {
                         Ok(stats) => {
                             reply.stats = Some(stats);
+                            if let Some(task) = &mut self.task {
+                                task.reply(&prose_of(&reply.text));
+                            }
                             if let Some(root) = turn.files_dir {
                                 if reply.root.is_none() {
                                     reply.root = Some(root.clone());
@@ -4034,6 +4074,8 @@ impl App {
             }
             // Esc interrupts the reply: the next queued prompt goes at once.
             KeyCode::Esc if self.turn.is_some() || self.pre_run.is_some() => self.stop_turn(),
+            // Esc doesn't wait for the agent's summary: the plain one goes.
+            KeyCode::Esc if let Some((id, _)) = self.summarizing => self.summarized(id, None),
             // Up on an empty prompt takes back the last queued one, to edit.
             KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
                 let last = self.queued.pop().expect("queued is not empty");
@@ -4401,6 +4443,7 @@ impl App {
         self.failures.clear();
         self.look_up = true;
         self.reference = None;
+        self.task = Some(summary::TaskRecord::new(&input));
         self.send_turn(input, message, files, making);
     }
 
@@ -4425,7 +4468,40 @@ impl App {
             && self.ask.is_none()
             && self.commands.is_none()
             && self.check.is_none()
+            && self.summarizing.is_none()
             && !self.entries.iter().any(|e| matches!(e, Entry::Shell(s) if !s.background && s.ended.is_none()))
+    }
+
+    /// The user's task, once nothing more of it is coming, is summarized
+    /// when it changed or checked files: by the agent, or plainly from the
+    /// record should it not answer.
+    fn settle(&mut self) {
+        let calling = self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.result.is_none()));
+        if self.task.is_none() || calling || !self.idle() {
+            return;
+        }
+        let Some(task) = self.task.take() else { return };
+        let Some((project, _)) = self.project.clone() else { return };
+        if !task.worth_summarizing() {
+            return;
+        }
+        self.summaries += 1;
+        let id = self.summaries;
+        self.summarizing = Some((id, task.plain()));
+        if cfg!(test) {
+            return;
+        }
+        let body = task.body(&project);
+        self.spawn(move |client, tx| {
+            let _ = tx.send(AppEvent::Summary(id, summary::summarize(&client, &body).ok().flatten()));
+        });
+    }
+
+    /// Summary `id` is in, the agent's or `None` for the plain one.
+    fn summarized(&mut self, id: usize, text: Option<String>) {
+        let Some((_, plain)) = self.summarizing.take_if(|(asked, _)| *asked == id) else { return };
+        self.entries.push(Entry::Summary(text.unwrap_or(plain)));
+        self.scroll_back = 0;
     }
 
     /// Send the next queued prompt once the one before it is all done.
@@ -4758,6 +4834,7 @@ impl App {
                 }
                 lines.push(working(what, detail));
             }
+            (_, None) if self.summarizing.is_some() => lines.push(working("Summarizing".to_string(), "esc skips".to_string())),
             _ => {}
         }
         lines
@@ -4968,6 +5045,15 @@ impl App {
                 Span::styled(text.clone(), dim()),
             ])),
             Entry::Error(text) => lines.push(error_line(text)),
+            Entry::Summary(text) => {
+                lines.push(Line::from(vec![
+                    Span::styled("■ ", Style::new().fg(pink())),
+                    Span::styled("Summary", Style::new().add_modifier(Modifier::BOLD)),
+                ]));
+                for line in prose_lines(text, reply_width(width)) {
+                    lines.push(Line::from(std::iter::once(Span::raw("  ")).chain(line.spans).collect::<Vec<_>>()));
+                }
+            }
         }
     }
 
@@ -5873,7 +5959,9 @@ fn entry_version(entry: &Entry) -> u64 {
         }
         Entry::Shell(shell) => (shell.id, shell.output.len(), shell.ended.is_some()).hash(&mut h),
         Entry::Ask(root, commands) => (root, commands).hash(&mut h),
-        Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) => text.hash(&mut h),
+        Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) | Entry::Summary(text) => {
+            text.hash(&mut h)
+        }
     }
     h.finish()
 }
@@ -8003,6 +8091,81 @@ mod tests {
         assert!(app.turn.is_some(), "the next round was sent");
         let rounds = &app.tooling.as_ref().unwrap().rounds;
         assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: tokio select");
+    }
+
+    #[test]
+    fn a_settled_task_is_summarized_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let turn = |app: &mut App, text: &str| {
+            app.entries.push(Entry::Reply(Reply { text: text.into(), ..Default::default() }));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: Some(dir.path().to_path_buf()),
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
+        };
+        let summaries = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Summary(_))).count();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        // A plain answer is its own summary.
+        app.task = Some(summary::TaskRecord::new("what is this?"));
+        turn(&mut app, "A Rust project.");
+        app.settle();
+        assert!(app.task.is_none() && app.summarizing.is_none());
+        // A task that writes a file isn't summarized while it's checked.
+        app.task = Some(summary::TaskRecord::new("add main"));
+        turn(&mut app, "Done.\n\n`src/main.rs`\n```rust\nfn main() {}\n```\n");
+        app.settle();
+        assert!(app.summarizing.is_none(), "the check is still running");
+        let id = app.check.as_ref().expect("a check runs").id;
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
+        let id = app.check.as_ref().expect("the tests run").id;
+        app.apply(AppEvent::Check(id, String::new(), Ended::Exited(0)));
+        app.settle();
+        let (asked, plain) = app.summarizing.clone().expect("a summary is asked for once it settles");
+        assert_eq!(plain, "Created src/main.rs (+1 −0). `cargo check --quiet` passed. `cargo test --quiet` passed.");
+        assert!(!app.idle(), "the next prompt waits for it");
+        assert!(screen(&app, 80, 30).contains("Summarizing… (esc skips)"));
+        app.settle();
+        assert_eq!(app.summaries, 1, "asked once");
+        // The agent's summary goes under the task.
+        app.apply(AppEvent::Summary(asked, Some("Added src/main.rs; it builds and its tests pass.".into())));
+        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == "Added src/main.rs; it builds and its tests pass."));
+        assert!(app.idle());
+        let text = screen(&app, 80, 30);
+        assert!(text.contains("■ Summary") && text.contains("  Added src/main.rs; it builds"), "{}", text);
+        // Asked again, it's not said twice.
+        app.apply(AppEvent::Summary(asked, Some("again".into())));
+        assert_eq!(summaries(&app), 1);
+    }
+
+    #[test]
+    fn esc_skips_the_agents_summary_for_the_plain_one() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let mut task = summary::TaskRecord::new("bump the version");
+        task.file("Cargo.toml", false, 1, 1);
+        app.task = Some(task);
+        app.settle();
+        let (asked, _) = app.summarizing.clone().expect("asked");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let plain = "Updated Cargo.toml (+1 −1).";
+        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
+        assert!(app.summarizing.is_none() && app.idle());
+        // The agent's, coming late, goes nowhere.
+        app.apply(AppEvent::Summary(asked, Some("late".into())));
+        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
     }
 
     #[test]
