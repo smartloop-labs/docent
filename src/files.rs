@@ -1913,25 +1913,16 @@ pub fn plan(root: &Path, files: Vec<File>, whole: &[String]) -> Plan {
     plan
 }
 
-/// Lines added and removed going from `old` to `new`, by their longest
-/// common run of lines; past a size where that costs too much, every line
-/// counts as changed.
+/// Lines added and removed going from `old` to `new`, by a Myers diff of
+/// their lines, as `git diff` counts them.
 pub fn line_changes(old: &str, new: &str) -> (usize, usize) {
     let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
-    if a.len() * b.len() > 4_000_000 {
-        return (b.len(), a.len());
-    }
-    let mut row = vec![0usize; b.len() + 1];
-    for x in &a {
-        let mut diagonal = 0;
-        for (j, y) in b.iter().enumerate() {
-            let above = row[j + 1];
-            row[j + 1] = if x == y { diagonal + 1 } else { above.max(row[j]) };
-            diagonal = above;
+    similar::capture_diff_slices(similar::Algorithm::Myers, &a, &b).iter().fold((0, 0), |(added, removed), op| {
+        match op.as_tag_tuple() {
+            (similar::DiffTag::Equal, ..) => (added, removed),
+            (_, gone, came) => (added + came.len(), removed + gone.len()),
         }
-    }
-    let common = row[b.len()];
-    (b.len() - common, a.len() - common)
+    })
 }
 
 /// Write `files` under `root`, making their folders: the paths written,
@@ -2424,6 +2415,12 @@ mod tests {
         assert_eq!(line_changes("", "a\nb\n"), (2, 0));
         assert_eq!(line_changes("a\nb\nc\n", "a\nx\nc\nd\n"), (2, 1));
         assert_eq!(line_changes("a\n", "a\n"), (0, 0));
+        assert_eq!(line_changes("a\nb\n", ""), (0, 2));
+        assert_eq!(line_changes("", ""), (0, 0));
+        // A few lines in a big file are a few lines, not the whole file.
+        let old: String = (0..5_000).map(|i| format!("line {i}\n")).collect();
+        let new = old.replacen("line 10\n", "// why\nline 10\n", 1).replacen("line 4000\n", "line 4000!\n", 1);
+        assert_eq!(line_changes(&old, &new), (2, 1));
     }
 
     #[test]

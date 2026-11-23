@@ -43,6 +43,8 @@ serde = { version = "1", features = ["derive"] }
 tui-markdown = "0.3.12"
 pulldown-cmark = { version = "0.13", default-features = false }
 unicode-width = "0.2"
+# Line diffs of files a reply changes.
+similar = "3.2.1"
 
 # To end a shell command's whole process group on /stop, and on quitting.
 [target.'cfg(unix)'.dependencies]
