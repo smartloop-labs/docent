@@ -1,6 +1,6 @@
 # Docent
 
-The private coding agent for your terminal. Frontier quality, local first.
+The private code agent for your terminal. Frontier quality, local first.
 
 Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. Before it writes, it reads the current API of the libraries the change uses from their installed packages. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd), your build and your tests, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent. What you ask it to remember, it keeps for the project.
 
@@ -88,7 +88,7 @@ Any command that talks to the agent starts it when none is running. It
 listens on a free port it picks itself and writes it to
 `~/.smartloop/server.port`, where the CLI reads it. On first use that means:
 
-1. Start the agent, which is built into the CLI (SLP framework 1.2.9), in
+1. Start the agent, which is built into the CLI (SLP framework 1.2.34), in
    the background with `SLP_HOME=~/.smartloop`, logging to
    `~/.smartloop/server.log`. An agent the chat started stops when it exits
    (unless another `docent` is still open); one started with
@@ -183,10 +183,10 @@ that answered:
   ⎿  sl-mini · 7 tokens · 0.4 tok/s · 16s
 
 [-] Reading en.wikipedia.org… (4s)
-╭──────────────────────────────────────────────────────────────────────╮
-│ >                                                                    │
-╰──────────────────────────────────────────────────────────────────────╯
-  [enter] send  [esc] interrupt  [?] shortcuts
+────────────────────────────────────────────────────────────────────────
+> Ask anything, or drop a file to attach it
+────────────────────────────────────────────────────────────────────────
+  [enter] queue  [esc] interrupt  [tab] auto-approve off  [?] shortcuts
 ```
 
 It chats in the server's current project, or the one given with `--project`.
@@ -195,13 +195,21 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | Key | Does |
 | --- | --- |
 | `?` | shortcuts |
+| `Enter` | send the prompt; while a reply runs, queue it to go once the reply and what follows are done |
 | `Shift+Enter`, `Alt+Enter`, `Ctrl+J` | new line |
-| `Esc` | interrupt the reply |
+| `Esc` | interrupt the reply; the next queued prompt goes at once |
+| `Esc` `Esc` | clear the prompt |
+| `↑` with prompts queued | take back the last queued prompt to edit it |
+| `↑` `↓` | earlier prompts, past the prompt's first or last line |
+| `Enter`, `Tab`, `Esc` | a reply's commands, asked in the prompt: run, run and always this session, skip |
+| `Tab` | on an empty prompt: auto-approve on or off, so a reply's commands run without asking |
 | wheel, `PgUp`/`PgDn` | scroll; drag to select and copy |
 | drop a file | attach an image (PNG, JPEG) or document (PDF, Office, CSV, text) |
 | drop a `.zip` | on an empty prompt, fills in `/project import` for it |
 | `Ctrl+O` | models: enable, disable, download |
-| `Ctrl+P` | projects: switch, create, import, delete |
+| `Ctrl+P` | projects: switch (in a new session), create, delete |
+| `Ctrl+B` | the commands still running (`/tasks`) |
+| `Ctrl+C` | quit |
 | `Ctrl+S` | web search on or off |
 
 | Command | Does |
@@ -209,6 +217,7 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | `/login`, `/logout` | sign in with a code you confirm in any browser (`--token` to paste one) |
 | `/models` | enable, disable and download models |
 | `/models <name> caps <list\|auto>` | set a model's capabilities here, over the catalog's, as in `text,vision,reasoning`; `auto` goes back to the catalog's |
+| `/models <name> thinking on\|off` | reasoning first, or a sooner answer (`Ctrl+T` in `/models`) |
 | `/mcp` | MCP servers; `/mcp add <url>` connects one |
 | `/project` | projects: switch (in a new session), create, import, delete |
 | `/project <name>` | switch to a project by its name or ID |
@@ -235,8 +244,8 @@ docent run "what are some things to do in madrid spain?"
 Options:
 
 ```sh
-docent run --project <project-id>   # chat in this project
-docent run --session <session-id>   # resume an existing session; a new one is created when omitted
+docent run --project <project-id>   # chat in this project (-p)
+docent run --session <session-id>   # resume an existing session (-s); a new one is created when omitted
 ```
 
 `docent` runs in a terminal only: with its input or output piped, it says so
