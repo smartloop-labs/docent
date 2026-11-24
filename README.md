@@ -297,23 +297,6 @@ What happens on each prompt:
 
 More in the [coding docs](https://smartloop.ai/docs/coding/).
 
-## Configuration
-
-The CLI connects to the local agent on whatever port it picked
-(`~/.smartloop/server.port`). Point it elsewhere with `SMARTLOOP_API_URL`:
-
-```sh
-SMARTLOOP_API_URL=http://localhost:9000 docent agent status
-```
-
-With `SMARTLOOP_API_URL` set, the CLI only connects: it never installs or starts
-an agent for that URL.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `SLP_HOME` | `~/.smartloop` | Where the workspace, models and logs live |
-| `SLP_PORT` | a free port | Pin the managed local agent to this port |
-
 ## License
 
 Released under the [MIT License](LICENSE).
