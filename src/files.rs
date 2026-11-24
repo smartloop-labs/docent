@@ -889,6 +889,9 @@ pub fn apply_edits(old: Option<&str>, edits: &[Edit]) -> Result<String, String> 
         None if edits[0].search.trim().is_empty() => (format!("{}\n", edits[0].replace), &edits[1..]),
         None => return Err("the file isn't there; give a new file whole as a heredoc".to_string()),
     };
+    if let Some(done) = apply_at_once(&text, rest) {
+        return Ok(done);
+    }
     for (n, edit) in rest.iter().enumerate() {
         let which = if edits.len() > 1 { format!("edit {} of {}", n + 1 + edits.len() - rest.len(), edits.len()) } else { "the edit".to_string() };
         if edit.search.trim().is_empty() {
@@ -984,9 +987,30 @@ fn unnumbered(text: &str) -> Option<String> {
 }
 
 fn replace_exactly(text: &str, edit: &Edit) -> Result<String, String> {
-    let (search, replace) = (edit.search.as_str(), edit.replace.as_str());
+    let replace = edit.replace.as_str();
+    Ok(match find(text, &edit.search)? {
+        Found::Bytes(start, end) => format!("{}{replace}{}", &text[..start], &text[end..]),
+        Found::Lines(from, to) => splice(&text.split_inclusive('\n').collect::<Vec<_>>(), from, to, replace),
+    })
+}
+
+/// Where a SEARCH is in a file's text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Found {
+    /// Its bytes, found exactly within lines.
+    Bytes(usize, usize),
+    /// Whole lines, by index: exactly, or as near as `find` reads them.
+    Lines(usize, usize),
+}
+
+/// Where `search`, found once, is in `text`: exactly, else line by line
+/// with its spacing let go, else by its first and last lines.
+fn find(text: &str, search: &str) -> Result<Found, String> {
     match text.matches(search).count() {
-        1 => return Ok(text.replacen(search, replace, 1)),
+        1 => {
+            let start = text.find(search).unwrap_or_default();
+            return Ok(Found::Bytes(start, start + search.len()));
+        }
         0 => {}
         n => return Err(format!("its SEARCH is found {n} times; give more lines around it so it's found once")),
     }
@@ -1000,7 +1024,7 @@ fn replace_exactly(text: &str, edit: &Edit) -> Result<String, String> {
             .filter(|&i| wanted.iter().enumerate().all(|(j, w)| same(lines[i + j], w)))
             .collect();
         match found.as_slice() {
-            [i] => return Ok(splice(&lines, *i, *i + wanted.len(), replace)),
+            [i] => return Ok(Found::Lines(*i, *i + wanted.len())),
             [] => {}
             many => return Err(format!("its SEARCH is found {} times; give more lines around it so it's found once", many.len())),
         }
@@ -1018,10 +1042,122 @@ fn replace_exactly(text: &str, edit: &Edit) -> Result<String, String> {
             })
             .collect();
         if let [(i, j)] = found.as_slice() {
-            return Ok(splice(&lines, *i, j + 1, replace));
+            return Ok(Found::Lines(*i, j + 1));
         }
     }
     Err("its SEARCH isn't in the file".to_string())
+}
+
+/// `text` with all of `edits` made at once, each found in `text` as it is
+/// and none in what another made; None when one isn't found, or two
+/// change the same lines differently, and they're made one at a time.
+///
+/// Models write pairs whose SEARCH lines overlap, each with the same
+/// lines around it as context, or a later pair repeating an earlier one.
+/// Made one at a time, the first changes what the next one searches for.
+/// Here each pair is diffed (`similar`), SEARCH to REPLACE, so it changes
+/// only the lines it really changes, where its SEARCH is in the file; a
+/// line two pairs keep as context is no clash, and the same change twice
+/// is made once.
+fn apply_at_once(text: &str, edits: &[Edit]) -> Option<String> {
+    if edits.len() < 2 {
+        return None;
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut changes = Vec::new();
+    for edit in edits {
+        changes.extend(edit_changes(text, &lines, edit)?);
+    }
+    // In order through the file; for two at the same place, in the
+    // pairs' order.
+    changes.sort_by_key(|c| (c.start, c.end));
+    changes.dedup();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (n, change) in changes.iter().enumerate() {
+        if change.start < at {
+            return None;
+        }
+        // An insertion where another change starts, after it, is fine;
+        // the same lines changed by two is a clash.
+        if changes[n + 1..].iter().any(|later| later.start < change.end) {
+            return None;
+        }
+        out.push_str(&text[at..change.start]);
+        out.push_str(&change.with);
+        at = change.end;
+    }
+    out.push_str(&text[at..]);
+    Some(out)
+}
+
+/// A change to a file's text as it is: its bytes from `start` to `end`
+/// give way to `with`.
+#[derive(Debug, Clone, PartialEq)]
+struct Change {
+    start: usize,
+    end: usize,
+    with: String,
+}
+
+/// The changes `edit` makes to `text` (its `lines`), found in it as it is:
+/// for whole lines, only those its REPLACE changes; else its SEARCH as a
+/// whole. None when it isn't found.
+fn edit_changes(text: &str, lines: &[&str], edit: &Edit) -> Option<Vec<Change>> {
+    // Of the ways to read it, the one with the most search text found.
+    let numbered = unnumbered(&edit.search).map(|search| (search, unnumbered(&edit.replace).unwrap_or_else(|| edit.replace.clone())));
+    let (search, replace, found) = std::iter::once((edit.search.clone(), edit.replace.clone()))
+        .chain(edit.splits.iter().cloned())
+        .chain(numbered)
+        .filter(|(search, _)| !search.trim().is_empty())
+        .filter_map(|(search, replace)| find(text, &search).ok().map(|found| (search, replace, found)))
+        .max_by_key(|(search, ..)| search.len())?;
+    let offset = |line: usize| lines[..line].iter().map(|l| l.len()).sum::<usize>();
+    let (from, to) = match found {
+        Found::Lines(from, to) => (from, to),
+        // Found exactly, on whole lines, it's those lines.
+        Found::Bytes(start, end) => {
+            let at_start = start == 0 || text.as_bytes()[start - 1] == b'\n';
+            let at_end = end == text.len() || text.as_bytes()[end - 1] == b'\n' || text.as_bytes()[end] == b'\n';
+            if !(at_start && at_end) {
+                return Some(vec![Change { start, end, with: replace }]);
+            }
+            let from = text[..start].matches('\n').count();
+            let to = from + text[start..end].strip_suffix('\n').unwrap_or(&text[start..end]).matches('\n').count() + 1;
+            (from, to)
+        }
+    };
+    let (old, new): (Vec<&str>, Vec<&str>) = (search.lines().collect(), replace.lines().collect());
+    // Found by its first and last lines, its middle isn't the file's line
+    // for line: it's all changed.
+    if old.len() != to - from {
+        let mut with = replace.clone();
+        if !with.is_empty() && (lines[to - 1].ends_with('\n') || to < lines.len()) {
+            with.push('\n');
+        }
+        return Some(vec![Change { start: offset(from), end: offset(to), with }]);
+    }
+    let ends_bare = !text.is_empty() && !text.ends_with('\n');
+    let changes = similar::capture_diff_slices(similar::Algorithm::Myers, &old, &new)
+        .iter()
+        .filter_map(|op| match op.as_tag_tuple() {
+            (similar::DiffTag::Equal, ..) => None,
+            (_, gone, came) => {
+                let (a, b) = (from + gone.start, from + gone.end);
+                let mut with: String = new[came].iter().map(|l| format!("{l}\n")).collect();
+                // At the end of a file with no newline at its end, the
+                // last line keeps none.
+                if ends_bare && b == lines.len() && !with.is_empty() {
+                    with.pop();
+                    if a == b {
+                        with.insert(0, '\n');
+                    }
+                }
+                Some(Change { start: offset(a), end: offset(b), with })
+            }
+        })
+        .collect();
+    Some(changes)
 }
 
 /// `lines` with those from `from` to `to` put in place by `replace`.
@@ -1420,6 +1556,78 @@ pub fn may_close_block(line: &str) -> bool {
         || t.starts_with("~~~")
         || t.starts_with(">>>>>>>")
         || (!t.is_empty() && t.len() <= 32 && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Whether `text` may hold an edit written in a model's call markup (see
+/// [`edit_calls_as_blocks`]).
+pub fn has_edit_call_markup(text: &str) -> bool {
+    text.contains(FUNCTION_OPEN) || CALL_TAGS.iter().any(|tag| text.contains(tag))
+}
+
+/// `reply` with each edit written in a model's call markup made one docent
+/// reads: a file block under a line naming its path.
+///
+/// Qwen3-Coder, used to its own calls, writes an edit block as
+/// `<tool_call> <function=edit src/app.ts>`, then the SEARCH/REPLACE pairs
+/// (fenced or not), then `</function></tool_call>`. Docent has no `edit`
+/// tool, so the server reads no call there and passes the text on. The
+/// `<function=…>` line becomes the path on a line of its own, and the tags
+/// around the pairs go. Only whole lines change, so a line still streaming
+/// is left for the next pass; a `<function=name>` naming no path (a real
+/// call) is kept.
+pub fn edit_calls_as_blocks(reply: &str) -> String {
+    let mut out = String::with_capacity(reply.len());
+    let mut rest = reply;
+    while let Some(nl) = rest.find('\n') {
+        let line = &rest[..nl];
+        rest = &rest[nl + 1..];
+        if let Some(lines) = edit_call_line(line) {
+            for l in lines {
+                out.push_str(&l);
+                out.push('\n');
+            }
+            continue;
+        }
+        let mut kept = line;
+        for tag in CALL_TAGS {
+            kept = kept.trim_end().strip_suffix(tag).unwrap_or(kept);
+        }
+        let only_tags = kept.trim().is_empty() && !line.trim().is_empty();
+        if !only_tags {
+            out.push_str(if kept.len() < line.len() { kept.trim_end() } else { line });
+            out.push('\n');
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+const FUNCTION_OPEN: &str = "<function=";
+/// Tags around a call that go with it; trimmed from a line's end.
+const CALL_TAGS: [&str; 3] = ["</tool_call>", "</function>", "<tool_call>"];
+
+/// The lines a `<function=edit src/app.ts>` line becomes: what came ahead
+/// of the markup, the path, and what came after the tag. None for any other
+/// line, or a function tag naming no path.
+fn edit_call_line(line: &str) -> Option<Vec<String>> {
+    let open = line.find(FUNCTION_OPEN)?;
+    let inside = &line[open + FUNCTION_OPEN.len()..];
+    let close = inside.find('>')?;
+    let mut words = inside[..close].split_whitespace();
+    words.next()?;
+    let path = words.find_map(|w| as_path(w.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'))))?;
+    let before = line[..open].trim_end();
+    let before = before.strip_suffix("<tool_call>").unwrap_or(before).trim_end();
+    let after = inside[close + 1..].trim();
+    let mut lines = Vec::new();
+    if !before.is_empty() {
+        lines.push(before.to_string());
+    }
+    lines.push(path);
+    if !after.is_empty() {
+        lines.push(after.to_string());
+    }
+    Some(lines)
 }
 
 /// Whether `block`, a fenced block's text from its opening fence, has its
@@ -2591,6 +2799,66 @@ mod tests {
         assert!(!super::blocks(open)[0].closed);
         // With no file named, it isn't one.
         assert!(super::blocks("<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n").is_empty());
+    }
+
+    #[test]
+    fn overlapping_pairs_are_made_together() {
+        let file = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n";
+        // Both pairs hold the blank line and `fn b() {` as context: made one
+        // at a time, the first changes what the second searches for.
+        let made = apply_edits(
+            Some(file),
+            &[edit("    one();\n}\n\nfn b() {", "    uno();\n}\n\nfn b() {"), edit("}\n\nfn b() {\n    two();", "}\n\nfn b() {\n    dos();")],
+        )
+        .unwrap();
+        assert_eq!(made, "fn a() {\n    uno();\n}\n\nfn b() {\n    dos();\n}\n");
+        // The same pair twice is made once.
+        let twice = apply_edits(Some(file), &[edit("one();", "uno();"), edit("one();", "uno();")]).unwrap();
+        assert_eq!(twice, "fn a() {\n    uno();\n}\n\nfn b() {\n    two();\n}\n");
+        // A pair searching for what an earlier one made still goes, one
+        // at a time.
+        let chained = apply_edits(Some(file), &[edit("one();", "uno();"), edit("uno();", "eins();")]).unwrap();
+        assert!(chained.contains("eins();"), "{chained}");
+        // Two pairs changing one line differently: the second finds it gone.
+        assert!(apply_edits(Some(file), &[edit("    one();\n}", "    uno();\n}"), edit("fn a() {\n    one();", "fn a() {\n    eins();")]).is_err());
+        // Pairs found by their spacing keep the file's own unchanged lines.
+        let spaced = apply_edits(Some(file), &[edit("fn a() {\none();", "fn a() {\nuno();"), edit("two();\n}", "dos();\n}")]).unwrap();
+        assert_eq!(spaced, "fn a() {\nuno();\n}\n\nfn b() {\n    dos();\n}\n");
+        // At the end of a file with no newline there, none is added.
+        let bare = apply_edits(Some("a\nb"), &[edit("a", "x"), edit("b", "y\nz")]).unwrap();
+        assert_eq!(bare, "x\ny\nz");
+    }
+
+    #[test]
+    fn an_edit_written_as_a_function_call_is_an_edit_of_its_path() {
+        // As Qwen3-Coder writes it: the pairs bare, the tags on lines of
+        // their own or on the REPLACE line.
+        let reply = "Let me add it in `src/lib/graph.ts`:\n\n<tool_call> <function=edit src/lib/graph.ts>\n<<<<<<< SEARCH\nconst w = 1;\n=======\nconst w = 2;\n>>>>>>> REPLACE</function>\n</tool_call>\nDone.\n";
+        assert!(has_edit_call_markup(reply));
+        let tidy = edit_calls_as_blocks(reply);
+        assert_eq!(tidy, "Let me add it in `src/lib/graph.ts`:\n\nsrc/lib/graph.ts\n<<<<<<< SEARCH\nconst w = 1;\n=======\nconst w = 2;\n>>>>>>> REPLACE\nDone.\n");
+        assert!(!has_edit_call_markup(&tidy));
+        let found = blocks(&tidy);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file.path, "src/lib/graph.ts");
+        assert!(found[0].closed);
+        assert_eq!(found[0].edit.as_deref(), Some(&[edit("const w = 1;", "const w = 2;")][..]));
+        assert_eq!(edit_calls_as_blocks(&tidy), tidy, "a second pass changes nothing");
+
+        // Fenced, with the text ahead of the call on the same line.
+        let fenced = "Now: <tool_call><function=edit src/a.rs>\n```rust\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n</function></tool_call>\n";
+        let found = blocks(&edit_calls_as_blocks(fenced));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file.path, "src/a.rs");
+        assert_eq!(found[0].edit.as_deref(), Some(&[edit("a", "b")][..]));
+    }
+
+    #[test]
+    fn a_function_call_naming_no_path_and_a_line_still_coming_are_kept() {
+        let call = "<function=bash>\n<parameter=command>\nls\n</parameter>\n";
+        assert_eq!(edit_calls_as_blocks(call), call);
+        let streaming = "Here.\n<tool_call> <function=edit src/li";
+        assert_eq!(edit_calls_as_blocks(streaming), streaming);
     }
 
     #[test]
