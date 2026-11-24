@@ -1,0 +1,64 @@
+name: CI
+
+# Builds and tests every pull request and every push to main, on Linux and
+# macOS. CPU only: the GPU backends are built by release.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes its running checks.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # cmake builds llama.cpp, libclang drives bindgen, and mupdf's system
+      # fonts (font-kit) need the fontconfig headers.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libclang-dev pkg-config libfontconfig1-dev
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      # llama.cpp takes tens of minutes from scratch; keep the -sys crates.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
+
+      # Spawns real project agents from the built binary; no network or models.
+      - name: Smoke test project agents
+        timeout-minutes: 3
+        run: python3 scripts/smoke-project-agent.py target/debug/docent
+
+      # Reported, not enforced, until main is clippy-clean.
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets

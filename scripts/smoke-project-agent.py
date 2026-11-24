@@ -1,4 +1,9 @@
-"""Exercise a cold project-agent launch from a built Docent binary."""
+"""Exercise project-agent launches from a built Docent binary.
+
+The local cases always run.  The installer upgrade and backend handoff
+download a published release, so they stay opt-in (--upgrade-to,
+--include-handoff) and need an older binary than the one they install.
+"""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -287,16 +292,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument(
-        "--include-missing-executable",
-        action="store_true",
-        help="also verify the expected 503 when the agent executable is missing",
-    )
-    parser.add_argument(
-        "--include-lifecycle",
-        action="store_true",
-        help="also test warm versus cold, agent replacement, and concurrent cold requests",
-    )
-    parser.add_argument(
         "--upgrade-to",
         metavar="VERSION",
         help="also run install.sh in a temporary install while the supplied older backend is live",
@@ -316,11 +311,14 @@ def main():
         binary = args.binary.resolve(strict=True)
     except OSError as exc:
         parser.error(str(exc))
-    cases = ["cold start"]
-    if args.include_missing_executable:
-        cases.append("missing executable")
-    if args.include_lifecycle:
-        cases.extend(["warm versus cold", "replace exited agent", "concurrent cold start"])
+    # Local cases: no network, no model weights, no published release.
+    cases = [
+        "cold start",
+        "missing executable",
+        "warm versus cold",
+        "replace exited agent",
+        "concurrent cold start",
+    ]
     if upgrade_version:
         cases.append("installer upgrade")
     if args.include_handoff:
