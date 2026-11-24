@@ -3390,11 +3390,23 @@ impl App {
         match event {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
-                let before = reply.text.len();
+                let mut before = reply.text.len();
                 // A call the model wrote in its own markup never reaches
                 // here: the server sends every model's calls as
-                // `tool_calls`.
+                // `tool_calls`. An edit block a model wrote as one does,
+                // as no tool takes it, and becomes the block it means.
+                // Only what just came is looked at, with a little before
+                // it for a tag split between chunks: the whole reply on
+                // every chunk stalls the terminal on a long one.
                 reply.text.push_str(&content);
+                let tail = floor_boundary(&reply.text, before.saturating_sub(MARKUP_TAIL));
+                let tail = reply.text[..tail].rfind('\n').map_or(0, |i| i + 1);
+                if content.contains('\n') && files::has_edit_call_markup(&reply.text[tail..]) {
+                    reply.text = files::edit_calls_as_blocks(&reply.text);
+                    // Lines from `tail` on may have changed; look at them
+                    // all for a block they end.
+                    before = before.min(tail);
+                }
                 // A file's written once its block is done, not when the
                 // reply is; looked for only when a line just ended that
                 // may end one.
@@ -6114,6 +6126,9 @@ const SHELL_SHOWN: usize = 20;
 const MODELS_PAGE: usize = 5;
 /// How many times a reply's failed command is sent back to be fixed.
 const COMMAND_ROUNDS: u32 = 3;
+/// Characters before a chunk looked at again for call markup, so a tag
+/// split between two chunks is still found.
+const MARKUP_TAIL: usize = 64;
 
 /// The largest char boundary of `text` at `at` or before it.
 fn floor_boundary(text: &str, at: usize) -> usize {
