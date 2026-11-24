@@ -424,7 +424,9 @@ pub struct ModelRow {
     pub capabilities: String,
     /// Whether the capabilities were set here, over the catalog's.
     pub overridden: bool,
-    /// The model's context window in tokens, when the catalog says.
+    /// The model's context window in tokens: for a local model, the window
+    /// the server runs it with on this machine (`n_ctx`), which can be
+    /// narrower than the catalog's; otherwise the catalog's, when it says.
     pub context: Option<u64>,
     pub access: String,
     /// False when the model needs a sign-in first.
@@ -510,7 +512,7 @@ pub fn model_row(model: &serde_json::Value, entry: Option<&serde_json::Value>, t
             .map(|c| c.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
             .unwrap_or_default(),
         overridden: model["capabilities_overridden"].as_bool().unwrap_or_default(),
-        context: model["context_length"].as_u64().filter(|n| *n > 0),
+        context: model["n_ctx"].as_u64().or_else(|| model["context_length"].as_u64()).filter(|n| *n > 0),
         access: model["access_level"].as_str().unwrap_or_default().to_string(),
         accessible: model["is_accessible"].as_bool() != Some(false),
         // Registered to run in the cloud, a model with a local copy hasn't
@@ -1186,6 +1188,17 @@ mod tests {
         let on = serde_json::json!({"downloaded": true, "enabled": true});
         let row = model_row(&model, Some(&on), 16.0);
         assert!(row.cloud && row.enabled && !row.downloaded);
+    }
+
+    #[test]
+    fn a_local_models_window_is_the_one_it_runs_with() {
+        // Declared 262144, but loaded with what fits beside the other models:
+        // a prompt sized to the catalog's window would be cut to fit.
+        let model = serde_json::json!({"name": "qwen3.8-27b", "local": true, "context_length": 262144, "n_ctx": 65536});
+        assert_eq!(model_row(&model, None, 64.0).context, Some(65536));
+        // An older server, or a cloud model, says only what the catalog does.
+        let model = serde_json::json!({"name": "qwen4-max", "type": "remote", "context_length": 262144, "n_ctx": null});
+        assert_eq!(model_row(&model, None, 64.0).context, Some(262144));
     }
 
     #[test]
