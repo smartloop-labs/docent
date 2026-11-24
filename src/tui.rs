@@ -554,9 +554,6 @@ struct Reply {
     warnings: Vec<String>,
     model: Option<String>,
     text: String,
-    /// Tool-call markup the model wrote as text is still open, waiting for
-    /// its closing tag: each chunk looks for it until it comes.
-    markup_open: bool,
     citations: Vec<chat::Reference>,
     stats: Option<TurnStats>,
     /// Why it ended early: stopped by the user, or an error.
@@ -3394,17 +3391,10 @@ impl App {
             ChatEvent::Content(content) => {
                 turn.tokens += 1;
                 let before = reply.text.len();
+                // A call the model wrote in its own markup never reaches
+                // here: the server sends every model's calls as
+                // `tool_calls`.
                 reply.text.push_str(&content);
-                // A tool call the model wrote as text runs as a shell
-                // block, and its control tokens never show. Only what just
-                // came is looked at, with a little before it for a tag
-                // split between chunks: the whole reply on every chunk
-                // stalls the terminal on a long one.
-                let tail = floor_boundary(&reply.text, before.saturating_sub(MARKUP_TAIL));
-                if reply.markup_open || files::has_tool_call_markup(&reply.text[tail..]) {
-                    reply.text = files::tool_calls_as_blocks(&reply.text);
-                    reply.markup_open = files::has_tool_call_markup(&reply.text);
-                }
                 // A file's written once its block is done, not when the
                 // reply is; looked for only when a line just ended that
                 // may end one.
@@ -6124,9 +6114,6 @@ const SHELL_SHOWN: usize = 20;
 const MODELS_PAGE: usize = 5;
 /// How many times a reply's failed command is sent back to be fixed.
 const COMMAND_ROUNDS: u32 = 3;
-/// Characters before a chunk looked at again for tool-call markup, so a
-/// tag split between two chunks is still found.
-const MARKUP_TAIL: usize = 64;
 
 /// The largest char boundary of `text` at `at` or before it.
 fn floor_boundary(text: &str, at: usize) -> usize {
@@ -10905,7 +10892,6 @@ mod tests {
         let mut text = String::new();
         for chunk in &chunks {
             text.push_str(chunk);
-            let _ = files::has_tool_call_markup(&text);
             if chunk.contains('\n') {
                 let _ = files::blocks(&text);
             }
