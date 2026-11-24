@@ -6,7 +6,7 @@ Ask for a change and docent writes it: new files whole, changes to the files the
 
 It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
 
-<img width="822" alt="docent run: a reply with its sources, the status line and the prompt" src="docs/tui.png" />
+<img width="822" alt="docent run: a reply editing two files, each shown as a diff, the status line and the prompt" src="docs/tui.png" />
 
 More at:
 [docs.smartloop.ai](https://smartloop.ai/docs/intro/)
@@ -46,58 +46,28 @@ Metal on macOS and Vulkan on Linux and Windows.
 On Linux the release folder goes to `~/.local/share/docent/<version>/`, and
 the bin directory gets symlinks to it.
 
-### From source
-
-Requires Rust (2024 edition), CMake and a C/C++ toolchain, since the built-in
-agent compiles llama.cpp. Pick the GPU backend with a feature:
-
-```sh
-cargo install --path . --features metal    # macOS
-cargo install --path . --features vulkan   # Linux, Windows (needs the Vulkan SDK)
-cargo install --path .                     # CPU only
-```
-
-The framework crate comes from Smartloop's public registry at
-`https://dl.smartloop.ai/crates/`, declared in `.cargo/config.toml`; no
-account or token is needed. `scripts/update-smartloop.sh [version]` moves it to
-the newest (or given) release, and also picks up a version republished under
-the same number; the **Update smartloop** workflow does the same on `main`
-and can start a release after it.
-
 ## Quick start
 
-All you need is `docent`. Run it and you're chatting: no account and no
-separate agent setup.
+All you need is `docent`. Run it and you're chatting: no account and nothing
+else to set up.
 
 ```sh
 docent
 ```
 
-The first run downloads and starts the local agent for you (see
-[First run](#first-run)). Everything below is optional:
-
-- **AI search:** `/login` in the chat signs you in and enables web (AI) search.
-- **Agent control:** `docent agent stop` stops the local agent and
-  `docent agent start` starts it again.
+The first run downloads the models it needs (see [First run](#first-run)).
+`/login` in the chat is optional: it signs you in and enables web (AI) search.
 
 ## Usage
 
 ### First run
 
-Any command that talks to the agent starts it when none is running. It
-listens on a free port it picks itself and writes it to
-`~/.smartloop/server.port`, where the CLI reads it. On first use that means:
+The agent is built into `docent` and starts with it. On first use it:
 
-1. Start the agent, which is built into the CLI (SLP framework 1.2.34), in
-   the background with `SLP_HOME=~/.smartloop`, logging to
-   `~/.smartloop/server.log`. An agent the chat started stops when it exits
-   (unless another `docent` is still open); one started with
-   `docent agent start` keeps running. An agent Studio desktop runs on the same home is used instead, when it is
-   the same framework version.
-2. Download the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) into the
-   workspace's `models/embeddings/` folder for document search.
-3. Run the agent's bootstrap, which downloads the decision model, creates
-   the default project and loads the model.
+1. Downloads the embedding model (`bge-m3-Q4_K_M.gguf`, ~417 MB) for document
+   search.
+2. Downloads the decision model, creates the default project and loads the
+   model.
 
 Each step is skipped when its files are already there. Progress shows as a
 checklist on stderr under the Docent banner that redraws in place, with
@@ -120,58 +90,22 @@ When stderr isn't a terminal, each step prints one line as it finishes
 instead. Enabling a model with `/models` shows the same checklist for its
 download.
 
-To do this up front, or to stop (and later restart) the agent. Optional; the
-agent starts on its own when needed:
-
-```sh
-docent agent start
-docent agent stop
-```
-
 ### Login, projects and models
 
 These live in the chat: `/login` signs in (optional; it unlocks AI search and
 the models marked `(sign in)`), `/project` switches, creates, imports and
 deletes projects, and `/models` enables and disables models. See the command
-table under [the chat](#agent-status-and-chat).
+table under [the chat](#chat).
 
-### Agent status and chat
-
-Check which endpoint the CLI uses, whether the local agent is running there,
-which model it has loaded, and the per-project agents it has started:
-
-```sh
-docent agent status
-```
-
-```
-Endpoint: http://localhost:50578
-Status:   healthy
-Model:    sl-mini (Q4_K_M, 32768 ctx, 769 MB)
-Process:  pid 8738, 250 MB
-+--------------+------+-------+-------+------+--------+
-| Project      | PID  | Port  | Alive | Idle | Memory |
-+--------------+------+-------+-------+------+--------+
-| general_chat | 2668 | 62110 | true  | 94s  | 122 MB |
-+--------------+------+-------+-------+------+--------+
-```
-
-`Endpoint` is the URL the CLI talks to (`SMARTLOOP_API_URL`, or the default).
-The command exits with status 1 when the agent can't be reached there.
-
-Start an interactive chat with the local agent:
+### Chat
 
 ```sh
 docent
 ```
 
-`docent` on its own is short for `docent run`. In a terminal this opens a full-screen app, laid out like Claude Code. While
-a reply runs, a live status line above the prompt shows the agent's current
-step (web search, document lookup, model selection) and for how long, with a
-line per running download. Replies render as markdown, as in Claude Code:
-headings, bold and italics, lists, quotes, syntax-highlighted code, and tables
-drawn to fit the width. The finished reply keeps its sources and the model
-that answered:
+`docent` on its own is short for `docent run`. While a reply runs, a status
+line above the prompt shows what it's doing and for how long. The finished
+reply keeps its sources and the model that answered:
 
 ```
 > what is the capital of France?
@@ -362,23 +296,6 @@ What happens on each prompt:
 | `Tab` on an empty prompt | turn auto-approve on or off |
 
 More in the [coding docs](https://smartloop.ai/docs/coding/).
-
-## Configuration
-
-The CLI connects to the local agent on whatever port it picked
-(`~/.smartloop/server.port`). Point it elsewhere with `SMARTLOOP_API_URL`:
-
-```sh
-SMARTLOOP_API_URL=http://localhost:9000 docent agent status
-```
-
-With `SMARTLOOP_API_URL` set, the CLI only connects: it never installs or starts
-an agent for that URL.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `SLP_HOME` | `~/.smartloop` | Where the workspace, models and logs live |
-| `SLP_PORT` | a free port | Pin the managed local agent to this port |
 
 ## License
 
