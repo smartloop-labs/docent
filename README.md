@@ -1,10 +1,10 @@
 # Docent
 
-The private code agent for your terminal. Frontier quality, local first.
+The local-first coding agent for your terminal. Frontier quality, private by default.
 
 Ask for a change and docent writes it: new files whole, changes to the files there as small edits, each shown as a diff as it streams and written as soon as it's done. Changes to files that are there ask first. Before it writes, it reads the current API of the libraries the change uses from their installed packages. It checks its work with your language servers (rust-analyzer, gopls, typescript-language-server, pyright, clangd), your build and your tests, hands any errors back to the model to fix, then runs the commands the reply gives, such as a commit, co-authored by docent. What you ask it to remember, it keeps for the project.
 
-It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. If no local agent is running, the CLI downloads the framework and models it needs and starts one itself.
+It's a document assistant too: chat with your PDFs and Office files, search the web, and connect MCP servers. The first run downloads the models it needs; nothing else to set up.
 
 <img width="822" alt="docent run: a reply editing two files, each shown as a diff, the status line and the prompt" src="docs/tui.png" />
 
@@ -25,26 +25,12 @@ Windows (PowerShell):
 irm https://smartloop.ai/install.ps1 | iex
 ```
 
-The binary goes to `$CARGO_HOME/bin` (`~/.cargo/bin`) when a Rust toolchain
-already owns that directory, since it is on your `PATH` anyway; otherwise to
-`~/.local/bin`. If the chosen directory is not on your `PATH`, the installer
-appends an export line to the startup file for your shell — `~/.bashrc`,
-`~/.zshrc`, or `fish_add_path` in `config.fish` — so a new terminal picks it up.
-Re-running the installer will not add that line twice.
+Installs to `~/.local/bin` (`%USERPROFILE%\.smartloop\bin` on Windows) and
+adds it to your `PATH`; open a new terminal to pick it up. Set
+`SMARTLOOP_CLI_VERSION` to pin a release.
 
-On Windows the binary goes to `%USERPROFILE%\.smartloop\bin` and the installer
-sets your user `PATH` through the registry. Restart the shell to pick it up.
-
-Set `SMARTLOOP_CLI_INSTALL_DIR` to install elsewhere, or `SMARTLOOP_CLI_VERSION`
-to pin a specific release.
-
-Prebuilt binaries are published for Linux (x86_64, aarch64; glibc, with the
-Vulkan loader bundled), macOS (Apple Silicon, signed and notarized) and
-Windows (x86_64, signed). The agent is built in, with GPU inference through
-Metal on macOS and Vulkan on Linux and Windows.
-
-On Linux the release folder goes to `~/.local/share/docent/<version>/`, and
-the bin directory gets symlinks to it.
+Builds for macOS (Apple Silicon), Linux (x86_64, aarch64) and Windows
+(x86_64), with GPU inference through Metal or Vulkan.
 
 ## Quick start
 
