@@ -19,7 +19,7 @@ cuda = ["smartloop/cuda"]
 [dependencies]
 # The SLP framework, run in-process as the local agent, from Smartloop's
 # registry at dl.smartloop.ai (declared in .cargo/config.toml).
-smartloop = { version = "1.2.36", registry = "smartloop" }
+smartloop = { version = "1.2.37", registry = "smartloop" }
 serde_json = "1"
 # Reads a Java library's sources jar; already built for smartloop.
 zip = "7"
