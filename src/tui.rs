@@ -9121,24 +9121,47 @@ mod tests {
         app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12, pending: 0 });
         app.connections = Some((2, 0));
         app.account = Some(Some("you@example.com".into()));
-        app.entries.push(Entry::User("Add a temperature tile to qtop with CPU and GPU temps, next to the GPU tile".into()));
+        // Two of qtop's files as they are, for the reply's edits to show as diffs against.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib/format.ts"),
+            "export function fmtUptime(seconds: number): string {\n  \
+             const d = Math.floor(seconds / 86400);\n  \
+             const h = Math.floor((seconds % 86400) / 3600);\n  \
+             const m = Math.floor((seconds % 3600) / 60);\n  \
+             return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests/format.test.ts"),
+            "test('fmtUptime shows days when >= 1 day, hours/minutes otherwise', () => {\n  \
+             assert.equal(fmtUptime(90061), '1d 1h');\n  \
+             assert.equal(fmtUptime(3661), '1h 1m');\n});\n",
+        )
+        .unwrap();
+        app.entries.push(Entry::User("qtop's uptime drops the minutes once it passes a day; keep them".into()));
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Added `TempTile.tsx` and gave it a slot beside the GPU tile:\n\n\
-                   | File | Change | Lines |\n\
-                   |---|---|---|\n\
-                   | `src/components/TempTile.tsx` | new tile: CPU package and GPU temps, wave history | +64 |\n\
-                   | `src/lib/stats.ts` | reads `cpuTemperature()` from systeminformation | +18 |\n\
-                   | `src/lib/layout.ts` | new slot to the right of the GPU tile | +6 |\n\n\
-                   `npm run build` and `npm test` pass."
+            text: "`fmtUptime` only adds the minutes under a day. It keeps them now:\n\n\
+                   ```edit src/lib/format.ts\n\
+                   <<<<<<< SEARCH\n  return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;\n\
+                   =======\n  return d > 0 ? `${d}d ${h}h ${m}m` : `${h}h ${m}m`;\n\
+                   >>>>>>> REPLACE\n```\n\n\
+                   ```edit tests/format.test.ts\n\
+                   <<<<<<< SEARCH\n  assert.equal(fmtUptime(90061), '1d 1h');\n\
+                   =======\n  assert.equal(fmtUptime(90061), '1d 1h 1m');\n\
+                   >>>>>>> REPLACE\n```\n\n\
+                   `npm test` passes."
                 .into(),
-            citations: vec!["systeminformation/lib/index.d.ts".into()],
-            stats: Some(TurnStats { tokens: 1840, elapsed: Duration::from_secs(38), cut_off: false }),
+            root: Some(dir.path().to_path_buf()),
+            stats: Some(TurnStats { tokens: 412, elapsed: Duration::from_secs(9), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
-        app.entries.push(Entry::User("Color the temps from the theme, red above 85°C".into()));
+        app.entries.push(Entry::User("Color the uptime from the theme when it passes 30 days".into()));
         app.entries.push(Entry::Reply(Reply::default()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
@@ -9153,7 +9176,7 @@ mod tests {
         });
         app.input = "".into();
 
-        let (width, height) = (100, 46);
+        let (width, height) = (100, 52);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
