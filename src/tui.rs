@@ -11043,6 +11043,68 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_prompt_goes_once_the_task_before_it_has_finished() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _inside = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "notes".into()));
+        let done = |app: &mut App, tokens: u64| {
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens, elapsed: Duration::from_secs(1), cut_off: false })));
+        };
+        // As the event loop goes round: the task settles, then the queue.
+        let round = |app: &mut App| {
+            app.settle();
+            app.send_queued();
+        };
+        let at = |app: &App, wanted: &dyn Fn(&Entry) -> bool| app.entries.iter().position(|e| wanted(e)).unwrap();
+        let user = |text: &'static str| move |e: &Entry| matches!(e, Entry::User(t) if t == text);
+        let finished = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Finished(..))).count();
+        app.input = "first".into();
+        app.submit();
+        app.input = "second".into();
+        app.submit();
+        assert_eq!(app.queued.len(), 1);
+
+        // An answer ends on its line before the next prompt goes.
+        done(&mut app, 3);
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some(), "the next prompt went");
+        let line = at(&app, &|e| matches!(e, Entry::Finished(_, 3)));
+        assert!(line < at(&app, &user("second")));
+        assert_eq!(app.task_tokens, 0, "the next prompt counts from nothing");
+
+        // One that changed files waits on its summary; the next prompt
+        // waits too, then goes under the summary and its line.
+        app.task.as_mut().unwrap().file("notes.md", false, 1, 0);
+        app.input = "third".into();
+        app.submit();
+        done(&mut app, 4);
+        round(&mut app);
+        let (asked, _) = app.summarizing.clone().expect("a summary is asked for");
+        assert!(app.queued.len() == 1 && app.turn.is_none(), "the next prompt waits for the summary");
+        app.apply(AppEvent::Summary(asked, Ok(Some("Updated notes.md.".into()))));
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        let summary = at(&app, &|e| matches!(e, Entry::Summary(_)));
+        let line = at(&app, &|e| matches!(e, Entry::Finished(_, 4)));
+        assert!(summary < line && line < at(&app, &user("third")), "summary, line, then the next prompt");
+
+        // Interrupted with a prompt queued, it never finished: no line, and
+        // the next counts afresh.
+        app.input = "fourth".into();
+        app.submit();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        assert_eq!(finished(&app), 2);
+        assert_eq!(app.task_tokens, 0);
+        done(&mut app, 5);
+        round(&mut app);
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 5))));
+    }
+
+    #[test]
     fn a_queued_prompt_waits_for_the_question_about_the_reply() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _inside = runtime.enter();
