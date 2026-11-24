@@ -392,7 +392,7 @@ jobs:
           Write-Host "docent.exe: $($sig.Status) - $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status), expected Valid" }
 
-      - name: Smoke test project-agent cold start
+      - name: Smoke test project agents
         if: runner.os == 'macOS'
         timeout-minutes: 3
         run: python3 scripts/smoke-project-agent.py "dist/${NAME}/docent"
