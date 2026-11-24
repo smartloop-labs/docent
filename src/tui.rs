@@ -193,9 +193,9 @@ enum AppEvent {
     Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
     /// The pre-run skill's lookup is done: the turn it held goes now.
     PreRun(Box<PreRun>),
-    /// The agent's summary of a settled task, by the ask's id; `None` when
-    /// it couldn't give one.
-    Summary(usize, Option<String>),
+    /// The agent's summary of a settled task, by the ask's id: `None` when
+    /// it had none to give, an error when it couldn't be asked.
+    Summary(usize, Result<Option<String>, String>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -1612,6 +1612,8 @@ struct App {
     summarizing: Option<(usize, String)>,
     /// Summaries asked for, for their ids.
     summaries: usize,
+    /// A summary couldn't be asked for this session, and why was said.
+    summary_failed: bool,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
@@ -1720,6 +1722,7 @@ impl App {
             task_tokens: 0,
             summarizing: None,
             summaries: 0,
+            summary_failed: false,
             command_round: 0,
             look_up: false,
             pre_run: None,
@@ -4081,7 +4084,7 @@ impl App {
             // Esc interrupts the reply: the next queued prompt goes at once.
             KeyCode::Esc if self.turn.is_some() || self.pre_run.is_some() => self.stop_turn(),
             // Esc doesn't wait for the agent's summary: the plain one goes.
-            KeyCode::Esc if let Some((id, _)) = self.summarizing => self.summarized(id, None),
+            KeyCode::Esc if let Some((id, _)) = self.summarizing => self.summarized(id, Ok(None)),
             // Up on an empty prompt takes back the last queued one, to edit.
             KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
                 let last = self.queued.pop().expect("queued is not empty");
@@ -4504,13 +4507,25 @@ impl App {
         }
         let body = task.body(&project);
         self.spawn(move |client, tx| {
-            let _ = tx.send(AppEvent::Summary(id, summary::summarize(&client, &body).ok().flatten()));
+            let _ = tx.send(AppEvent::Summary(id, summary::summarize(&client, &crate::api_url(), &body)));
         });
     }
 
-    /// Summary `id` is in, the agent's or `None` for the plain one.
-    fn summarized(&mut self, id: usize, text: Option<String>) {
+    /// Summary `id` is in: the agent's, or the plain one when it had none
+    /// or couldn't be asked. Why it couldn't is said once a session, so a
+    /// summary that never comes, as from an agent without the call, shows
+    /// why rather than passing for the agent's.
+    fn summarized(&mut self, id: usize, text: Result<Option<String>, String>) {
         let Some((_, plain)) = self.summarizing.take_if(|(asked, _)| *asked == id) else { return };
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                if !std::mem::replace(&mut self.summary_failed, true) {
+                    self.entries.push(Entry::Warning(format!("{why}; showing docent's own summary")));
+                }
+                None
+            }
+        };
         self.entries.push(Entry::Summary(text.unwrap_or(plain)));
         self.entries.push(self.finished());
         self.scroll_back = 0;
@@ -8166,7 +8181,7 @@ mod tests {
         app.settle();
         assert_eq!(app.summaries, 1, "asked once");
         // The agent's summary goes under the task, over its finished line.
-        app.apply(AppEvent::Summary(asked, Some("Added src/main.rs; it builds and its tests pass.".into())));
+        app.apply(AppEvent::Summary(asked, Ok(Some("Added src/main.rs; it builds and its tests pass.".into()))));
         let at = app.entries.len() - 2;
         assert!(matches!(&app.entries[at], Entry::Summary(s) if s == "Added src/main.rs; it builds and its tests pass."));
         assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 1))));
@@ -8175,7 +8190,7 @@ mod tests {
         assert!(text.contains("■ Summary") && text.contains("  Added src/main.rs; it builds"), "{}", text);
         assert!(text.find("■ Summary") < text.rfind("■ Finished in"), "{}", text);
         // Asked again, it's not said twice.
-        app.apply(AppEvent::Summary(asked, Some("again".into())));
+        app.apply(AppEvent::Summary(asked, Ok(Some("again".into()))));
         assert_eq!(summaries(&app), 1);
     }
 
@@ -8247,6 +8262,38 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_that_cant_be_asked_for_says_why_once() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let warnings = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Warning(_))).count();
+        for _ in 0..2 {
+            let mut task = summary::TaskRecord::new("bump the version");
+            task.file("Cargo.toml", false, 1, 1);
+            app.task = Some(task);
+            app.settle();
+            let (asked, _) = app.summarizing.clone().expect("asked");
+            app.apply(AppEvent::Summary(asked, Err("Failed to summarize: 404 Not Found".into())));
+            let at = app.entries.len() - 2;
+            assert!(matches!(&app.entries[at], Entry::Summary(s) if s == "Updated Cargo.toml (+1 −1)."));
+            assert!(matches!(app.entries.last(), Some(Entry::Finished(..))));
+        }
+        assert_eq!(warnings(&app), 1, "said once a session");
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("Failed to summarize: 404 Not Found; showing docent's own summary"), "{}", text);
+        // None to give isn't a failure: nothing's said.
+        let mut app = self::app();
+        app.project = Some(("p1".into(), "app".into()));
+        let mut task = summary::TaskRecord::new("bump the version");
+        task.file("Cargo.toml", false, 1, 1);
+        app.task = Some(task);
+        app.settle();
+        let (asked, _) = app.summarizing.clone().expect("asked");
+        app.apply(AppEvent::Summary(asked, Ok(None)));
+        assert_eq!(warnings(&app), 0);
+    }
+
+    #[test]
     fn esc_skips_the_agents_summary_for_the_plain_one() {
         let mut app = app();
         app.phase = Phase::Ready;
@@ -8262,7 +8309,7 @@ mod tests {
         assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
         assert!(app.summarizing.is_none() && app.idle());
         // The agent's, coming late, goes nowhere.
-        app.apply(AppEvent::Summary(asked, Some("late".into())));
+        app.apply(AppEvent::Summary(asked, Ok(Some("late".into()))));
         assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
     }
 
