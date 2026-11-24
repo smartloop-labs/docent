@@ -9117,30 +9117,51 @@ mod tests {
         let Ok(path) = std::env::var("SCREENSHOT_JSON") else { return };
         let mut app = app();
         app.phase = Phase::Ready;
-        app.project = Some(("p1".into(), "general_chat".into()));
+        app.project = Some(("p1".into(), "qtop".into()));
         app.agent = Some(crate::AgentState { state: "healthy".into(), memory: Some(42), documents: 12, pending: 0 });
         app.connections = Some((2, 0));
         app.account = Some(Some("you@example.com".into()));
-        app.entries.push(Entry::User(
-            "[Doc 1] Issue a mutual NDA to Northwind Labs from our template: 2-year term, California law".into(),
-        ));
+        // Two of qtop's files as they are, for the reply's edits to show as diffs against.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib/format.ts"),
+            "export function fmtUptime(seconds: number): string {\n  \
+             const d = Math.floor(seconds / 86400);\n  \
+             const h = Math.floor((seconds % 86400) / 3600);\n  \
+             const m = Math.floor((seconds % 3600) / 60);\n  \
+             return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests/format.test.ts"),
+            "test('fmtUptime shows days when >= 1 day, hours/minutes otherwise', () => {\n  \
+             assert.equal(fmtUptime(90061), '1d 1h');\n  \
+             assert.equal(fmtUptime(3661), '1h 1m');\n});\n",
+        )
+        .unwrap();
+        app.entries.push(Entry::User("qtop's uptime drops the minutes once it passes a day; keep them".into()));
         app.entries.push(Entry::Reply(Reply {
             warnings: Vec::new(),
             model: Some("sl-mini".into()),
-            text: "Drafted `nda-northwind-labs.docx` from your template:\n\n\
-                   | Clause | Terms | Section |\n\
-                   |---|---|---|\n\
-                   | **Parties** | Smartloop Inc. and Northwind Labs, Inc. | 1 |\n\
-                   | **Term** | 2 years from signing; confidentiality survives 3 | 5 |\n\
-                   | **Governing law** | California, venue in San Francisco | 9 |\n\n\
-                   Signature blocks are left blank for both parties."
+            text: "`fmtUptime` only adds the minutes under a day. It keeps them now:\n\n\
+                   ```edit src/lib/format.ts\n\
+                   <<<<<<< SEARCH\n  return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;\n\
+                   =======\n  return d > 0 ? `${d}d ${h}h ${m}m` : `${h}h ${m}m`;\n\
+                   >>>>>>> REPLACE\n```\n\n\
+                   ```edit tests/format.test.ts\n\
+                   <<<<<<< SEARCH\n  assert.equal(fmtUptime(90061), '1d 1h');\n\
+                   =======\n  assert.equal(fmtUptime(90061), '1d 1h 1m');\n\
+                   >>>>>>> REPLACE\n```\n\n\
+                   `npm test` passes."
                 .into(),
-            citations: vec!["mutual-nda-template.docx".into()],
-            stats: Some(TurnStats { tokens: 96, elapsed: Duration::from_secs(14), cut_off: false }),
+            root: Some(dir.path().to_path_buf()),
+            stats: Some(TurnStats { tokens: 412, elapsed: Duration::from_secs(9), cut_off: false }),
             ended: None,
             ..Default::default()
         }));
-        app.entries.push(Entry::User("[Doc 2] Compare it with their redlines and flag anything risky".into()));
+        app.entries.push(Entry::User("Color the uptime from the theme when it passes 30 days".into()));
         app.entries.push(Entry::Reply(Reply::default()));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         app.turn = Some(Turn {
@@ -9148,14 +9169,14 @@ mod tests {
             task: runtime.spawn(async {}),
             entry: 3,
             tokens: 0,
-            activity: Some("Reading northwind-redlines.pdf".into()),
+            activity: Some("Reading src/lib/theme.ts".into()),
             files_dir: None,
             whole: Vec::new(),
             calls: Vec::new(),
         });
         app.input = "".into();
 
-        let (width, height) = (100, 46);
+        let (width, height) = (100, 52);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
