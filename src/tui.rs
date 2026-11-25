@@ -3115,7 +3115,12 @@ impl App {
                                 self.run_commands();
                             }
                         }
-                        Err(e) => reply.ended = Some(e),
+                        Err(e) => {
+                            reply.ended = Some(e);
+                            // Failed, the task didn't finish: it ends on
+                            // the error, as a stopped one does.
+                            self.task = None;
+                        }
                     }
                 }
                 self.load_usage();
@@ -8233,6 +8238,37 @@ mod tests {
         // Settled, it isn't said again.
         app.settle();
         assert_eq!(finished(&app), 1);
+    }
+
+    #[test]
+    fn a_task_whose_reply_fails_ends_on_the_error_without_a_finished_line() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let mut task = summary::TaskRecord::new("bump the version");
+        task.file("Cargo.toml", false, 1, 1);
+        app.task = Some(task);
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: None,
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let error = "Failed to read stream: connection closed";
+        app.apply(AppEvent::TurnDone(Err(error.into())));
+        app.settle();
+        assert!(matches!(app.entries.last(), Some(Entry::Reply(r)) if r.ended.as_deref() == Some(error)));
+        // Not finished, nor summarized, though it changed a file.
+        assert!(app.task.is_none() && app.summarizing.is_none());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Finished(..))));
+        assert!(app.idle());
     }
 
     #[test]
