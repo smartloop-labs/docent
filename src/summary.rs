@@ -159,11 +159,12 @@ impl TaskRecord {
     }
 }
 
-/// The agent's summary of the task in `body`: `None` when it has none to
-/// give, an error when it can't be asked (an older agent has no such call).
-pub fn summarize(client: &Client, body: &Value) -> Result<Option<String>, String> {
+/// The agent's summary of the task in `body`, asked of the agent at `api`
+/// (its `/v1` URL): `None` when it has none to give, an error when it
+/// can't be asked (an older agent has no such call).
+pub fn summarize(client: &Client, api: &str, body: &Value) -> Result<Option<String>, String> {
     let response = client
-        .post(format!("{}/chat/summary", crate::api_url()))
+        .post(format!("{}/chat/summary", api))
         .timeout(SUMMARY_TIMEOUT)
         .json(body)
         .send()
@@ -221,6 +222,75 @@ mod tests {
         task.file("a.rs", true, 3, 0);
         task.file("a.rs", false, 1, 1);
         assert!(task.files[0].created);
+    }
+
+    /// The `/v1/chat/summary` request as smartloop's `TaskSummaryRequest`
+    /// reads it: smartloop's tests parse the same file, so a field renamed
+    /// on either side fails a test rather than every summary.
+    const CONTRACT: &str = include_str!("../tests/fixtures/task-summary-request.json");
+
+    #[test]
+    fn the_body_keeps_to_the_summary_contract() {
+        let mut task = worked();
+        task.file("src/cli.rs", true, 40, 0);
+        task.command("cargo run", None, "");
+        let contract: Value = serde_json::from_str(CONTRACT).expect("the fixture is JSON");
+        assert_eq!(task.body("p1"), contract);
+    }
+
+    /// A one-request HTTP server on a free port answering `status` with
+    /// `body`: its `/v1` URL, and the request it got once answered.
+    fn agent(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let served = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let (mut head, mut length) = (String::new(), 0);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            let mut sent = vec![0; length];
+            reader.read_exact(&mut sent).unwrap();
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+            format!("{}{}", head.lines().next().unwrap_or_default(), String::from_utf8(sent).unwrap())
+        });
+        (url, served)
+    }
+
+    #[test]
+    fn the_summary_is_asked_of_the_agent_and_read_from_its_answer() {
+        let body = worked().body("p1");
+        let ask = |status: &str, answer: &str| {
+            let (url, served) = agent(status, answer);
+            let got = summarize(&Client::new(), &url, &body);
+            (got, served.join().unwrap())
+        };
+        let (got, request) = ask("200 OK", r#"{"summary": "  - Added a --verbose flag\n"}"#);
+        assert_eq!(got, Ok(Some("- Added a --verbose flag".into())));
+        assert!(request.starts_with("POST /v1/chat/summary HTTP/1.1"), "{}", request);
+        let sent: Value = serde_json::from_str(&request[request.find('{').unwrap()..]).unwrap();
+        assert_eq!(sent, body);
+        // None to give: the plain summary stands in, with nothing wrong.
+        assert_eq!(ask("200 OK", r#"{"summary": null}"#).0, Ok(None));
+        assert_eq!(ask("200 OK", r#"{"summary": "  "}"#).0, Ok(None));
+        // Not asked: why, for the user.
+        assert_eq!(ask("404 Not Found", "").0, Err("Failed to summarize: 404 Not Found".into()));
+        assert_eq!(ask("500 Internal Server Error", "{}").0, Err("Failed to summarize: 500 Internal Server Error".into()));
+        assert!(ask("200 OK", "not json").0.is_err_and(|e| e.starts_with("Failed to summarize: ")));
     }
 
     #[test]

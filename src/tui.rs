@@ -193,9 +193,9 @@ enum AppEvent {
     Diagnostics(usize, Vec<&'static str>, Vec<lsp::Problem>),
     /// The pre-run skill's lookup is done: the turn it held goes now.
     PreRun(Box<PreRun>),
-    /// The agent's summary of a settled task, by the ask's id; `None` when
-    /// it couldn't give one.
-    Summary(usize, Option<String>),
+    /// The agent's summary of a settled task, by the ask's id: `None` when
+    /// it had none to give, an error when it couldn't be asked.
+    Summary(usize, Result<Option<String>, String>),
 }
 
 /// One `Steps` call, carried from a worker thread to the app.
@@ -445,6 +445,9 @@ enum Entry {
     Error(String),
     /// What a settled task did, under the last of its entries.
     Summary(String),
+    /// A prompt's work all done: how long it took, from the prompt to its
+    /// settling and any summary, and the tokens its replies streamed.
+    Finished(Duration, u64),
 }
 
 /// A file a reply wrote as it streamed: what it was before (`None`, new)
@@ -1598,11 +1601,19 @@ struct App {
     /// What the user's last prompt has done so far, across its tool and
     /// fix rounds, summarized once it settles.
     task: Option<summary::TaskRecord>,
+    /// When the user's last prompt was sent, and the tokens its replies
+    /// have streamed since, for the line that ends it: timed to that line,
+    /// so a summary's wait counts, as the next prompt waits on it too.
+    task_started: Instant,
+    task_tokens: u64,
     /// The summary asked for, by id, with the plain one that stands in
-    /// should it not come; the next prompt waits for it.
+    /// should it not come; the task's `Entry::Finished` goes under it. The
+    /// next prompt waits for it.
     summarizing: Option<(usize, String)>,
     /// Summaries asked for, for their ids.
     summaries: usize,
+    /// A summary couldn't be asked for this session, and why was said.
+    summary_failed: bool,
     /// Rounds of fixing a reply's failed command since the user's last
     /// prompt, so a command that keeps failing doesn't go on forever.
     command_round: u32,
@@ -1707,8 +1718,11 @@ impl App {
             always_run: false,
             tooling: None,
             task: None,
+            task_started: Instant::now(),
+            task_tokens: 0,
             summarizing: None,
             summaries: 0,
+            summary_failed: false,
             command_round: 0,
             look_up: false,
             pre_run: None,
@@ -3041,6 +3055,7 @@ impl App {
                     if let Some(Entry::Reply(reply)) = self.entries.get_mut(turn.entry) {
                     match result {
                         Ok(stats) => {
+                            self.task_tokens += stats.tokens;
                             reply.stats = Some(stats);
                             if let Some(task) = &mut self.task {
                                 task.reply(&prose_of(&reply.text));
@@ -3100,7 +3115,12 @@ impl App {
                                 self.run_commands();
                             }
                         }
-                        Err(e) => reply.ended = Some(e),
+                        Err(e) => {
+                            reply.ended = Some(e);
+                            // Failed, the task didn't finish: it ends on
+                            // the error, as a stopped one does.
+                            self.task = None;
+                        }
                     }
                 }
                 self.load_usage();
@@ -4069,7 +4089,7 @@ impl App {
             // Esc interrupts the reply: the next queued prompt goes at once.
             KeyCode::Esc if self.turn.is_some() || self.pre_run.is_some() => self.stop_turn(),
             // Esc doesn't wait for the agent's summary: the plain one goes.
-            KeyCode::Esc if let Some((id, _)) = self.summarizing => self.summarized(id, None),
+            KeyCode::Esc if let Some((id, _)) = self.summarizing => self.summarized(id, Ok(None)),
             // Up on an empty prompt takes back the last queued one, to edit.
             KeyCode::Up if self.input.is_empty() && !self.queued.is_empty() => {
                 let last = self.queued.pop().expect("queued is not empty");
@@ -4085,6 +4105,9 @@ impl App {
             // Esc on an empty prompt stops the command running in front.
             KeyCode::Esc if self.input.is_empty() && self.foreground_job() => {
                 let stopped = self.stop_jobs(|j| self.shell_of(j.id).is_some_and(|s| !s.background));
+                // Stopped partway, the task didn't finish: no line ends it,
+                // as when its reply is stopped.
+                self.task = None;
                 self.entries.push(Entry::Notice(format!("Stopped: {}", one_line(&stopped))));
                 self.scroll_back = 0;
             }
@@ -4438,6 +4461,8 @@ impl App {
         self.look_up = true;
         self.reference = None;
         self.task = Some(summary::TaskRecord::new(&input));
+        self.task_started = Instant::now();
+        self.task_tokens = 0;
         self.send_turn(input, message, files, making);
     }
 
@@ -4466,8 +4491,9 @@ impl App {
             && !self.entries.iter().any(|e| matches!(e, Entry::Shell(s) if !s.background && s.ended.is_none()))
     }
 
-    /// The user's task, once nothing more of it is coming, is summarized
-    /// when it changed or checked files: by the agent, or plainly from the
+    /// The user's task, once nothing more of it is coming, ends on a line
+    /// saying how long it took. One that changed or checked files is
+    /// summarized above that line: by the agent, or plainly from the
     /// record should it not answer.
     fn settle(&mut self) {
         let calling = self.tooling.as_ref().is_some_and(|t| t.calls.iter().any(|c| c.result.is_none()));
@@ -4475,10 +4501,12 @@ impl App {
             return;
         }
         let Some(task) = self.task.take() else { return };
-        let Some((project, _)) = self.project.clone() else { return };
-        if !task.worth_summarizing() {
+        let project = self.project.clone().map(|(project, _)| project);
+        let Some(project) = project.filter(|_| task.worth_summarizing()) else {
+            self.entries.push(self.finished());
+            self.scroll_back = 0;
             return;
-        }
+        };
         self.summaries += 1;
         let id = self.summaries;
         self.summarizing = Some((id, task.plain()));
@@ -4487,15 +4515,34 @@ impl App {
         }
         let body = task.body(&project);
         self.spawn(move |client, tx| {
-            let _ = tx.send(AppEvent::Summary(id, summary::summarize(&client, &body).ok().flatten()));
+            let _ = tx.send(AppEvent::Summary(id, summary::summarize(&client, &crate::api_url(), &body)));
         });
     }
 
-    /// Summary `id` is in, the agent's or `None` for the plain one.
-    fn summarized(&mut self, id: usize, text: Option<String>) {
+    /// Summary `id` is in: the agent's, or the plain one when it had none
+    /// or couldn't be asked. Why it couldn't is said once a session, so a
+    /// summary that never comes, as from an agent without the call, shows
+    /// why rather than passing for the agent's.
+    fn summarized(&mut self, id: usize, text: Result<Option<String>, String>) {
         let Some((_, plain)) = self.summarizing.take_if(|(asked, _)| *asked == id) else { return };
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                if !std::mem::replace(&mut self.summary_failed, true) {
+                    self.entries.push(Entry::Warning(format!("{why}; showing docent's own summary")));
+                }
+                None
+            }
+        };
         self.entries.push(Entry::Summary(text.unwrap_or(plain)));
+        self.entries.push(self.finished());
         self.scroll_back = 0;
+    }
+
+    /// The line the user's last prompt ends on: how long since it was
+    /// sent, and the tokens its replies streamed.
+    fn finished(&self) -> Entry {
+        Entry::Finished(self.task_started.elapsed(), self.task_tokens)
     }
 
     /// Send the next queued prompt once the one before it is all done.
@@ -5048,6 +5095,7 @@ impl App {
                     lines.push(Line::from(std::iter::once(Span::raw("  ")).chain(line.spans).collect::<Vec<_>>()));
                 }
             }
+            Entry::Finished(took, tokens) => lines.push(Line::styled(finished_line(*took, *tokens), dim())),
         }
     }
 
@@ -5954,6 +6002,7 @@ fn entry_version(entry: &Entry) -> u64 {
         Entry::User(text) | Entry::Notice(text) | Entry::Warning(text) | Entry::Error(text) | Entry::Summary(text) => {
             text.hash(&mut h)
         }
+        Entry::Finished(took, tokens) => (took, tokens).hash(&mut h),
     }
     h.finish()
 }
@@ -6528,12 +6577,23 @@ fn shell_lines(shell: &Shell, spinner: &str, shown: usize, lines: &mut Vec<Line<
             let what = if shell.background { "  … running in the background" } else { "  … running" };
             vec![Span::styled(what, dim()), Span::styled("  ✕ stop", stop)]
         }
-        Some(Ended::Exited(0)) => vec![Span::styled("  ✓ done", Style::new().fg(Color::Green))],
+        // Only what went wrong is said: the task's `Finished` line ends it.
+        Some(Ended::Exited(0)) => return,
         Some(Ended::Exited(c)) => vec![Span::styled(format!("  ✗ exited with {}", c), Style::new().fg(Color::Red))],
         Some(Ended::Killed) => vec![Span::styled("  ✗ killed by a signal", Style::new().fg(Color::Red))],
         Some(Ended::Stopped) => vec![Span::styled("  ■ stopped", Style::new().fg(Color::Yellow))],
     };
     lines.push(Line::from(end));
+}
+
+/// The line a prompt's work ends on: "■ Finished in 1min 12s · 4321 tokens".
+fn finished_line(took: Duration, tokens: u64) -> String {
+    let took = format_duration(took);
+    match tokens {
+        0 => format!("■ Finished in {took}"),
+        1 => format!("■ Finished in {took} · 1 token"),
+        n => format!("■ Finished in {took} · {n} tokens"),
+    }
 }
 
 /// The reply's commands, to allow or skip: each script's lines. The keys
@@ -7525,7 +7585,8 @@ mod tests {
         assert_eq!((output.as_str(), ended), (format!("{}echo hello\nhello", TRACE).as_str(), Some(Ended::Exited(0))));
         app.apply(AppEvent::Shell(shell.id, output, ended));
         let text = screen(&app, 80, 24);
-        assert!(text.contains("! echo hello") && text.contains("  │ hello") && text.contains("  ✓ done"), "{}", text);
+        // Done, it says nothing more: only what went wrong is said.
+        assert!(text.contains("! echo hello") && text.contains("  │ hello") && !text.contains("done"), "{}", text);
         // The shell's trace of the one command is the entry's first line again.
         assert!(!text.contains("$ echo hello"), "{}", text);
         assert_eq!(app.shell_context, vec!["I ran `echo hello` in the shell; it exited with 0:\n```\n$ echo hello\nhello\n```"]);
@@ -7615,6 +7676,24 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_block_says_how_it_ended_only_when_that_was_not_a_success() {
+        let last = |ended: Option<Ended>, background: bool| {
+            let shell = Shell { id: 1, command: "make".into(), output: String::new(), ended, background, detached: false };
+            let mut lines = Vec::new();
+            shell_lines(&shell, "⠋", SHELL_SHOWN, &mut lines);
+            lines.last().map(|l| l.to_string()).unwrap_or_default()
+        };
+        assert_eq!(last(None, false), "  … running  ✕ stop");
+        assert_eq!(last(None, true), "  … running in the background  ✕ stop");
+        // A success says nothing more: the command is the block's last line.
+        assert_eq!(last(Some(Ended::Exited(0)), false), "! make");
+        assert_eq!(last(Some(Ended::Exited(0)), true), "! make");
+        assert_eq!(last(Some(Ended::Exited(2)), false), "  ✗ exited with 2");
+        assert_eq!(last(Some(Ended::Killed), false), "  ✗ killed by a signal");
+        assert_eq!(last(Some(Ended::Stopped), true), "  ■ stopped");
+    }
+
+    #[test]
     fn a_script_shows_each_command_over_what_it_printed() {
         let script = "git fetch --prune\ngit branch -a";
         let mut shell = Shell { id: 1, command: script.into(), output: String::new(), ended: None, background: false, detached: false };
@@ -7631,7 +7710,7 @@ mod tests {
         shell.ended = Some(Ended::Exited(0));
         assert_eq!(
             rows(&shell),
-            ["! git fetch --prune", "  │ From github.com:x/y", "  │  - [deleted] old", "$ git branch -a", "  │ * main", "  ✓ done"]
+            ["! git fetch --prune", "  │ From github.com:x/y", "  │  - [deleted] old", "$ git branch -a", "  │ * main"]
         );
         // bash marks a nested `$(...)` with one more marker; a `+` or `$`
         // in the output itself is output.
@@ -8085,11 +8164,14 @@ mod tests {
         let mut app = app();
         app.phase = Phase::Ready;
         app.project = Some(("p1".into(), "app".into()));
-        // A plain answer is its own summary.
+        // A plain answer is its own summary: it ends on how long it took.
         app.task = Some(summary::TaskRecord::new("what is this?"));
         turn(&mut app, "A Rust project.");
         app.settle();
         assert!(app.task.is_none() && app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 1))));
+        assert!(screen(&app, 80, 30).contains("■ Finished in 0s · 1 token"));
+        app.task_tokens = 0;
         // A task that writes a file isn't summarized while it's checked.
         app.task = Some(summary::TaskRecord::new("add main"));
         turn(&mut app, "Done.\n\n`src/main.rs`\n```rust\nfn main() {}\n```\n");
@@ -8106,15 +8188,148 @@ mod tests {
         assert!(screen(&app, 80, 30).contains("Summarizing… (esc skips)"));
         app.settle();
         assert_eq!(app.summaries, 1, "asked once");
-        // The agent's summary goes under the task.
-        app.apply(AppEvent::Summary(asked, Some("Added src/main.rs; it builds and its tests pass.".into())));
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == "Added src/main.rs; it builds and its tests pass."));
+        // The agent's summary goes under the task, over its finished line.
+        app.apply(AppEvent::Summary(asked, Ok(Some("Added src/main.rs; it builds and its tests pass.".into()))));
+        let at = app.entries.len() - 2;
+        assert!(matches!(&app.entries[at], Entry::Summary(s) if s == "Added src/main.rs; it builds and its tests pass."));
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 1))));
         assert!(app.idle());
         let text = screen(&app, 80, 30);
         assert!(text.contains("■ Summary") && text.contains("  Added src/main.rs; it builds"), "{}", text);
+        assert!(text.find("■ Summary") < text.rfind("■ Finished in"), "{}", text);
         // Asked again, it's not said twice.
-        app.apply(AppEvent::Summary(asked, Some("again".into())));
+        app.apply(AppEvent::Summary(asked, Ok(Some("again".into()))));
         assert_eq!(summaries(&app), 1);
+    }
+
+    #[test]
+    fn a_prompts_tokens_add_up_over_its_turns_and_start_again_with_the_next() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let turn = |app: &mut App, tokens: u64| {
+            app.entries.push(Entry::Reply(Reply::default()));
+            app.turn = Some(Turn {
+                started: Instant::now(),
+                task: runtime.spawn(async {}),
+                entry: app.entries.len() - 1,
+                tokens: 0,
+                activity: None,
+                files_dir: None,
+                whole: Vec::new(),
+                calls: Vec::new(),
+            });
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens, elapsed: Duration::from_secs(1), cut_off: false })));
+        };
+        let finished = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Finished(..))).count();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        // Left over from the prompt before: a new prompt starts again.
+        app.task_tokens = 7;
+        app.send_prompt("what is this?".into(), Vec::new());
+        assert!(app.task.is_some() && app.task_tokens == 0);
+        // A tool round and the answer: one prompt, its tokens summed.
+        turn(&mut app, 3);
+        turn(&mut app, 4);
+        app.settle();
+        // With no project, nothing's summarized, but it still ends.
+        assert!(app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 7))));
+        assert!(screen(&app, 80, 30).contains("■ Finished in 0s · 7 tokens"));
+        // Settled, it isn't said again.
+        app.settle();
+        assert_eq!(finished(&app), 1);
+    }
+
+    #[test]
+    fn a_task_whose_reply_fails_ends_on_the_error_without_a_finished_line() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let mut task = summary::TaskRecord::new("bump the version");
+        task.file("Cargo.toml", false, 1, 1);
+        app.task = Some(task);
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: None,
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let error = "Failed to read stream: connection closed";
+        app.apply(AppEvent::TurnDone(Err(error.into())));
+        app.settle();
+        assert!(matches!(app.entries.last(), Some(Entry::Reply(r)) if r.ended.as_deref() == Some(error)));
+        // Not finished, nor summarized, though it changed a file.
+        assert!(app.task.is_none() && app.summarizing.is_none());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Finished(..))));
+        assert!(app.idle());
+    }
+
+    #[test]
+    fn a_task_that_asks_back_ends_unsummarized_and_a_stopped_one_not_at_all() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        // It changed a file, but waits on the user: no summary, the line.
+        let mut task = summary::TaskRecord::new("add a prefix");
+        task.file("src/main.rs", false, 2, 1);
+        task.reply("Which prefix format do you use?");
+        app.task = Some(task);
+        app.settle();
+        assert!(app.summarizing.is_none());
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(..))));
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Summary(_))));
+        // Stopped partway, it didn't finish: no line.
+        let entries = app.entries.len();
+        app.task = Some(summary::TaskRecord::new("add main"));
+        app.stop_turn();
+        app.settle();
+        assert_eq!(app.entries.len(), entries);
+    }
+
+    #[test]
+    fn the_finished_line_says_how_long_and_how_many_tokens() {
+        assert_eq!(finished_line(Duration::from_secs(5), 0), "■ Finished in 5s");
+        assert_eq!(finished_line(Duration::from_secs(5), 1), "■ Finished in 5s · 1 token");
+        assert_eq!(finished_line(Duration::from_secs(72), 4321), "■ Finished in 1min 12s · 4321 tokens");
+    }
+
+    #[test]
+    fn a_summary_that_cant_be_asked_for_says_why_once() {
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "app".into()));
+        let warnings = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Warning(_))).count();
+        for _ in 0..2 {
+            let mut task = summary::TaskRecord::new("bump the version");
+            task.file("Cargo.toml", false, 1, 1);
+            app.task = Some(task);
+            app.settle();
+            let (asked, _) = app.summarizing.clone().expect("asked");
+            app.apply(AppEvent::Summary(asked, Err("Failed to summarize: 404 Not Found".into())));
+            let at = app.entries.len() - 2;
+            assert!(matches!(&app.entries[at], Entry::Summary(s) if s == "Updated Cargo.toml (+1 −1)."));
+            assert!(matches!(app.entries.last(), Some(Entry::Finished(..))));
+        }
+        assert_eq!(warnings(&app), 1, "said once a session");
+        let text = screen(&app, 100, 30);
+        assert!(text.contains("Failed to summarize: 404 Not Found; showing docent's own summary"), "{}", text);
+        // None to give isn't a failure: nothing's said.
+        let mut app = self::app();
+        app.project = Some(("p1".into(), "app".into()));
+        let mut task = summary::TaskRecord::new("bump the version");
+        task.file("Cargo.toml", false, 1, 1);
+        app.task = Some(task);
+        app.settle();
+        let (asked, _) = app.summarizing.clone().expect("asked");
+        app.apply(AppEvent::Summary(asked, Ok(None)));
+        assert_eq!(warnings(&app), 0);
     }
 
     #[test]
@@ -8129,11 +8344,12 @@ mod tests {
         let (asked, _) = app.summarizing.clone().expect("asked");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let plain = "Updated Cargo.toml (+1 −1).";
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
+        let summary = |app: &App| matches!(&app.entries[app.entries.len() - 2], Entry::Summary(s) if s == plain);
+        assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
         assert!(app.summarizing.is_none() && app.idle());
         // The agent's, coming late, goes nowhere.
-        app.apply(AppEvent::Summary(asked, Some("late".into())));
-        assert!(matches!(app.entries.last(), Some(Entry::Summary(s)) if s == plain));
+        app.apply(AppEvent::Summary(asked, Ok(Some("late".into()))));
+        assert!(summary(&app) && matches!(app.entries.last(), Some(Entry::Finished(..))));
     }
 
     #[test]
@@ -8244,9 +8460,15 @@ mod tests {
         assert!(screen(&app, 80, 30).contains("[esc] stop command"));
         let job = app.jobs.last().expect("git push runs");
         let stopped = job.stopped.clone();
+        app.task = Some(summary::TaskRecord::new("push it"));
         key(&mut app, KeyCode::Esc);
         assert!(stopped.load(Ordering::Relaxed));
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Stopped: git push"));
+        // Stopped partway, the task didn't finish: no line ends it.
+        app.apply(AppEvent::Ran(app.shell_runs, "p1".into(), String::new(), Some(Ended::Stopped)));
+        app.settle();
+        assert!(app.task.is_none());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Finished(..))));
         app.jobs.clear();
         assert!(!screen(&app, 80, 30).contains("[esc]"));
         // A command with a placeholder is left out, and the rest run.
@@ -10863,6 +11085,68 @@ mod tests {
         app.send_queued();
         assert!(app.queued.is_empty() && app.turn.is_some());
         assert!(screen(&app, 80, 24).contains("> third"));
+    }
+
+    #[test]
+    fn a_queued_prompt_goes_once_the_task_before_it_has_finished() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _inside = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "notes".into()));
+        let done = |app: &mut App, tokens: u64| {
+            app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens, elapsed: Duration::from_secs(1), cut_off: false })));
+        };
+        // As the event loop goes round: the task settles, then the queue.
+        let round = |app: &mut App| {
+            app.settle();
+            app.send_queued();
+        };
+        let at = |app: &App, wanted: &dyn Fn(&Entry) -> bool| app.entries.iter().position(|e| wanted(e)).unwrap();
+        let user = |text: &'static str| move |e: &Entry| matches!(e, Entry::User(t) if t == text);
+        let finished = |app: &App| app.entries.iter().filter(|e| matches!(e, Entry::Finished(..))).count();
+        app.input = "first".into();
+        app.submit();
+        app.input = "second".into();
+        app.submit();
+        assert_eq!(app.queued.len(), 1);
+
+        // An answer ends on its line before the next prompt goes.
+        done(&mut app, 3);
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some(), "the next prompt went");
+        let line = at(&app, &|e| matches!(e, Entry::Finished(_, 3)));
+        assert!(line < at(&app, &user("second")));
+        assert_eq!(app.task_tokens, 0, "the next prompt counts from nothing");
+
+        // One that changed files waits on its summary; the next prompt
+        // waits too, then goes under the summary and its line.
+        app.task.as_mut().unwrap().file("notes.md", false, 1, 0);
+        app.input = "third".into();
+        app.submit();
+        done(&mut app, 4);
+        round(&mut app);
+        let (asked, _) = app.summarizing.clone().expect("a summary is asked for");
+        assert!(app.queued.len() == 1 && app.turn.is_none(), "the next prompt waits for the summary");
+        app.apply(AppEvent::Summary(asked, Ok(Some("Updated notes.md.".into()))));
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        let summary = at(&app, &|e| matches!(e, Entry::Summary(_)));
+        let line = at(&app, &|e| matches!(e, Entry::Finished(_, 4)));
+        assert!(summary < line && line < at(&app, &user("third")), "summary, line, then the next prompt");
+
+        // Interrupted with a prompt queued, it never finished: no line, and
+        // the next counts afresh.
+        app.input = "fourth".into();
+        app.submit();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        round(&mut app);
+        assert!(app.queued.is_empty() && app.turn.is_some());
+        assert_eq!(finished(&app), 2);
+        assert_eq!(app.task_tokens, 0);
+        done(&mut app, 5);
+        round(&mut app);
+        assert!(matches!(app.entries.last(), Some(Entry::Finished(_, 5))));
     }
 
     #[test]
