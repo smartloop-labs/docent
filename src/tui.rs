@@ -4100,6 +4100,9 @@ impl App {
             // Esc on an empty prompt stops the command running in front.
             KeyCode::Esc if self.input.is_empty() && self.foreground_job() => {
                 let stopped = self.stop_jobs(|j| self.shell_of(j.id).is_some_and(|s| !s.background));
+                // Stopped partway, the task didn't finish: no line ends it,
+                // as when its reply is stopped.
+                self.task = None;
                 self.entries.push(Entry::Notice(format!("Stopped: {}", one_line(&stopped))));
                 self.scroll_back = 0;
             }
@@ -8421,9 +8424,15 @@ mod tests {
         assert!(screen(&app, 80, 30).contains("[esc] stop command"));
         let job = app.jobs.last().expect("git push runs");
         let stopped = job.stopped.clone();
+        app.task = Some(summary::TaskRecord::new("push it"));
         key(&mut app, KeyCode::Esc);
         assert!(stopped.load(Ordering::Relaxed));
         assert!(matches!(app.entries.last(), Some(Entry::Notice(n)) if n == "Stopped: git push"));
+        // Stopped partway, the task didn't finish: no line ends it.
+        app.apply(AppEvent::Ran(app.shell_runs, "p1".into(), String::new(), Some(Ended::Stopped)));
+        app.settle();
+        assert!(app.task.is_none());
+        assert!(!app.entries.iter().any(|e| matches!(e, Entry::Finished(..))));
         app.jobs.clear();
         assert!(!screen(&app, 80, 30).contains("[esc]"));
         // A command with a placeholder is left out, and the rest run.
