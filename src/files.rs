@@ -766,8 +766,8 @@ fn gather(reply: &str, ended: bool, on_disk: impl Fn(&str) -> Option<String>) ->
             continue;
         }
         let mut file = block.file;
+        let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
         if let Some(edits) = &block.edit {
-            let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
             match apply_edits(before.as_deref(), edits) {
                 Ok(after) => file.content = after,
                 Err(why) => {
@@ -778,16 +778,49 @@ fn gather(reply: &str, ended: bool, on_disk: impl Fn(&str) -> Option<String>) ->
             if !edited.contains(&file.path) {
                 edited.push(file.path.clone());
             }
-        } else if block.append {
-            let before = files.iter().find(|f| f.path == file.path).map(|f| f.content.clone()).or_else(|| on_disk(&file.path));
-            if let Some(before) = before {
-                file.content = before + &file.content;
-            }
+        } else if block.append
+            && let Some(before) = &before
+        {
+            file.content = format!("{before}{}", file.content);
+        }
+        // What's written is the change to the file as it was, and no edit
+        // markup the reply left in it.
+        if let Some(before) = &before {
+            file.content = without_markup(before, std::mem::take(&mut file.content));
         }
         files.retain(|f| f.path != file.path);
         files.push(file);
     }
     Extracted { files, edited, failed, cut }
+}
+
+/// `after`, a file's new contents, without the edit markup a reply left
+/// in it: a `<<<<<<< SEARCH` or `>>>>>>> REPLACE` line among the lines it
+/// adds to `before`, the file as it was. The two are diffed by line
+/// (`similar`'s Myers, as `git diff` does), so only a line the change
+/// brings in can go; one the file already had stays, as in a document
+/// about edit blocks.
+///
+/// A model leaves one behind when it ends a block of new lines with a
+/// REPLACE line and no pair around it, or writes a file whole with a pair's
+/// markers still in it.
+fn without_markup(before: &str, after: String) -> String {
+    let markup = |line: &str| is_search(line) || is_replace(line);
+    if !after.lines().any(markup) {
+        return after;
+    }
+    let (old, new): (Vec<&str>, Vec<&str>) = (before.split_inclusive('\n').collect(), after.split_inclusive('\n').collect());
+    let mut out = String::with_capacity(after.len());
+    for op in similar::capture_diff_slices(similar::Algorithm::Myers, &old, &new) {
+        let (tag, _, came) = op.as_tag_tuple();
+        let kept = tag == similar::DiffTag::Equal;
+        for line in &new[came] {
+            if kept || !markup(line) {
+                out.push_str(line);
+            }
+        }
+    }
+    out
 }
 
 /// A line opening an edit's search text: `<<<<<<< SEARCH`.
@@ -863,13 +896,15 @@ pub fn edits(body: &[&str]) -> Vec<Edit> {
             k += 1;
             continue;
         }
-        let Some(end) = (k + 1..body.len()).find(|&j| is_replace(body[j])) else { break };
+        // To its REPLACE line; or, that left out, to the next pair's SEARCH,
+        // which would else be taken into this one's replacement.
+        let Some(end) = (k + 1..body.len()).find(|&j| is_replace(body[j]) || is_search(body[j])) else { break };
         let pair = &body[k + 1..end];
         let dividers: Vec<usize> = (0..pair.len()).filter(|&j| is_divider(pair[j])).collect();
         if !dividers.is_empty() {
             out.push(Edit::split(pair, &dividers));
         }
-        k = end + 1;
+        k = if is_replace(body[end]) { end + 1 } else { end };
     }
     out
 }
@@ -1317,7 +1352,10 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
         // to find above its `=======`, what goes in its place below it, to
         // its REPLACE line or the block's end. Anything else is no edit,
         // and asked for again.
-        if info.split_whitespace().next() == Some("edit") {
+        // So is one that has a pair's `=======` and REPLACE lines, whatever
+        // it's marked: written whole, they'd be lines of the file.
+        let unmarked = body.iter().any(|l| is_replace(l)) && body.iter().any(|l| is_divider(l));
+        if info.split_whitespace().next() == Some("edit") || unmarked {
             let edit = if close.is_some() { markerless_edits(&body) } else { Vec::new() };
             let file = File { path, content: String::new() };
             blocks.push(Block { file, fence: at, end: i, append: false, closed: close.is_some(), edit: Some(edit) });
@@ -2711,6 +2749,32 @@ mod tests {
         let blocks = super::blocks(open);
         assert!(!blocks[0].closed);
         assert_eq!(blocks[0].edit.as_deref(), Some(&[edit("x", "y")][..]));
+    }
+
+    #[test]
+    fn edit_markup_is_never_written_into_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let was = "const a = 1;\nget theme(){\n  return old;\n}\nconst z = 9;\n";
+        fs::write(dir.path().join("app.js"), was).unwrap();
+        let now = "const a = 1;\nget theme(){\n  return seasonal;\n}\nconst z = 9;\n";
+        // A pair's lines in a block marked as code, with no SEARCH line.
+        let unmarked = "app.js\n```js\nget theme(){\n  return old;\n}\n=======\nget theme(){\n  return seasonal;\n}\n    >>>>>>> REPLACE\n```\n";
+        // The file whole, a REPLACE line left under the lines it changed.
+        let whole = "app.js\n```js\nconst a = 1;\nget theme(){\n  return seasonal;\n}\n    >>>>>>> REPLACE\nconst z = 9;\n```\n";
+        // The same in a heredoc.
+        let heredoc = "```sh\ncat > app.js <<'EOF'\nconst a = 1;\nget theme(){\n  return seasonal;\n}\n>>>>>>> REPLACE\nconst z = 9;\nEOF\n```\n";
+        // A pair with no REPLACE line, then another.
+        let unended = "```edit app.js\n<<<<<<< SEARCH\n  return old;\n=======\n  return seasonal;\n<<<<<<< SEARCH\nconst z = 9;\n=======\nconst z = 9;\n>>>>>>> REPLACE\n```\n";
+        for reply in [unmarked, whole, heredoc, unended] {
+            let got = extract_in(dir.path(), reply);
+            assert!(got.failed.is_empty(), "{reply}: {:?}", got.failed);
+            assert_eq!(got.files[0].content, now, "{reply}");
+        }
+        // A marker line the file already had is the file's, and stays.
+        let doc = "Use:\n>>>>>>> REPLACE\nold\n";
+        fs::write(dir.path().join("doc.md"), doc).unwrap();
+        let got = extract_in(dir.path(), "```edit doc.md\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n```\n");
+        assert_eq!(got.files[0].content, "Use:\n>>>>>>> REPLACE\nnew\n");
     }
 
     #[test]
