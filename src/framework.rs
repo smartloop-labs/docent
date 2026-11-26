@@ -614,7 +614,14 @@ pub fn stream_progress(
             let name = data["filename"].as_str().unwrap_or_default().to_string();
             files.insert(name, (done, total));
             let (done, total) = files.values().fold((0, 0), |(d, t), (fd, ft)| (d + fd, t + ft));
-            list.progress(download, done, total);
+            // The agent checks each finished file before publishing it, which
+            // takes a while for a large one. Say so once every byte is in,
+            // rather than leave the bar sitting at 100%.
+            if data["status"] == "verifying" && done >= total {
+                list.note(download, "verifying…");
+            } else {
+                list.progress(download, done, total);
+            }
             continue;
         }
 
@@ -1018,6 +1025,8 @@ mod tests {
         count: usize,
         done: Vec<usize>,
         failed: Option<(usize, String)>,
+        notes: Vec<(usize, String)>,
+        bars: Vec<(usize, u64, u64)>,
     }
 
     impl Steps for Recorded {
@@ -1028,8 +1037,12 @@ mod tests {
         fn add_name(&mut self, _: usize, _: &str) {}
         fn set_detail(&mut self, _: usize, _: &str) {}
         fn start(&mut self, _: usize) {}
-        fn note(&mut self, _: usize, _: &str) {}
-        fn progress(&mut self, _: usize, _: u64, _: u64) {}
+        fn note(&mut self, step: usize, detail: &str) {
+            self.notes.push((step, detail.to_string()));
+        }
+        fn progress(&mut self, step: usize, done: u64, total: u64) {
+            self.bars.push((step, done, total));
+        }
         fn warn(&mut self, _: &str) {}
         fn done(&mut self, step: usize) {
             self.done.push(step);
@@ -1043,11 +1056,9 @@ mod tests {
         }
     }
 
-    /// A download cancelled mid-way ends with the agent's `cancelled`
-    /// event: the step fails with its message, so what follows it (enabling
-    /// the model) isn't done.
-    #[test]
-    fn a_cancelled_download_ends_the_work() {
+    /// Serve `body` as the event stream of the next request, and return the
+    /// server's base URL.
+    fn serve_events(body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
@@ -1065,14 +1076,23 @@ mod tests {
                 }
             }
             std::io::Read::read_exact(&mut reader, &mut vec![0; length]).unwrap();
-            let body = "data: {\"status\": \"downloading\", \"message\": \"Downloading model m...\"}\n\n\
-                        data: {\"downloaded\": 10, \"total\": 100, \"filename\": \"m.gguf\"}\n\n\
-                        event: cancelled\ndata: {\"status\": \"cancelled\", \"message\": \"Download of m cancelled.\"}\n\n";
             let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n", body.len());
             stream.write_all(head.as_bytes()).unwrap();
             stream.write_all(body.as_bytes()).unwrap();
         });
+        base
+    }
 
+    /// A download cancelled mid-way ends with the agent's `cancelled`
+    /// event: the step fails with its message, so what follows it (enabling
+    /// the model) isn't done.
+    #[test]
+    fn a_cancelled_download_ends_the_work() {
+        let base = serve_events(
+            "data: {\"status\": \"downloading\", \"message\": \"Downloading model m...\"}\n\n\
+             data: {\"downloaded\": 10, \"total\": 100, \"filename\": \"m.gguf\"}\n\n\
+             event: cancelled\ndata: {\"status\": \"cancelled\", \"message\": \"Download of m cancelled.\"}\n\n",
+        );
         let mut list = Recorded::default();
         let download = list.add("Download m");
         let enable = list.add("Enable for project");
@@ -1085,6 +1105,27 @@ mod tests {
         assert!(ended.is_err(), "a cancelled stream ends the work");
         assert_eq!(list.failed, Some((download, "Download of m cancelled.".to_string())));
         assert!(!list.done.contains(&enable));
+    }
+
+    /// The bar gives way to "verifying…" once every file is in and the
+    /// agent is checking them, but not while a small file is verified
+    /// alongside a large one still downloading.
+    #[test]
+    fn a_finished_download_shows_it_is_verifying() {
+        let base = serve_events(
+            "data: {\"status\": \"downloading\", \"message\": \"Downloading model m...\"}\n\n\
+             data: {\"status\": \"downloading\", \"downloaded\": 50, \"total\": 100, \"filename\": \"m.gguf\"}\n\n\
+             data: {\"status\": \"verifying\", \"downloaded\": 10, \"total\": 10, \"filename\": \"mmproj.gguf\"}\n\n\
+             data: {\"status\": \"verifying\", \"downloaded\": 100, \"total\": 100, \"filename\": \"m.gguf\"}\n\n",
+        );
+        let mut list = Recorded::default();
+        let download = list.add("Download m");
+        stream_progress(&base, "/v1/init", serde_json::json!({}), &mut list, download, &|status| match status {
+            "downloading" => Stage::Start(download),
+            _ => Stage::Other,
+        });
+        assert_eq!(list.bars, vec![(download, 50, 100), (download, 60, 110)]);
+        assert_eq!(list.notes, vec![(download, "verifying…".to_string())]);
     }
 
     /// A server that stalls halfway through the first response and serves
