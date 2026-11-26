@@ -5608,6 +5608,10 @@ impl App {
                 Some((
                     match d.list.active() {
                         Some(StepRow { bytes: Some((done, total)), .. }) if *total > 0 => format!("downloading {}%", done * 100 / total),
+                        // A phase in place of the bar, such as "verifying…".
+                        Some(StepRow { detail, .. }) if !detail.is_empty() => {
+                            format!("{} {}", detail.trim_end_matches('…'), self.spinner())
+                        }
                         _ => format!("downloading {}", self.spinner()),
                     },
                     Style::new().fg(pink()),
@@ -10339,6 +10343,14 @@ mod tests {
         let text = screen(&app, 100, 24);
         assert!(!text.contains("[ctrl+d]") && !text.contains("[enter]") && text.contains("[ctrl+x] cancel download"), "{}", text);
         assert!(text.contains("[ctrl+r] refresh"), "{}", text);
+        // Its note follows the download: the bar's percentage, then the
+        // agent checking the finished files.
+        app.apply(AppEvent::Download(0, StepEvent::Add("Download qwen3.8-27b".into())));
+        app.apply(AppEvent::Download(0, StepEvent::Progress(0, 50, 100)));
+        assert!(screen(&app, 100, 24).contains("downloading 50%"));
+        app.apply(AppEvent::Download(0, StepEvent::Note(0, "verifying…".into())));
+        let text = screen(&app, 100, 24);
+        assert!(text.contains(&format!("verifying {}", app.spinner())) && !text.contains("downloading"), "{}", text);
     }
 
     #[test]
