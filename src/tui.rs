@@ -1223,8 +1223,17 @@ struct Tooling {
     failed: Option<String>,
     /// Why the next round isn't sent, once it's known it won't be.
     stop: Option<String>,
-    /// `web_search` calls of the last reply not started yet: id and query.
-    searches: Vec<(String, String)>,
+    /// `web_search` and `web_fetch` calls of the last reply not started
+    /// yet, by id.
+    searches: Vec<(String, WebCall)>,
+}
+
+/// A call of the web tools, run off the UI thread.
+#[derive(Clone, Debug, PartialEq)]
+enum WebCall {
+    Search(String),
+    /// A page's URL, and the character to read it from.
+    Fetch(String, usize),
 }
 
 /// One tool call of a reply, as it runs.
@@ -1273,7 +1282,18 @@ impl Tooling {
                     match crate::web::query(&call.arguments) {
                         Ok(query) => {
                             shown.push_str(&format!("\n\nSearching the web: {}\n", query.replace('\n', " ")));
-                            self.searches.push((c.id.clone(), query));
+                            self.searches.push((c.id.clone(), WebCall::Search(query)));
+                        }
+                        Err(why) => c.result = Some(why),
+                    }
+                    return c;
+                }
+                if call.name == crate::web::FETCH_TOOL {
+                    match crate::web::fetch_args(&call.arguments) {
+                        Ok((url, start)) => {
+                            let from = if start > 0 { format!(" (from character {})", start) } else { String::new() };
+                            shown.push_str(&format!("\n\nReading {}{}\n", url, from));
+                            self.searches.push((c.id.clone(), WebCall::Fetch(url, start)));
                         }
                         Err(why) => c.result = Some(why),
                     }
@@ -1347,11 +1367,12 @@ fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>),
     // `bash` by habit, on Windows too, runs as the tool offered there.
     if name != chat::TOOL_NAME && name != "bash" {
         return Err(format!(
-            "Error: there's no tool named `{}`; the tools are `{}`, `{}` and `{}`.",
+            "Error: there's no tool named `{}`; the tools are `{}`, `{}`, `{}` and `{}`.",
             name,
             chat::TOOL_NAME,
             files::EXPLORE_TOOL,
-            crate::web::TOOL
+            crate::web::TOOL,
+            crate::web::FETCH_TOOL
         ));
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
@@ -2907,16 +2928,20 @@ impl App {
         self.tool_round_done();
     }
 
-    /// The last reply's `web_search` calls, started each on a thread of
-    /// its own, their pages coming back as `Searched`.
+    /// The last reply's `web_search` and `web_fetch` calls, started each
+    /// on a thread of its own, their pages coming back as `Searched`.
     fn start_searches(&mut self) {
         let searches = self.tooling.as_mut().map(|t| std::mem::take(&mut t.searches)).unwrap_or_default();
-        for (id, query) in searches {
+        for (id, call) in searches {
             if cfg!(test) {
                 continue;
             }
             self.spawn(move |_, tx| {
-                let _ = tx.send(AppEvent::Searched(id, crate::web::search(&query)));
+                let result = match call {
+                    WebCall::Search(query) => crate::web::search(&query),
+                    WebCall::Fetch(url, start) => crate::web::fetch(&url, start),
+                };
+                let _ = tx.send(AppEvent::Searched(id, result));
             });
         }
     }
@@ -3111,7 +3136,7 @@ impl App {
                                 // command has nowhere to.
                                 let text = reply.text.clone();
                                 let (commands, shown) = tooling.called(&text, turn.calls);
-                                tooling.resolve(&commands, "Not run: this turn has no working folder; only `web_search` is available.");
+                                tooling.resolve(&commands, "Not run: this turn has no working folder; only `web_search` and `web_fetch` are available.");
                                 reply.text.push_str(&shown);
                                 self.start_searches();
                                 self.tool_round_done();
@@ -8136,6 +8161,20 @@ mod tests {
         assert!(app.turn.is_some(), "the next round was sent");
         let rounds = &app.tooling.as_ref().unwrap().rounds;
         assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: tokio select");
+
+        // So does reading a page by its URL; a URL that isn't http(s) is
+        // answered at once.
+        let fetch = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "web_fetch".into(), arguments: arguments.into() };
+        reply(&mut app, vec![fetch("call_5", r#"{"url": "https://docs.rs/tokio", "start": 12000}"#), fetch("call_6", r#"{"url": "ftp://x"}"#)]);
+        assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the page");
+        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
+        assert!(shown.text.contains("\n\nReading https://docs.rs/tokio (from character 12000)\n"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("isn't an http(s) URL")));
+        app.apply(AppEvent::Searched("call_5".into(), "https://docs.rs/tokio\n\npage".into()));
+        assert!(app.turn.is_some(), "the next round was sent");
+        let rounds = &app.tooling.as_ref().unwrap().rounds;
+        assert_eq!(rounds[rounds.len() - 2]["content"], "https://docs.rs/tokio\n\npage");
     }
 
     #[test]

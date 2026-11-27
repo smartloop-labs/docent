@@ -128,7 +128,7 @@ pub fn project_brief(root: &Path, kind: &str) -> String {
     let mut text = format!(
         "I'm working in the {} project at {}. This is about that project, not a general question: answer from \
          its files. For what they and your own knowledge don't tell, or may have out of date, such as a \
-         library's current API or an error message, call `web_search` when you have it. You haven't seen the \
+         library's current API or an error message, call the `web_search` tool, and `web_fetch` to read a page by its URL, not curl or wget. You haven't seen the \
          code yet. Before you answer or change anything, call the `{tool}` tool with no arguments for an overview \
          of the codebase (its files, manifests and README), then call `{tool}` with the `paths` the request \
          concerns to read them, as many rounds as you need, and only then decide what to do. When I ask for code \
