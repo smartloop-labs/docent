@@ -130,7 +130,6 @@ On exit it prints the session id, to resume with `docent -s <session-id>` (or `-
 | `Ctrl+P` | projects: switch (in a new session), create, delete |
 | `Ctrl+B` | the commands still running (`/tasks`) |
 | `Ctrl+C` | quit |
-| `Ctrl+S` | web search on or off |
 
 | Command | Does |
 | --- | --- |
@@ -229,8 +228,8 @@ What happens on each prompt:
    them what to do. Reading only reads, inside the folder, so it's never
    asked about. For what the code and the model's own knowledge don't
    tell, or may have out of date, it calls `web_search`, which searches
-   through Smartloop's hosted search and reads the top pages. It's offered
-   while the project's web search is on (ctrl+s), signed in. That way it
+   through Smartloop's hosted search and reads the top pages. Web search is
+   on by default (signed out, the tool says so). That way it
    answers from your code, and goes to the web only for what
    the code can't tell it, like a library's current API. It's also told about
    the machine (OS and version, shell, the package managers and toolchains on
@@ -247,7 +246,7 @@ What happens on each prompt:
    go to the agent with it, so it doesn't write against an API it remembers
    from an older version. It's offline and costs nothing; a library that
    isn't installed yet goes without (building the project installs it), and
-   with web search on (`Ctrl+S`) the agent can look it up itself. Each is
+   the agent can look it up itself with `web_search`. Each is
    kept in `.docent/cache/api/` as markdown you can read, which has a
    `.gitignore` of its own, so it's read once a version. `Esc` stops it.
 3. **You see diffs as they stream in.** Each file shows as numbered hunks,

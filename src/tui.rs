@@ -152,9 +152,6 @@ enum AppEvent {
     Usage(Option<SearchUsage>),
     /// `/usage`: this month's credits, read with the searches.
     Credits(Option<CreditUsage>),
-    /// The project's web search switch, read or just toggled; `toggled`
-    /// says whether to announce it.
-    WebSearch { enabled: bool, toggled: bool },
     /// The folder's skills went to the project: list them again.
     SkillsPushed,
     /// What the agent is doing for this project, for the welcome card;
@@ -694,6 +691,21 @@ impl Reply {
                             (true, Some(file)) if pending => streaming_part(&file.path, &file.content, false, width),
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
                             (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, replying, width),
+                            // An edit of a file the reply never names: not
+                            // made, and shown as its change all the same.
+                            // So are a reply's pairs when it wasn't asked
+                            // for files: its change, never its markup.
+                            (true, None) if segment.lines().any(files::is_search) => {
+                                let mut part = Vec::new();
+                                if self.root.is_some() && !pending {
+                                    part.push(Line::from(vec![
+                                        Span::styled("← ", dim()),
+                                        Span::styled("not changed: the reply doesn't say which file this is for", Style::new().fg(Color::Yellow)),
+                                    ]));
+                                }
+                                part.extend(pairs_part(&segment, width));
+                                part
+                            }
                             (true, None) => code_lines(&segment, width),
                             (false, _) => prose_lines(&segment, width),
                         },
@@ -826,7 +838,7 @@ impl Reply {
                     Span::styled(path.clone(), Style::new().bold()),
                     Span::styled(format!(" · not changed: {}", files::plainly(&why)), Style::new().fg(Color::Yellow)),
                 ])];
-                part.extend(code_lines(segment, width));
+                part.extend(pairs_part(segment, width));
                 part
             }
         }
@@ -838,6 +850,43 @@ impl Reply {
         let root = self.root.as_ref()?;
         self.olds.borrow_mut().entry(path.to_string()).or_insert_with(|| std::fs::read_to_string(root.join(path)).ok()).clone()
     }
+}
+
+/// An edit block that wasn't made, `segment` its text, as the change each
+/// of its pairs asks for: the lines to go and the lines to come, diffed by
+/// line, never its SEARCH and REPLACE lines. With no pair that can be read,
+/// its lines as code without them.
+fn pairs_part(segment: &str, width: u16) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = segment.lines().collect();
+    let indent = lines.iter().find(|l| files::is_search(l)).map_or("", |l| &l[..l.len() - l.trim_start().len()]);
+    let mut body: Vec<&str> = lines.iter().map(|l| l.strip_prefix(indent).unwrap_or(l)).collect();
+    // A pair still coming in, or cut off: what has come of it.
+    if let Some(open) = body.iter().rposition(|l| files::is_search(l))
+        && !body[open..].iter().any(|l| files::is_replace(l))
+    {
+        while body.last().is_some_and(|l| files::opening_fence(l).is_some()) {
+            body.pop();
+        }
+        if !body[open..].iter().any(|l| files::is_divider(l)) {
+            body.push("=======");
+        }
+        body.push(">>>>>>> REPLACE");
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for edit in files::edits(&body) {
+        let mut diff = files::diff("", Some(&edit.search), &edit.replace, false);
+        diff.lines.retain(|l| !matches!(l, files::DiffLine::Hunk { .. }));
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(diff_lines(&diff, width).into_iter().skip(1));
+    }
+    if out.is_empty() {
+        let markup = |l: &str| files::is_search(l) || files::is_replace(l) || files::own_edit_path(l).is_some() || files::is_own_edit_end(l);
+        let kept: Vec<&str> = body.into_iter().filter(|l| !markup(l)).collect();
+        out = code_lines(&kept.join("\n"), width);
+    }
+    out
 }
 
 /// A file a reply is still giving: its name and how many lines have come,
@@ -875,6 +924,16 @@ fn segments(text: &str) -> Vec<(bool, String, usize)> {
             let fence = "`".repeat(longest.max(2) + 1);
             let close = if closed { format!("\n{fence}") } else { String::new() };
             out.push((true, format!("{fence}\n{}{close}", body.join("\n")), i));
+            i = end;
+            prose = end;
+            continue;
+        }
+        // So is one written in a form of the model's own.
+        if let Some((_, end)) = files::own_edit(&lines, i) {
+            if prose < i {
+                out.push((false, lines[prose..i].join("\n"), prose));
+            }
+            out.push((true, format!("````\n{}\n````", lines[i..end].join("\n")), i));
             i = end;
             prose = end;
             continue;
@@ -1187,8 +1246,6 @@ struct Sent {
     /// Characters of file contents one `explore` call returns, for the
     /// model's window.
     budget: usize,
-    /// Offer `web_search`: the project's web search isn't off.
-    web_search: bool,
 }
 
 /// What the pre-run skill looks up for a turn: the `deps` its `prompt`,
@@ -1228,8 +1285,17 @@ struct Tooling {
     failed: Option<String>,
     /// Why the next round isn't sent, once it's known it won't be.
     stop: Option<String>,
-    /// `web_search` calls of the last reply not started yet: id and query.
-    searches: Vec<(String, String)>,
+    /// `web_search` and `web_fetch` calls of the last reply not started
+    /// yet, by id.
+    searches: Vec<(String, WebCall)>,
+}
+
+/// A call of the web tools, run off the UI thread.
+#[derive(Clone, Debug, PartialEq)]
+enum WebCall {
+    Search(String),
+    /// A page's URL, and the character to read it from.
+    Fetch(String, usize),
 }
 
 /// One tool call of a reply, as it runs.
@@ -1278,7 +1344,18 @@ impl Tooling {
                     match crate::web::query(&call.arguments) {
                         Ok(query) => {
                             shown.push_str(&format!("\n\nSearching the web: {}\n", query.replace('\n', " ")));
-                            self.searches.push((c.id.clone(), query));
+                            self.searches.push((c.id.clone(), WebCall::Search(query)));
+                        }
+                        Err(why) => c.result = Some(why),
+                    }
+                    return c;
+                }
+                if call.name == crate::web::FETCH_TOOL {
+                    match crate::web::fetch_args(&call.arguments) {
+                        Ok((url, start)) => {
+                            let from = if start > 0 { format!(" (from character {})", start) } else { String::new() };
+                            shown.push_str(&format!("\n\nReading {}{}\n", url, from));
+                            self.searches.push((c.id.clone(), WebCall::Fetch(url, start)));
                         }
                         Err(why) => c.result = Some(why),
                     }
@@ -1352,11 +1429,12 @@ fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>),
     // `bash` by habit, on Windows too, runs as the tool offered there.
     if name != chat::TOOL_NAME && name != "bash" {
         return Err(format!(
-            "Error: there's no tool named `{}`; the tools are `{}`, `{}` and, when web search is on, `{}`.",
+            "Error: there's no tool named `{}`; the tools are `{}`, `{}`, `{}` and `{}`.",
             name,
             chat::TOOL_NAME,
             files::EXPLORE_TOOL,
-            crate::web::TOOL
+            crate::web::TOOL,
+            crate::web::FETCH_TOOL
         ));
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
@@ -1654,8 +1732,6 @@ struct App {
     models_checked: bool,
     /// This month's credits, read with `search`.
     credits: Option<CreditUsage>,
-    /// The project's web search switch (ctrl+s), once read.
-    web_search: Option<bool>,
     quit: bool,
 }
 
@@ -1740,7 +1816,6 @@ impl App {
             update: None,
             models_checked: false,
             credits: None,
-            web_search: None,
             quit: false,
         }
     }
@@ -2023,8 +2098,7 @@ impl App {
             self.entries.push(Entry::Warning(warning));
         }
         let budget = files::budget_for(self.window);
-        let web_search = self.web_search != Some(false);
-        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget, web_search };
+        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget };
         if deps.is_empty() {
             return self.start_sent(project, sent, files);
         }
@@ -2034,9 +2108,10 @@ impl App {
 
     /// Start the turn `sent`, its tool rounds from none.
     fn start_sent(&mut self, project: String, sent: Sent, files: Vec<Attachment>) {
-        // A turn with a working directory offers the `bash` tool, run there,
-        // and its tool rounds start over: it's a new request, not one going on.
-        self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
+        // Every turn offers `web_search`, and one with a working directory
+        // `bash` too, run there. Its tool rounds start over: it's a new
+        // request, not one going on.
+        self.tooling = Some(Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
     }
 
@@ -2168,7 +2243,6 @@ impl App {
                 project_id: &project,
                 session_id: &session,
                 tools: sent.cwd.is_some(),
-                web_search: sent.web_search,
                 rounds: &rounds,
             };
             let result = chat::stream_turn(&chat, &request, &mut on).await;
@@ -2186,7 +2260,6 @@ impl App {
         });
     }
 
-    /// Put the project's web search back on after a turn that had it off.
     /// Whether a turn of `prompt` makes files: always in a code project the
     /// chat was opened in, and elsewhere when the prompt asks for something
     /// to be made, names a file of the folder, as a pasted error does, or
@@ -2917,16 +2990,20 @@ impl App {
         self.tool_round_done();
     }
 
-    /// The last reply's `web_search` calls, started each on a thread of
-    /// its own, their pages coming back as `Searched`.
+    /// The last reply's `web_search` and `web_fetch` calls, started each
+    /// on a thread of its own, their pages coming back as `Searched`.
     fn start_searches(&mut self) {
         let searches = self.tooling.as_mut().map(|t| std::mem::take(&mut t.searches)).unwrap_or_default();
-        for (id, query) in searches {
+        for (id, call) in searches {
             if cfg!(test) {
                 continue;
             }
             self.spawn(move |_, tx| {
-                let _ = tx.send(AppEvent::Searched(id, crate::web::search(&query)));
+                let result = match call {
+                    WebCall::Search(query) => crate::web::search(&query),
+                    WebCall::Fetch(url, start) => crate::web::fetch(&url, start),
+                };
+                let _ = tx.send(AppEvent::Searched(id, result));
             });
         }
     }
@@ -3113,6 +3190,18 @@ impl App {
                                 }
                                 self.start_searches();
                                 self.run_commands();
+                            } else if !turn.calls.is_empty()
+                                && let Some(tooling) = &mut self.tooling
+                            {
+                                // No working directory: only `web_search`
+                                // was offered, so only searches run; a
+                                // command has nowhere to.
+                                let text = reply.text.clone();
+                                let (commands, shown) = tooling.called(&text, turn.calls);
+                                tooling.resolve(&commands, "Not run: this turn has no working folder; only `web_search` and `web_fetch` are available.");
+                                reply.text.push_str(&shown);
+                                self.start_searches();
+                                self.tool_round_done();
                             }
                         }
                         Err(e) => {
@@ -3224,13 +3313,6 @@ impl App {
                     self.skills = skills;
                 }
             }
-            AppEvent::WebSearch { enabled, toggled } => {
-                self.web_search = Some(enabled);
-                if toggled {
-                    let text = if enabled { "Web search on" } else { "Web search off; ctrl+s turns it back on" };
-                    self.entries.push(Entry::Notice(text.to_string()));
-                }
-            }
         }
     }
 
@@ -3284,7 +3366,6 @@ impl App {
                 self.project = Some(project);
                 // Its folder's skills go to it, wherever the folder is.
                 self.follow_project();
-                self.load_web_search();
                 // Read now, so a project with no model enabled says so at once.
                 self.load_models();
                 self.load_skills();
@@ -3369,7 +3450,6 @@ impl App {
         self.attachments.clear();
         self.session = chat::new_session_id();
         self.scroll_back = 0;
-        self.web_search = None;
         self.window = None;
         self.enabled_models = None;
         self.models_checked = false;
@@ -3384,7 +3464,6 @@ impl App {
         let id = project.0.clone();
         self.project = Some(project);
         self.follow_project();
-        self.load_web_search();
         self.load_models();
         self.load_skills();
         self.load_connections();
@@ -3601,7 +3680,6 @@ impl App {
             (KeyCode::Char('o'), true) => return self.open_models(),
             (KeyCode::Char('p'), true) => return self.open_projects(),
             (KeyCode::Char('b'), true) => return self.open_jobs(),
-            (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
         let handled = match self.overlay {
@@ -3930,23 +4008,6 @@ impl App {
         self.load_usage();
     }
 
-    /// ctrl+s: flip the project's web search switch, as the studio app's
-    /// Cmd/Ctrl+Alt+S does.
-    fn toggle_web_search(&mut self) {
-        let Some((project, _)) = self.project.clone() else { return };
-        let current = self.web_search;
-        self.spawn(move |client, tx| {
-            let current = match current {
-                Some(on) => Ok(on),
-                None => crate::web_search_enabled(&client, &project),
-            };
-            let _ = tx.send(match current.and_then(|on| crate::set_web_search(&client, &project, !on)) {
-                Ok(enabled) => AppEvent::WebSearch { enabled, toggled: true },
-                Err(e) => AppEvent::Error(e),
-            });
-        });
-    }
-
     /// Re-read what the agent is doing every `AGENT_EVERY`, one ask at a
     /// time, once it's set up.
     fn poll_agent(&mut self) {
@@ -3994,15 +4055,6 @@ impl App {
         self.spawn(move |client, tx| {
             if let Ok(skills) = crate::project_skills(&client, &project) {
                 let _ = tx.send(AppEvent::Skills(project, skills));
-            }
-        });
-    }
-
-    fn load_web_search(&self) {
-        let Some((project, _)) = self.project.clone() else { return };
-        self.spawn(move |client, tx| {
-            if let Ok(enabled) = crate::web_search_enabled(&client, &project) {
-                let _ = tx.send(AppEvent::WebSearch { enabled, toggled: false });
             }
         });
     }
@@ -5887,16 +5939,13 @@ impl App {
     fn usage_panel_lines(&self, loading: bool) -> Vec<Line<'static>> {
         let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
         let indent = || Span::raw(format!(" {:<12}", ""));
-        let switch = (self.web_search == Some(false)).then(|| {
-            Line::from(vec![indent(), Span::styled("web search is off for this project · ctrl+s turns it on", dim())])
-        });
         let Some(credits) = self.credits.as_ref() else {
             let text = if loading {
                 format!("asking the agent {}", self.spinner())
             } else {
                 "sign in with /login to see your usage".to_string()
             };
-            return std::iter::once(Line::from(vec![label("Credits"), Span::styled(text, dim())])).chain(switch).collect();
+            return vec![Line::from(vec![label("Credits"), Span::styled(text, dim())])];
         };
         let mut lines = Vec::new();
         let mut head = vec![label("Credits")];
@@ -5942,7 +5991,6 @@ impl App {
         if let Some(more) = more {
             lines.push(Line::from(vec![indent(), Span::styled("/upgrade", key_style()), Span::styled(more, dim())]));
         }
-        lines.extend(switch);
         lines
     }
 
@@ -7087,7 +7135,6 @@ fn help_lines() -> Vec<Line<'static>> {
         ("drag", "select and copy to the clipboard"),
         ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
-        ("[ctrl+s]", "turn web search on or off for the project"),
         ("/mcp", "MCP servers: list, remove"),
         ("/mcp add <url>", "connect an MCP server by its URL"),
         ("[ctrl+p] /project", "projects: switch (in a new session), create, delete"),
@@ -8075,6 +8122,44 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_with_no_folder_still_searches_the_web() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "general_chat".into()));
+        let sent = Sent { message: "what about next weekend?".into(), ..Default::default() };
+        app.tooling = Some(Tooling { sent, ..Default::default() });
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: None,
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let calls = vec![
+            chat::ToolCall { id: "call_1".into(), name: "web_search".into(), arguments: r#"{"query": "events next weekend"}"#.into() },
+            chat::ToolCall { id: "call_2".into(), name: "bash".into(), arguments: r#"{"command": "ls"}"#.into() },
+        ];
+        app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
+        // The search waits for its pages; the command has nowhere to run.
+        assert!(app.turn.is_none() && app.ask.is_none() && app.commands.is_none());
+        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
+        assert!(shown.text.contains("Searching the web: events next weekend"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no working folder")));
+        app.apply(AppEvent::Searched("call_1".into(), "Web search results for: events next weekend".into()));
+        assert!(app.turn.is_some(), "the next round was sent");
+        let rounds = &app.tooling.as_ref().unwrap().rounds;
+        assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: events next weekend");
+    }
+
+    #[test]
     fn explore_calls_read_the_project_at_once_and_the_rounds_go_on() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
@@ -8138,6 +8223,20 @@ mod tests {
         assert!(app.turn.is_some(), "the next round was sent");
         let rounds = &app.tooling.as_ref().unwrap().rounds;
         assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: tokio select");
+
+        // So does reading a page by its URL; a URL that isn't http(s) is
+        // answered at once.
+        let fetch = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "web_fetch".into(), arguments: arguments.into() };
+        reply(&mut app, vec![fetch("call_5", r#"{"url": "https://docs.rs/tokio", "start": 12000}"#), fetch("call_6", r#"{"url": "ftp://x"}"#)]);
+        assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the page");
+        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
+        assert!(shown.text.contains("\n\nReading https://docs.rs/tokio (from character 12000)\n"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("isn't an http(s) URL")));
+        app.apply(AppEvent::Searched("call_5".into(), "https://docs.rs/tokio\n\npage".into()));
+        assert!(app.turn.is_some(), "the next round was sent");
+        let rounds = &app.tooling.as_ref().unwrap().rounds;
+        assert_eq!(rounds[rounds.len() - 2]["content"], "https://docs.rs/tokio\n\npage");
     }
 
     #[test]
@@ -8998,6 +9097,43 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_never_shows_its_search_and_replace_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let rows = |text: &str| -> Vec<String> {
+            let reply = Reply { root: Some(dir.path().to_path_buf()), text: text.into(), stats: Some(TurnStats::default()), ..Default::default() };
+            reply.body(60).iter().map(|l| l.to_string().trim_end().to_string()).collect()
+        };
+        let clean = |shown: &[String]| !shown.iter().any(|r| r.contains("SEARCH") || r.contains("REPLACE") || r.contains("======="));
+        // One more edit of the file before it, under prose naming none.
+        let shown = rows("a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n\nEdit 2 — the next line:\n\n    <<<<<<< SEARCH\n    two\n    =======\n    2\n    >>>>>>> REPLACE\n\nDone.\n");
+        assert_eq!(shown.iter().filter(|r| *r == "← a.txt  +1 −1").count(), 2, "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // No file named anywhere: not made, shown as its change.
+        let shown = rows("Edit 2 — the next line:\n\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.starts_with("← not changed: the reply doesn't say which file")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+2")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // Its marker lines the words alone, and no file named.
+        let shown = rows("And a small README tweak:\n\n    SEARCH\n    two\n    =======\n    2\n    REPLACE\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+2")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // A form of the model's own: told as not made, its lines without its markers.
+        let shown = rows("A touch-up:\n\n    EDIT a.txt\n    two\n    2\n    END_EDIT\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the change came in a form that can't be read")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("two")) && !shown.iter().any(|r| r.contains("EDIT")), "{:?}", shown);
+        // Cut off partway through a pair, under a script's name.
+        let shown = rows("2. jade-shell — the call site:\n\n    jade-shell\n    <<<<<<< SEARCH\n    two\n    =======\n    # picker\n    ORDER=(a b");
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+# picker")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // One that can't be made.
+        let shown = rows("```edit a.txt\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n```\n");
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("-nope")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+    }
+
+    #[test]
     fn a_language_servers_errors_go_to_the_agent_and_none_lead_to_the_build_check() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -9613,10 +9749,6 @@ mod tests {
         for expected in ["Credits", "24% used", "/upgrade to Pro or Plus for more credits a month"] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
-        // ctrl+s turned search off: say so, and how to turn it back on.
-        app.apply(AppEvent::WebSearch { enabled: false, toggled: true });
-        let text = screen(&app, 100, 30);
-        assert!(text.contains("web search is off for this project · ctrl+s turns it on"), "{}", text);
         // Signed out: nothing to show but how to sign in.
         app.apply(AppEvent::Credits(None));
         assert!(screen(&app, 100, 24).contains("sign in with /login"));

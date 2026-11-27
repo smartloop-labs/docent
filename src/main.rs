@@ -637,13 +637,6 @@ pub fn set_current_project(client: &Client, project_id: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Whether web search is on for the project: the agent's own per-project
-/// switch, which the studio app toggles with Cmd/Ctrl+Alt+S.
-pub fn web_search_enabled(client: &Client, project_id: &str) -> Result<bool, String> {
-    let reply = request_json(client, format!("{}/{}/websearch", projects_url(), project_id), "read web search")?;
-    Ok(reply["enabled"].as_bool().unwrap_or_default())
-}
-
 /// The agent as the welcome card shows it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentState {
@@ -732,21 +725,6 @@ pub fn project_skills(client: &Client, project_id: &str) -> Result<Vec<(String, 
         .map(|skill| (text(skill, "name"), text(skill, "description")))
         .filter(|(name, _)| !name.is_empty())
         .collect())
-}
-
-/// Turn web search on or off for the project; returns the new state.
-pub fn set_web_search(client: &Client, project_id: &str, enabled: bool) -> Result<bool, String> {
-    let action = if enabled { "turn on web search" } else { "turn off web search" };
-    let response = client
-        .patch(format!("{}/{}/websearch", projects_url(), project_id))
-        .json(&serde_json::json!({ "enabled": enabled }))
-        .send()
-        .map_err(|e| format!("Failed to {}: {}", action, e))?;
-    if !response.status().is_success() {
-        return Err(error_message(action, response));
-    }
-    let reply: serde_json::Value = response.json().map_err(|e| format!("Failed to {}: {}", action, e))?;
-    Ok(reply["enabled"].as_bool().unwrap_or(enabled))
 }
 
 /// The steps of enabling `name`, reported on `list`: the checklist, or the

@@ -132,11 +132,10 @@ pub struct Request<'a> {
     pub project_id: &'a str,
     pub session_id: &'a str,
     /// Offer the `bash` and `explore` tools: on any turn with a working
-    /// directory, where its commands run and its files are read. A server that won't give tools
-    /// to the model it picked ignores it and answers in text, as before.
+    /// directory, where its commands run and its files are read.
+    /// `web_search` and `web_fetch` are offered either way. A server that won't give tools
+    /// to the model it picked ignores them and answers in text, as before.
     pub tools: bool,
-    /// Offer `web_search` too: the project's web search is on.
-    pub web_search: bool,
     /// The turn's tool rounds so far, after the user's message: each
     /// assistant message with its `tool_calls`, then a `tool` message with
     /// each call's result.
@@ -187,7 +186,7 @@ pub fn bash_tool() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": TOOL_NAME,
-            "description": format!("{} and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.", what),
+            "description": format!("{} and return its output (stdout+stderr, exit code). Use it to look around the project, build, test, or run git. Don't use it to look things up on the web (no curl or wget for docs, APIs, pages or search): call `web_search` to search and `web_fetch` to read a page by its URL. Never use it to create or change files (no cat > file, heredocs, sed -i, tee, or echo >): write new files whole and change existing ones in your reply, as the instructions describe.", what),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -314,14 +313,15 @@ pub fn request_body(request: &Request) -> serde_json::Value {
         "project_id": request.project_id,
         "stream": true,
     });
-    if request.tools {
-        let mut tools = vec![bash_tool(), explore_tool()];
-        if request.web_search {
-            tools.push(crate::web::tool());
-        }
-        body["tools"] = serde_json::json!(tools);
-        body["tool_choice"] = serde_json::json!("auto");
-    }
+    // `web_search` and `web_fetch` go on every turn: they need no folder, only the model
+    // asking for it.
+    let tools = if request.tools {
+        serde_json::json!([bash_tool(), explore_tool(), crate::web::tool(), crate::web::fetch_tool()])
+    } else {
+        serde_json::json!([crate::web::tool(), crate::web::fetch_tool()])
+    };
+    body["tools"] = tools;
+    body["tool_choice"] = serde_json::json!("auto");
     body
 }
 
@@ -690,7 +690,6 @@ mod tests {
             project_id: "p1",
             session_id: "s1",
             tools: true,
-            web_search: true,
             rounds: &rounds,
         };
         let body = request_body(&request);
@@ -700,9 +699,8 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
         assert_eq!(body["tools"][1]["function"]["name"], crate::files::EXPLORE_TOOL);
         assert_eq!(body["tools"][2]["function"]["name"], crate::web::TOOL);
+        assert_eq!(body["tools"][3]["function"]["name"], crate::web::FETCH_TOOL);
         assert!(body.get("cwd").is_none());
-        let offline = request_body(&Request { web_search: false, ..request });
-        assert_eq!(offline["tools"].as_array().unwrap().len(), 2);
         let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
         assert_eq!(
@@ -711,9 +709,10 @@ mod tests {
         );
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
 
-        // A turn that isn't making files offers none, and is as before.
+        // A turn that isn't making files offers the web tools alone.
         let plain = request_body(&Request { system: None, tools: false, rounds: &[], attachments: &["a1".into()], ..request });
-        assert!(plain.get("tools").is_none() && plain.get("tool_choice").is_none());
+        assert_eq!(plain["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(plain["tools"][0]["function"]["name"], crate::web::TOOL);
         assert_eq!(plain["messages"], serde_json::json!([{"role": "user", "content": "list it", "attachments": ["a1"]}]));
     }
 
