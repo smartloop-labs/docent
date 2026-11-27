@@ -134,8 +134,10 @@ pub fn query(arguments: &str) -> Result<String, String> {
 /// the model. Blocking, a network round trip a page: run it off the UI
 /// thread. Never fails: why it couldn't search is the result, so the model
 /// goes on without it.
-pub fn search(query: &str) -> String {
+pub fn search(query: &str, said: impl Fn(&str) + Send + Sync + 'static) -> String {
     let agent = WebSearchAgent::new(None, TOP, CANDIDATES, None);
+    // What the agent says of each step, a page at a time: "Reading docs.rs".
+    let progress: smartloop::agents::web_search_agent::ProgressCallback = std::sync::Arc::new(move |_, _, message| said(message));
     let links = match agent.fetch_links(query, CANDIDATES) {
         Ok(links) => links,
         Err(SearchProviderError::NoSearchCredentials(_)) => {
@@ -154,7 +156,7 @@ pub fn search(query: &str) -> String {
     }
     // No rerank model, so fetching more than TOP usable pages would only
     // read pages that get thrown away: stop at TOP, skipping failed links.
-    agent.fetch_top(query, &links, TOP, TOP, None)
+    agent.fetch_top(query, &links, TOP, TOP, Some(&progress))
 }
 
 #[cfg(test)]
@@ -196,7 +198,7 @@ mod live {
     #[test]
     #[ignore]
     fn live_search() {
-        let text = super::search("rust tokio select macro documentation");
+        let text = super::search("rust tokio select macro documentation", |step| println!("{step}"));
         println!("{}", text.chars().take(1500).collect::<String>());
         assert!(!text.is_empty());
     }
