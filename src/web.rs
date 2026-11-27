@@ -5,8 +5,9 @@
 //! The framework's `WebSearchAgent` asks Smartloop's hosted `/v1/websearch`
 //! for links (signed in, within the month's allowance), then fetches the
 //! pages as markdown. Docent calls it in process, the agent being built in,
-//! and hands the pages to the model as the tool's result. The project's web
-//! search switch (ctrl+s) decides whether the tool is offered at all.
+//! and hands the pages to the model as the tool's result. Web search is on
+//! by default: the tool is offered on every turn with tools, and signed
+//! out, it says so and the model goes on without it.
 
 use smartloop::agents::web_search_agent::WebSearchAgent;
 use smartloop::search::providers::SearchProviderError;
@@ -15,8 +16,9 @@ use smartloop::search::providers::SearchProviderError;
 pub const TOOL: &str = "web_search";
 /// Pages handed back for one search.
 const TOP: usize = 3;
-/// Links asked for, so that pages that won't load can be skipped.
-const CANDIDATES: usize = 6;
+/// Links asked for: spares for pages that won't load. Only fetched as
+/// needed, so spares cost nothing unless a top page fails.
+const CANDIDATES: usize = 10;
 
 /// The tool, as offered to the model.
 pub fn tool() -> serde_json::Value {
@@ -70,7 +72,9 @@ pub fn search(query: &str) -> String {
     if links.is_empty() {
         return format!("No web results for \"{}\"; try other words.", query);
     }
-    agent.fetch_top(query, &links, TOP, CANDIDATES, None)
+    // No rerank model, so fetching more than TOP usable pages would only
+    // read pages that get thrown away: stop at TOP, skipping failed links.
+    agent.fetch_top(query, &links, TOP, TOP, None)
 }
 
 #[cfg(test)]

@@ -152,9 +152,6 @@ enum AppEvent {
     Usage(Option<SearchUsage>),
     /// `/usage`: this month's credits, read with the searches.
     Credits(Option<CreditUsage>),
-    /// The project's web search switch, read or just toggled; `toggled`
-    /// says whether to announce it.
-    WebSearch { enabled: bool, toggled: bool },
     /// The folder's skills went to the project: list them again.
     SkillsPushed,
     /// What the agent is doing for this project, for the welcome card;
@@ -1187,8 +1184,6 @@ struct Sent {
     /// Characters of file contents one `explore` call returns, for the
     /// model's window.
     budget: usize,
-    /// Offer `web_search`: the project's web search isn't off.
-    web_search: bool,
 }
 
 /// What the pre-run skill looks up for a turn: the `deps` its `prompt`,
@@ -1352,7 +1347,7 @@ fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>),
     // `bash` by habit, on Windows too, runs as the tool offered there.
     if name != chat::TOOL_NAME && name != "bash" {
         return Err(format!(
-            "Error: there's no tool named `{}`; the tools are `{}`, `{}` and, when web search is on, `{}`.",
+            "Error: there's no tool named `{}`; the tools are `{}`, `{}` and `{}`.",
             name,
             chat::TOOL_NAME,
             files::EXPLORE_TOOL,
@@ -1654,8 +1649,6 @@ struct App {
     models_checked: bool,
     /// This month's credits, read with `search`.
     credits: Option<CreditUsage>,
-    /// The project's web search switch (ctrl+s), once read.
-    web_search: Option<bool>,
     quit: bool,
 }
 
@@ -1740,7 +1733,6 @@ impl App {
             update: None,
             models_checked: false,
             credits: None,
-            web_search: None,
             quit: false,
         }
     }
@@ -2023,8 +2015,7 @@ impl App {
             self.entries.push(Entry::Warning(warning));
         }
         let budget = files::budget_for(self.window);
-        let web_search = self.web_search != Some(false);
-        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget, web_search };
+        let sent = Sent { system, message, attachments: Vec::new(), cwd, files_dir, whole: Vec::new(), budget };
         if deps.is_empty() {
             return self.start_sent(project, sent, files);
         }
@@ -2034,9 +2025,10 @@ impl App {
 
     /// Start the turn `sent`, its tool rounds from none.
     fn start_sent(&mut self, project: String, sent: Sent, files: Vec<Attachment>) {
-        // A turn with a working directory offers the `bash` tool, run there,
-        // and its tool rounds start over: it's a new request, not one going on.
-        self.tooling = sent.cwd.is_some().then(|| Tooling { sent: sent.clone(), ..Default::default() });
+        // Every turn offers `web_search`, and one with a working directory
+        // `bash` too, run there. Its tool rounds start over: it's a new
+        // request, not one going on.
+        self.tooling = Some(Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
     }
 
@@ -2168,7 +2160,6 @@ impl App {
                 project_id: &project,
                 session_id: &session,
                 tools: sent.cwd.is_some(),
-                web_search: sent.web_search,
                 rounds: &rounds,
             };
             let result = chat::stream_turn(&chat, &request, &mut on).await;
@@ -2186,7 +2177,6 @@ impl App {
         });
     }
 
-    /// Put the project's web search back on after a turn that had it off.
     /// Whether a turn of `prompt` makes files: always in a code project the
     /// chat was opened in, and elsewhere when the prompt asks for something
     /// to be made, names a file of the folder, as a pasted error does, or
@@ -3113,6 +3103,18 @@ impl App {
                                 }
                                 self.start_searches();
                                 self.run_commands();
+                            } else if !turn.calls.is_empty()
+                                && let Some(tooling) = &mut self.tooling
+                            {
+                                // No working directory: only `web_search`
+                                // was offered, so only searches run; a
+                                // command has nowhere to.
+                                let text = reply.text.clone();
+                                let (commands, shown) = tooling.called(&text, turn.calls);
+                                tooling.resolve(&commands, "Not run: this turn has no working folder; only `web_search` is available.");
+                                reply.text.push_str(&shown);
+                                self.start_searches();
+                                self.tool_round_done();
                             }
                         }
                         Err(e) => {
@@ -3224,13 +3226,6 @@ impl App {
                     self.skills = skills;
                 }
             }
-            AppEvent::WebSearch { enabled, toggled } => {
-                self.web_search = Some(enabled);
-                if toggled {
-                    let text = if enabled { "Web search on" } else { "Web search off; ctrl+s turns it back on" };
-                    self.entries.push(Entry::Notice(text.to_string()));
-                }
-            }
         }
     }
 
@@ -3284,7 +3279,6 @@ impl App {
                 self.project = Some(project);
                 // Its folder's skills go to it, wherever the folder is.
                 self.follow_project();
-                self.load_web_search();
                 // Read now, so a project with no model enabled says so at once.
                 self.load_models();
                 self.load_skills();
@@ -3369,7 +3363,6 @@ impl App {
         self.attachments.clear();
         self.session = chat::new_session_id();
         self.scroll_back = 0;
-        self.web_search = None;
         self.window = None;
         self.enabled_models = None;
         self.models_checked = false;
@@ -3384,7 +3377,6 @@ impl App {
         let id = project.0.clone();
         self.project = Some(project);
         self.follow_project();
-        self.load_web_search();
         self.load_models();
         self.load_skills();
         self.load_connections();
@@ -3601,7 +3593,6 @@ impl App {
             (KeyCode::Char('o'), true) => return self.open_models(),
             (KeyCode::Char('p'), true) => return self.open_projects(),
             (KeyCode::Char('b'), true) => return self.open_jobs(),
-            (KeyCode::Char('s'), true) => return self.toggle_web_search(),
             _ => {}
         }
         let handled = match self.overlay {
@@ -3930,23 +3921,6 @@ impl App {
         self.load_usage();
     }
 
-    /// ctrl+s: flip the project's web search switch, as the studio app's
-    /// Cmd/Ctrl+Alt+S does.
-    fn toggle_web_search(&mut self) {
-        let Some((project, _)) = self.project.clone() else { return };
-        let current = self.web_search;
-        self.spawn(move |client, tx| {
-            let current = match current {
-                Some(on) => Ok(on),
-                None => crate::web_search_enabled(&client, &project),
-            };
-            let _ = tx.send(match current.and_then(|on| crate::set_web_search(&client, &project, !on)) {
-                Ok(enabled) => AppEvent::WebSearch { enabled, toggled: true },
-                Err(e) => AppEvent::Error(e),
-            });
-        });
-    }
-
     /// Re-read what the agent is doing every `AGENT_EVERY`, one ask at a
     /// time, once it's set up.
     fn poll_agent(&mut self) {
@@ -3994,15 +3968,6 @@ impl App {
         self.spawn(move |client, tx| {
             if let Ok(skills) = crate::project_skills(&client, &project) {
                 let _ = tx.send(AppEvent::Skills(project, skills));
-            }
-        });
-    }
-
-    fn load_web_search(&self) {
-        let Some((project, _)) = self.project.clone() else { return };
-        self.spawn(move |client, tx| {
-            if let Ok(enabled) = crate::web_search_enabled(&client, &project) {
-                let _ = tx.send(AppEvent::WebSearch { enabled, toggled: false });
             }
         });
     }
@@ -5887,16 +5852,13 @@ impl App {
     fn usage_panel_lines(&self, loading: bool) -> Vec<Line<'static>> {
         let label = |text: &str| Span::styled(format!(" {:<12}", text), dim());
         let indent = || Span::raw(format!(" {:<12}", ""));
-        let switch = (self.web_search == Some(false)).then(|| {
-            Line::from(vec![indent(), Span::styled("web search is off for this project · ctrl+s turns it on", dim())])
-        });
         let Some(credits) = self.credits.as_ref() else {
             let text = if loading {
                 format!("asking the agent {}", self.spinner())
             } else {
                 "sign in with /login to see your usage".to_string()
             };
-            return std::iter::once(Line::from(vec![label("Credits"), Span::styled(text, dim())])).chain(switch).collect();
+            return vec![Line::from(vec![label("Credits"), Span::styled(text, dim())])];
         };
         let mut lines = Vec::new();
         let mut head = vec![label("Credits")];
@@ -5942,7 +5904,6 @@ impl App {
         if let Some(more) = more {
             lines.push(Line::from(vec![indent(), Span::styled("/upgrade", key_style()), Span::styled(more, dim())]));
         }
-        lines.extend(switch);
         lines
     }
 
@@ -7087,7 +7048,6 @@ fn help_lines() -> Vec<Line<'static>> {
         ("drag", "select and copy to the clipboard"),
         ("drop a file", "attach an image or document as [Image 1] or [Doc 1]"),
         ("[ctrl+o] /models", "models: enable, disable, download"),
-        ("[ctrl+s]", "turn web search on or off for the project"),
         ("/mcp", "MCP servers: list, remove"),
         ("/mcp add <url>", "connect an MCP server by its URL"),
         ("[ctrl+p] /project", "projects: switch (in a new session), create, delete"),
@@ -8072,6 +8032,44 @@ mod tests {
         assert!(matches!(app.entries.last(), Some(Entry::Shell(s)) if s.command == "git status"));
         assert!(app.tooling.as_ref().unwrap().calls.is_empty());
 
+    }
+
+    #[test]
+    fn a_turn_with_no_folder_still_searches_the_web() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut app = app();
+        app.phase = Phase::Ready;
+        app.project = Some(("p1".into(), "general_chat".into()));
+        let sent = Sent { message: "what about next weekend?".into(), ..Default::default() };
+        app.tooling = Some(Tooling { sent, ..Default::default() });
+        app.entries.push(Entry::Reply(Reply::default()));
+        app.turn = Some(Turn {
+            started: Instant::now(),
+            task: runtime.spawn(async {}),
+            entry: app.entries.len() - 1,
+            tokens: 0,
+            activity: None,
+            files_dir: None,
+            whole: Vec::new(),
+            calls: Vec::new(),
+        });
+        let calls = vec![
+            chat::ToolCall { id: "call_1".into(), name: "web_search".into(), arguments: r#"{"query": "events next weekend"}"#.into() },
+            chat::ToolCall { id: "call_2".into(), name: "bash".into(), arguments: r#"{"command": "ls"}"#.into() },
+        ];
+        app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
+        app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
+        // The search waits for its pages; the command has nowhere to run.
+        assert!(app.turn.is_none() && app.ask.is_none() && app.commands.is_none());
+        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
+        assert!(shown.text.contains("Searching the web: events next weekend"), "{}", shown.text);
+        let tooling = app.tooling.as_ref().unwrap();
+        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no working folder")));
+        app.apply(AppEvent::Searched("call_1".into(), "Web search results for: events next weekend".into()));
+        assert!(app.turn.is_some(), "the next round was sent");
+        let rounds = &app.tooling.as_ref().unwrap().rounds;
+        assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: events next weekend");
     }
 
     #[test]
@@ -9613,10 +9611,6 @@ mod tests {
         for expected in ["Credits", "24% used", "/upgrade to Pro or Plus for more credits a month"] {
             assert!(text.contains(expected), "{}\n{}", expected, text);
         }
-        // ctrl+s turned search off: say so, and how to turn it back on.
-        app.apply(AppEvent::WebSearch { enabled: false, toggled: true });
-        let text = screen(&app, 100, 30);
-        assert!(text.contains("web search is off for this project · ctrl+s turns it on"), "{}", text);
         // Signed out: nothing to show but how to sign in.
         app.apply(AppEvent::Credits(None));
         assert!(screen(&app, 100, 24).contains("sign in with /login"));
