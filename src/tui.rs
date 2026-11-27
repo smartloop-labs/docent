@@ -179,6 +179,8 @@ enum AppEvent {
     Ran(usize, String, String, Option<Ended>),
     /// A `web_search` call's result, by the call's id.
     Searched(String, String),
+    /// What a web call still running is doing: "Reading docs.rs".
+    Searching(String),
     /// A reply's scripts left unrun, as one before them failed or was
     /// stopped: off the running list, and out of the chat.
     Unrun(Vec<usize>),
@@ -887,6 +889,12 @@ fn pairs_part(segment: &str, width: u16) -> Vec<Line<'static>> {
         out = code_lines(&kept.join("\n"), width);
     }
     out
+}
+
+/// The host of `url`, to name a page being read: `docs.rs`.
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().filter(|h| !h.is_empty()).unwrap_or(url)
 }
 
 /// A file a reply is still giving: its name and how many lines have come,
@@ -1688,6 +1696,10 @@ struct App {
     /// should it not come; the task's `Entry::Finished` goes under it. The
     /// next prompt waits for it.
     summarizing: Option<(usize, String)>,
+    /// The web calls still running: when the first started, what they're
+    /// doing, and how many. No turn streams while they run, so this is
+    /// what the status line says.
+    searching: Option<(Instant, String, usize)>,
     /// Summaries asked for, for their ids.
     summaries: usize,
     /// A summary couldn't be asked for this session, and why was said.
@@ -1797,6 +1809,7 @@ impl App {
             task_started: Instant::now(),
             task_tokens: 0,
             summarizing: None,
+            searching: None,
             summaries: 0,
             summary_failed: false,
             command_round: 0,
@@ -2995,12 +3008,23 @@ impl App {
     fn start_searches(&mut self) {
         let searches = self.tooling.as_mut().map(|t| std::mem::take(&mut t.searches)).unwrap_or_default();
         for (id, call) in searches {
+            let doing = match &call {
+                WebCall::Search(_) => "Searching the web".to_string(),
+                WebCall::Fetch(url, _) => format!("Reading {}", host(url)),
+            };
+            self.searching = Some(match self.searching.take() {
+                Some((started, _, running)) => (started, doing, running + 1),
+                None => (Instant::now(), doing, 1),
+            });
             if cfg!(test) {
                 continue;
             }
             self.spawn(move |_, tx| {
                 let result = match call {
-                    WebCall::Search(query) => crate::web::search(&query),
+                    WebCall::Search(query) => {
+                        let steps = tx.clone();
+                        crate::web::search(&query, move |step| drop(steps.send(AppEvent::Searching(step.to_string()))))
+                    }
                     WebCall::Fetch(url, start) => crate::web::fetch(&url, start),
                 };
                 let _ = tx.send(AppEvent::Searched(id, result));
@@ -3012,6 +3036,10 @@ impl App {
     /// on once every call of the reply has one. One for a turn since
     /// stopped finds no call, and goes nowhere.
     fn searched(&mut self, id: String, result: String) {
+        self.searching = match self.searching.take() {
+            Some((started, doing, running)) if running > 1 => Some((started, doing, running - 1)),
+            _ => None,
+        };
         let Some(tooling) = &mut self.tooling else { return };
         let Some(call) = tooling.calls.iter_mut().find(|c| c.id == id && c.result.is_none()) else { return };
         call.result = Some(result);
@@ -3259,6 +3287,11 @@ impl App {
             AppEvent::PreRun(done) => self.pre_run_done(*done),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
             AppEvent::Searched(id, result) => self.searched(id, result),
+            AppEvent::Searching(step) => {
+                if let Some((_, doing, _)) = &mut self.searching {
+                    *doing = step.trim_end_matches(['.', '…']).to_string();
+                }
+            }
             AppEvent::Uploaded(ids) => {
                 if let Some(tooling) = &mut self.tooling {
                     tooling.sent.attachments = ids;
@@ -4926,6 +4959,12 @@ impl App {
                     detail.push_str(&format!(" · {} tokens", turn.tokens));
                 }
                 lines.push(working(what, detail));
+            }
+            // A web call runs between a turn's rounds, with nothing
+            // streaming: said here, or the wait reads as a stall.
+            (_, None) if self.tooling.is_some() && self.searching.is_some() => {
+                let (started, doing, _) = self.searching.as_ref().unwrap();
+                lines.push(working(doing.clone(), format_duration(started.elapsed())));
             }
             (_, None) if self.summarizing.is_some() => lines.push(working("Summarizing".to_string(), "esc skips".to_string())),
             _ => {}
@@ -8153,7 +8192,12 @@ mod tests {
         assert!(shown.text.contains("Searching the web: events next weekend"), "{}", shown.text);
         let tooling = app.tooling.as_ref().unwrap();
         assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no working folder")));
+        // With no turn streaming, the status line says what the search is at.
+        assert!(screen(&app, 80, 24).contains("Searching the web…"), "{}", screen(&app, 80, 24));
+        app.apply(AppEvent::Searching("Reading docs.rs".into()));
+        assert!(screen(&app, 80, 24).contains("Reading docs.rs…"), "{}", screen(&app, 80, 24));
         app.apply(AppEvent::Searched("call_1".into(), "Web search results for: events next weekend".into()));
+        assert!(app.searching.is_none());
         assert!(app.turn.is_some(), "the next round was sent");
         let rounds = &app.tooling.as_ref().unwrap().rounds;
         assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: events next weekend");
