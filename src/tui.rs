@@ -691,6 +691,21 @@ impl Reply {
                             (true, Some(file)) if pending => streaming_part(&file.path, &file.content, false, width),
                             (true, Some(file)) => self.file_part(&file.path, &file.content, false, streaming, &segment, width),
                             (true, None) if !docs.is_empty() => self.heredoc_part(&segment, start, &docs, replying, width),
+                            // An edit of a file the reply never names: not
+                            // made, and shown as its change all the same.
+                            // So are a reply's pairs when it wasn't asked
+                            // for files: its change, never its markup.
+                            (true, None) if segment.lines().any(files::is_search) => {
+                                let mut part = Vec::new();
+                                if self.root.is_some() && !pending {
+                                    part.push(Line::from(vec![
+                                        Span::styled("← ", dim()),
+                                        Span::styled("not changed: the reply doesn't say which file this is for", Style::new().fg(Color::Yellow)),
+                                    ]));
+                                }
+                                part.extend(pairs_part(&segment, width));
+                                part
+                            }
                             (true, None) => code_lines(&segment, width),
                             (false, _) => prose_lines(&segment, width),
                         },
@@ -823,7 +838,7 @@ impl Reply {
                     Span::styled(path.clone(), Style::new().bold()),
                     Span::styled(format!(" · not changed: {}", files::plainly(&why)), Style::new().fg(Color::Yellow)),
                 ])];
-                part.extend(code_lines(segment, width));
+                part.extend(pairs_part(segment, width));
                 part
             }
         }
@@ -835,6 +850,43 @@ impl Reply {
         let root = self.root.as_ref()?;
         self.olds.borrow_mut().entry(path.to_string()).or_insert_with(|| std::fs::read_to_string(root.join(path)).ok()).clone()
     }
+}
+
+/// An edit block that wasn't made, `segment` its text, as the change each
+/// of its pairs asks for: the lines to go and the lines to come, diffed by
+/// line, never its SEARCH and REPLACE lines. With no pair that can be read,
+/// its lines as code without them.
+fn pairs_part(segment: &str, width: u16) -> Vec<Line<'static>> {
+    let lines: Vec<&str> = segment.lines().collect();
+    let indent = lines.iter().find(|l| files::is_search(l)).map_or("", |l| &l[..l.len() - l.trim_start().len()]);
+    let mut body: Vec<&str> = lines.iter().map(|l| l.strip_prefix(indent).unwrap_or(l)).collect();
+    // A pair still coming in, or cut off: what has come of it.
+    if let Some(open) = body.iter().rposition(|l| files::is_search(l))
+        && !body[open..].iter().any(|l| files::is_replace(l))
+    {
+        while body.last().is_some_and(|l| files::opening_fence(l).is_some()) {
+            body.pop();
+        }
+        if !body[open..].iter().any(|l| files::is_divider(l)) {
+            body.push("=======");
+        }
+        body.push(">>>>>>> REPLACE");
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for edit in files::edits(&body) {
+        let mut diff = files::diff("", Some(&edit.search), &edit.replace, false);
+        diff.lines.retain(|l| !matches!(l, files::DiffLine::Hunk { .. }));
+        if !out.is_empty() {
+            out.push(Line::default());
+        }
+        out.extend(diff_lines(&diff, width).into_iter().skip(1));
+    }
+    if out.is_empty() {
+        let markup = |l: &str| files::is_search(l) || files::is_replace(l) || files::own_edit_path(l).is_some() || files::is_own_edit_end(l);
+        let kept: Vec<&str> = body.into_iter().filter(|l| !markup(l)).collect();
+        out = code_lines(&kept.join("\n"), width);
+    }
+    out
 }
 
 /// A file a reply is still giving: its name and how many lines have come,
@@ -872,6 +924,16 @@ fn segments(text: &str) -> Vec<(bool, String, usize)> {
             let fence = "`".repeat(longest.max(2) + 1);
             let close = if closed { format!("\n{fence}") } else { String::new() };
             out.push((true, format!("{fence}\n{}{close}", body.join("\n")), i));
+            i = end;
+            prose = end;
+            continue;
+        }
+        // So is one written in a form of the model's own.
+        if let Some((_, end)) = files::own_edit(&lines, i) {
+            if prose < i {
+                out.push((false, lines[prose..i].join("\n"), prose));
+            }
+            out.push((true, format!("````\n{}\n````", lines[i..end].join("\n")), i));
             i = end;
             prose = end;
             continue;
@@ -9032,6 +9094,43 @@ mod tests {
         assert!(shown.contains(&"← a.txt  +1 −1".to_string()), "{:?}", shown);
         assert!(!shown.iter().any(|r| r.contains("SEARCH")), "{:?}", shown);
         assert_eq!(files::extract_in(dir.path(), &reply.text).files[0].content, "one\n2\nthree\n");
+    }
+
+    #[test]
+    fn an_edit_never_shows_its_search_and_replace_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let rows = |text: &str| -> Vec<String> {
+            let reply = Reply { root: Some(dir.path().to_path_buf()), text: text.into(), stats: Some(TurnStats::default()), ..Default::default() };
+            reply.body(60).iter().map(|l| l.to_string().trim_end().to_string()).collect()
+        };
+        let clean = |shown: &[String]| !shown.iter().any(|r| r.contains("SEARCH") || r.contains("REPLACE") || r.contains("======="));
+        // One more edit of the file before it, under prose naming none.
+        let shown = rows("a.txt\n<<<<<<< SEARCH\none\n=======\n1\n>>>>>>> REPLACE\n\nEdit 2 — the next line:\n\n    <<<<<<< SEARCH\n    two\n    =======\n    2\n    >>>>>>> REPLACE\n\nDone.\n");
+        assert_eq!(shown.iter().filter(|r| *r == "← a.txt  +1 −1").count(), 2, "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // No file named anywhere: not made, shown as its change.
+        let shown = rows("Edit 2 — the next line:\n\n<<<<<<< SEARCH\ntwo\n=======\n2\n>>>>>>> REPLACE\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.starts_with("← not changed: the reply doesn't say which file")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+2")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // Its marker lines the words alone, and no file named.
+        let shown = rows("And a small README tweak:\n\n    SEARCH\n    two\n    =======\n    2\n    REPLACE\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+2")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // A form of the model's own: told as not made, its lines without its markers.
+        let shown = rows("A touch-up:\n\n    EDIT a.txt\n    two\n    2\n    END_EDIT\n\nDone.\n");
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed: the change came in a form that can't be read")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("two")) && !shown.iter().any(|r| r.contains("EDIT")), "{:?}", shown);
+        // Cut off partway through a pair, under a script's name.
+        let shown = rows("2. jade-shell — the call site:\n\n    jade-shell\n    <<<<<<< SEARCH\n    two\n    =======\n    # picker\n    ORDER=(a b");
+        assert!(shown.iter().any(|r| r.contains("-two")) && shown.iter().any(|r| r.contains("+# picker")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
+        // One that can't be made.
+        let shown = rows("```edit a.txt\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE\n```\n");
+        assert!(shown.iter().any(|r| r.starts_with("← a.txt · not changed")), "{:?}", shown);
+        assert!(shown.iter().any(|r| r.contains("-nope")), "{:?}", shown);
+        assert!(clean(&shown), "{:?}", shown);
     }
 
     #[test]

@@ -21,8 +21,12 @@ files below do and why, then give every change: a change you only describe isn't
 there with an edit block, never by giving it again whole: a fenced block marked `edit` with the file's path \
 after it (```` ```edit src/app.js ````), holding one or more pairs of a line `<<<<<<< SEARCH`, the lines to \
 change copied exactly from the file with a line or two around them so they're found once, a line `=======`, \
-the lines to put in their place, and a line `>>>>>>> REPLACE`. Copy the lines as the file has them, without \
-the line numbers `explore` shows. Give only the lines that change and a little around them, never the rest of \
+the lines to put in their place, and a line `>>>>>>> REPLACE`. Every change to a file comes this way, the \
+last and the smallest too, such as a line of the README after the code: a fenced `edit` block of its own with \
+the file's path in the fence, all of one file's pairs in the one block, and the three marker lines written \
+exactly as here, angle brackets and all. Nothing else is read as a change, so it isn't made: no pairs outside \
+a fence or indented under a numbered step, no path left to the sentence above, no markers of your own. Copy \
+the lines as the file has them, without the line numbers `explore` shows. Give only the lines that change and a little around them, never the rest of \
 the file. Give a new file whole with a shell heredoc in a fenced block marked `sh`: a line \
 `cat > path/to/file <<'EOF'`, with the path relative to the working folder, then the file's complete contents, \
 then `EOF` alone on its line; never a comment such as `// ... rest unchanged` in place of lines. When a block's \
@@ -43,7 +47,7 @@ the background, and what comes after doesn't wait for it.";
 /// A change to a file that's there, as an edit block of just the lines
 /// that change, shown to the agent with `HINT` and again when a change is
 /// asked for over.
-pub const EDIT_EXAMPLE: &str = "For example, to change the speed in `src/app.js`, give just those lines:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 3;\n\nfunction tick(x) {\n=======\nconst speed = 5;\n\nfunction tick(x) {\n>>>>>>> REPLACE\n```";
+pub const EDIT_EXAMPLE: &str = "For example, to change the speed in `src/app.js`, give just those lines:\n\n```edit src/app.js\n<<<<<<< SEARCH\nconst speed = 3;\n\nfunction tick(x) {\n=======\nconst speed = 5;\n\nfunction tick(x) {\n>>>>>>> REPLACE\n```\n\nA second change, however small, to that file or another, is written the same way, never loosely:\n\n```edit README.md\n<<<<<<< SEARCH\nRuns at speed 3.\n=======\nRuns at speed 5.\n>>>>>>> REPLACE\n```";
 
 /// Files at a folder's top that say it's a code project, and its kind.
 const MARKERS: [(&str, &str); 14] = [
@@ -805,7 +809,8 @@ fn gather(reply: &str, ended: bool, on_disk: impl Fn(&str) -> Option<String>) ->
 /// REPLACE line and no pair around it, or writes a file whole with a pair's
 /// markers still in it.
 fn without_markup(before: &str, after: String) -> String {
-    let markup = |line: &str| is_search(line) || is_replace(line);
+    // With its angle brackets: the word alone may be a line of the file.
+    let markup = |line: &str| (is_search(line) || is_replace(line)) && line.trim_start().starts_with(['<', '>']);
     if !after.lines().any(markup) {
         return after;
     }
@@ -823,21 +828,23 @@ fn without_markup(before: &str, after: String) -> String {
     out
 }
 
-/// A line opening an edit's search text: `<<<<<<< SEARCH`.
+/// A line opening an edit's search text: `<<<<<<< SEARCH`, or the word
+/// alone, as models also write it.
 pub(crate) fn is_search(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with("<<<<<<<") && t.trim_start_matches('<').trim() == "SEARCH"
+    t == "SEARCH" || (t.starts_with("<<<<<<<") && t.trim_start_matches('<').trim() == "SEARCH")
 }
 
-/// A line ending an edit's replacement: `>>>>>>> REPLACE`.
-fn is_replace(line: &str) -> bool {
+/// A line ending an edit's replacement: `>>>>>>> REPLACE`, or the word
+/// alone.
+pub(crate) fn is_replace(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with(">>>>>>>") && t.trim_start_matches('>').trim() == "REPLACE"
+    t == "REPLACE" || (t.starts_with(">>>>>>>") && t.trim_start_matches('>').trim() == "REPLACE")
 }
 
 /// A line between an edit's search and its replacement: `=======`, seven
 /// and no more, so a markdown heading's longer underline isn't taken for it.
-fn is_divider(line: &str) -> bool {
+pub(crate) fn is_divider(line: &str) -> bool {
     line.trim() == "======="
 }
 
@@ -847,6 +854,11 @@ fn is_divider(line: &str) -> bool {
 /// it has ended, its last pair done and something else after it.
 pub(crate) fn bare_edit(lines: &[&str], k: usize) -> Option<(usize, bool)> {
     if !is_search(lines.get(k)?) {
+        return None;
+    }
+    // The word alone opens one only once its divider has come: a line of
+    // prose may be just that word.
+    if lines[k].trim() == "SEARCH" && !lines[k + 1..].iter().any(|l| is_divider(l)) {
         return None;
     }
     let mut at = k;
@@ -860,6 +872,28 @@ pub(crate) fn bare_edit(lines: &[&str], k: usize) -> Option<(usize, bool)> {
             None => return Some((replace + 1, false)),
         }
     }
+}
+
+/// The file named by a line `EDIT path`, which opens an edit written in a
+/// form of the model's own, down to a line `END_EDIT`.
+pub(crate) fn own_edit_path(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("EDIT ")?.trim().trim_matches(|c| matches!(c, '`' | '*' | ':'));
+    as_path(rest).or_else(|| edited_name(rest))
+}
+
+/// A line that ends such an edit.
+pub(crate) fn is_own_edit_end(line: &str) -> bool {
+    matches!(line.trim(), "END_EDIT" | "END EDIT")
+}
+
+/// An edit written in a form of the model's own, when `lines[k]` opens it:
+/// `EDIT path`, its lines, `END_EDIT`. Its file and the index past its end;
+/// none until its end has come. It's read so it's told as a change not
+/// made and asked for again, not passed over as code.
+pub(crate) fn own_edit(lines: &[&str], k: usize) -> Option<(String, usize)> {
+    let path = own_edit_path(lines.get(k)?)?;
+    let end = (k + 1..lines.len()).find(|&j| is_own_edit_end(lines[j]))?;
+    Some((path, end + 1))
 }
 
 /// The pairs of an edit block's `body` given with no SEARCH lines: each
@@ -1234,12 +1268,33 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
             // SEARCH/REPLACE pairs with no fence around them: an edit of
             // the file named on the line above.
             if let Some((end, closed)) = bare_edit(&lines, at) {
-                if let Some((_, label)) = above
-                    && let Some(path) = label_path(label)
-                {
+                // Under a line that names no file ("Edit 2: drop the copy"),
+                // it's one more edit of the file the heading or the block
+                // before it names.
+                let label = above.map(|(_, label)| label);
+                let path = label
+                    .and_then(|l| label_path(l).or_else(|| edited_name(l).filter(|n| n.contains(['-', '_', '.', '/']))))
+                    .or_else(|| heading.take())
+                    .or_else(|| blocks.last().map(|b| b.file.path.clone()))
+                    .or_else(|| label.and_then(edited_name));
+                if let Some(path) = path {
+                    // Indented as a block, its lines lose that indent.
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    let body: Vec<&str> = lines[at..end].iter().map(|l| l.strip_prefix(indent).unwrap_or(l)).collect();
                     let file = File { path, content: String::new() };
-                    blocks.push(Block { file, fence: at, end, append: false, closed, edit: Some(edits(&lines[at..end])) });
+                    blocks.push(Block { file, fence: at, end, append: false, closed, edit: Some(edits(&body)) });
                 }
+                i = end;
+                above = None;
+                continue;
+            }
+            // `EDIT path` to `END_EDIT`: its pairs when it has a divider,
+            // else an edit that can't be read.
+            if let Some((path, end)) = own_edit(&lines, at) {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let body: Vec<&str> = lines[at + 1..end - 1].iter().map(|l| l.strip_prefix(indent).unwrap_or(l)).collect();
+                let edit = if body.iter().any(|l| is_search(l)) { edits(&body) } else { markerless_edits(&body) };
+                blocks.push(Block { file: File { path, content: String::new() }, fence: at, end, append: false, closed: true, edit: Some(edit) });
                 i = end;
                 above = None;
                 continue;
@@ -1254,7 +1309,15 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
             {
                 let fence = (i..next).find(|k| !lines[*k].trim().is_empty()).unwrap_or(i);
                 let closed = next < lines.len() || ended;
-                blocks.push(Block { file: File { path, content }, fence, end: next, append: false, closed, edit: None });
+                // SEARCH/REPLACE pairs indented under the path: an edit of
+                // the file, not its contents.
+                if let Some(first) = (i..next).find(|k| is_search(lines[*k])) {
+                    let edit = Some(edits(&content.lines().collect::<Vec<_>>()));
+                    let file = File { path, content: String::new() };
+                    blocks.push(Block { file, fence: first, end: next, append: false, closed, edit });
+                } else {
+                    blocks.push(Block { file: File { path, content }, fence, end: next, append: false, closed, edit: None });
+                }
                 i = next;
                 above = None;
                 continue;
@@ -1282,6 +1345,15 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
         {
             path = Some(labelled);
         }
+        // An edit's file may have a name with no extension, a script's:
+        // after `edit` in the fence, or alone on the line above.
+        let pairs = body.iter().any(|l| is_search(l));
+        if path.is_none() && pairs {
+            let mut words = info.split_whitespace();
+            path = (words.next() == Some("edit")).then(|| words.next()).flatten().and_then(edited_name).or_else(|| {
+                above.and_then(|(_, label)| edited_name(label)).filter(|n| n.contains(['-', '_', '.', '/']))
+            });
+        }
         if path.is_none() {
             path = body.first().and_then(|first| comment_path(first));
         }
@@ -1291,7 +1363,7 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
             && let Some(first) = body.iter().position(|l| !l.trim().is_empty())
             && !is_search(body[first])
             && body[first..].iter().any(|l| is_search(l))
-            && let Some(named) = label_path(body[first])
+            && let Some(named) = label_path(body[first]).or_else(|| edited_name(body[first]))
         {
             path = Some(named);
             body.drain(..=first);
@@ -1312,6 +1384,10 @@ fn blocks_of(reply: &str, ended: bool) -> Vec<Block> {
         // whose heredocs name their own files.
         if path.is_none() && !heredoc_lang(info) {
             path = heading;
+        }
+        // An edit that names no file is one more of the file before it.
+        if path.is_none() && body.iter().any(|l| is_search(l)) {
+            path = blocks.last().map(|b| b.file.path.clone());
         }
         above = None;
         // A block that opens with a heredoc writing a file is that heredoc,
@@ -1787,11 +1863,7 @@ pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> Diff {
         return diff;
     };
     let a: Vec<&str> = old.lines().collect();
-    let mut ops: Vec<(char, &str)> = if a.len() * b.len() > 4_000_000 {
-        a.iter().map(|l| ('-', *l)).chain(b.iter().map(|l| ('+', *l))).collect()
-    } else {
-        lcs_ops(&a, &b)
-    };
+    let mut ops = line_ops(&a, &b);
     // Streaming, the last run of changes is still arriving: of the old
     // lines in it, only as many as new lines have come are taken out, as
     // replaced; the rest may yet be kept, so they don't show as removed.
@@ -1859,35 +1931,20 @@ pub fn diff(path: &str, old: Option<&str>, new: &str, streaming: bool) -> Diff {
     diff
 }
 
-/// `a` turned into `b` line by line, by their longest common run: each
-/// line kept (` `), taken out (`-`) or put in (`+`).
-fn lcs_ops<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
-    let (n, m) = (a.len(), b.len());
-    let w = m + 1;
-    let mut table = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            table[i * w + j] =
-                if a[i] == b[j] { table[(i + 1) * w + j + 1] + 1 } else { table[(i + 1) * w + j].max(table[i * w + j + 1]) };
-        }
-    }
-    let (mut i, mut j) = (0, 0);
-    let mut ops = Vec::new();
-    while i < n && j < m {
-        if a[i] == b[j] {
-            ops.push((' ', a[i]));
-            i += 1;
-            j += 1;
-        } else if table[(i + 1) * w + j] >= table[i * w + j + 1] {
-            ops.push(('-', a[i]));
-            i += 1;
+/// `a` turned into `b` line by line, as `git diff` has it (`similar`'s
+/// Myers): each line kept (` `), taken out (`-`) or put in (`+`), the
+/// lines a change takes out ahead of those it puts in.
+fn line_ops<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
+    let mut ops = Vec::with_capacity(a.len().max(b.len()));
+    for op in similar::capture_diff_slices(similar::Algorithm::Myers, a, b) {
+        let (tag, gone, came) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            ops.extend(a[gone].iter().map(|l| (' ', *l)));
         } else {
-            ops.push(('+', b[j]));
-            j += 1;
+            ops.extend(a[gone].iter().map(|l| ('-', *l)));
+            ops.extend(b[came].iter().map(|l| ('+', *l)));
         }
     }
-    ops.extend(a[i..].iter().map(|l| ('-', *l)));
-    ops.extend(b[j..].iter().map(|l| ('+', *l)));
     ops
 }
 
@@ -1966,6 +2023,23 @@ fn label_path(line: &str) -> Option<String> {
         .unwrap_or(text);
     let text = text.trim_matches(|c: char| matches!(c, '*' | '_' | '`' | ':' | '(' | ')') || c.is_whitespace());
     as_path(text).or_else(|| described_path(text))
+}
+
+/// The file a line names for the edit under it when its name has no
+/// extension, as a script's hasn't (`jade-shell`, `bin/setup`): all the
+/// line says, one word of path characters. An edit is of a file that's
+/// there, so a word that names none makes no file; it's an edit not made.
+fn edited_name(line: &str) -> Option<String> {
+    let text = line.trim().trim_matches(|c: char| matches!(c, '*' | '_' | '`' | ':' | '#') || c.is_whitespace());
+    let text = text.strip_prefix("./").unwrap_or(text);
+    let allowed = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '+' | '@');
+    let named = !text.is_empty()
+        && text.chars().all(allowed)
+        && text.chars().any(char::is_alphabetic)
+        && !text.starts_with('/')
+        && !text.ends_with('/')
+        && Path::new(text).components().all(|c| matches!(c, Component::Normal(_)));
+    named.then(|| text.to_string())
 }
 
 /// A path ahead of a note on it, as small models write one: `Cargo.toml -
@@ -2658,8 +2732,11 @@ mod tests {
         // The example the agent is shown applies.
         let example = EDIT_EXAMPLE.split_once("\n\n").unwrap().1;
         let app = "const speed = 3;\n\nfunction tick(x) {\n  return x + speed;\n}\n";
-        let done = extract_with(example, true, |_| Some(app.into()));
+        let readme = "# App\n\nRuns at speed 3.\n";
+        let done = extract_with(example, true, |p| Some(if p == "README.md" { readme.into() } else { app.into() }));
+        assert!(done.failed.is_empty(), "{:?}", done.failed);
         assert_eq!(done.files[0].content, app.replace("speed = 3", "speed = 5"));
+        assert_eq!((done.files[1].path.as_str(), done.files[1].content.as_str()), ("README.md", "# App\n\nRuns at speed 5.\n"));
     }
 
     #[test]
@@ -2863,6 +2940,48 @@ mod tests {
         assert!(!super::blocks(open)[0].closed);
         // With no file named, it isn't one.
         assert!(super::blocks("<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n").is_empty());
+    }
+
+    #[test]
+    fn an_edit_naming_no_file_is_one_more_of_the_file_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("theme.sh"), "a=1\ntheme_palette\n\nhex2rgb() {\n  echo hi\n}\n").unwrap();
+        let pair = "    <<<<<<< SEARCH\n    theme_palette\n\n    hex2rgb() {\n      echo hi\n    }\n    =======\n    theme_palette\n    >>>>>>> REPLACE\n";
+        // Bare and indented, under prose that names no file.
+        let bare = format!("```edit theme.sh\n<<<<<<< SEARCH\na=1\n=======\na=2\n>>>>>>> REPLACE\n```\n\nEdit 2 — remove the copy (it moved up):\n\n{pair}\nDone.\n");
+        // Fenced, the same.
+        let fenced = "**theme.sh**\n```\n<<<<<<< SEARCH\na=1\n=======\na=2\n>>>>>>> REPLACE\n```\n\nEdit 2:\n\n```\n<<<<<<< SEARCH\ntheme_palette\n\nhex2rgb() {\n  echo hi\n}\n=======\ntheme_palette\n>>>>>>> REPLACE\n```\n";
+        for reply in [bare.as_str(), fenced] {
+            let got = extract_in(dir.path(), reply);
+            assert!(got.failed.is_empty(), "{reply}: {:?}", got.failed);
+            assert_eq!(got.files[0].content, "a=2\ntheme_palette\n", "{reply}");
+        }
+        // Its SEARCH and REPLACE lines written as the words alone.
+        let words = "```edit theme.sh\n<<<<<<< SEARCH\na=1\n=======\na=2\n>>>>>>> REPLACE\n```\n\nAnd a small tweak:\n\n    SEARCH\n    theme_palette\n\n    hex2rgb() {\n      echo hi\n    }\n    =======\n    theme_palette\n    REPLACE\n\nDone.\n";
+        let got = extract_in(dir.path(), words);
+        assert!(got.failed.is_empty(), "{:?}", got.failed);
+        assert_eq!(got.files[0].content, "a=2\ntheme_palette\n");
+        assert!(super::blocks("SEARCH\nfor the word.\n").is_empty());
+        // A form of the model's own: with no divider it can't be read, and is asked for again.
+        let own = "A touch-up:\n\n    EDIT theme.sh\n    a=1\n    a=2\n    END_EDIT\n";
+        let got = extract_in(dir.path(), own);
+        assert!(got.files.is_empty());
+        assert_eq!(got.failed, vec![("theme.sh".to_string(), "the edit block has no complete SEARCH/REPLACE pair".to_string())]);
+        let got = extract_in(dir.path(), "EDIT theme.sh\na=1\n=======\na=2\nEND_EDIT\n");
+        assert_eq!(got.files[0].content, "a=2\ntheme_palette\n\nhex2rgb() {\n  echo hi\n}\n");
+        // A script's name has no extension: alone above the pairs, or in the fence.
+        fs::write(dir.path().join("jade-shell"), "x\ntheme_palette\n").unwrap();
+        for reply in [
+            "2. jade-shell — the call site:\n\n    jade-shell\n    <<<<<<< SEARCH\n    theme_palette\n    =======\n    pick\n    >>>>>>> REPLACE\n\nDone.\n",
+            "```edit jade-shell\n<<<<<<< SEARCH\ntheme_palette\n=======\npick\n>>>>>>> REPLACE\n```\n",
+            "jade-shell\n```\n<<<<<<< SEARCH\ntheme_palette\n=======\npick\n>>>>>>> REPLACE\n```\n",
+        ] {
+            let got = extract_in(dir.path(), reply);
+            assert_eq!(got.files.first().map(|f| (f.path.as_str(), f.content.as_str())), Some(("jade-shell", "x\npick\n")), "{reply}");
+        }
+        // Indented under its path, it's an edit, not the file's contents.
+        let got = extract_in(dir.path(), &format!("theme.sh\n\n{pair}"));
+        assert_eq!(got.files[0].content, "a=1\ntheme_palette\n");
     }
 
     #[test]
