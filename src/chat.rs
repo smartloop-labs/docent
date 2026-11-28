@@ -314,6 +314,10 @@ pub fn request_body(request: &Request) -> serde_json::Value {
         "session_id": request.session_id,
         "project_id": request.project_id,
         "stream": true,
+        // Web search is always on here: there's no switch for it, so the
+        // project's own (off in projects made before it defaulted on) is
+        // not left to decide.
+        "web_search": true,
     });
     // Docent's own tools, which it runs: they need a folder. The framework
     // adds `web_search` and `web_fetch` to whatever is sent here, on every
@@ -698,8 +702,10 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], TOOL_NAME);
         assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
         assert_eq!(body["tools"][1]["function"]["name"], crate::files::EXPLORE_TOOL);
-        // The web tools are the framework's to offer and run, not sent from here.
+        // The web tools are the framework's to offer and run, not sent from
+        // here; the turn asks for them, whatever the project's switch says.
         assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(body["web_search"], true);
         assert!(body.get("cwd").is_none());
         let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
@@ -712,6 +718,7 @@ mod tests {
         // A turn that isn't making files sends no tools: the framework's are all it has.
         let plain = request_body(&Request { system: None, tools: false, rounds: &[], attachments: &["a1".into()], ..request });
         assert!(plain.get("tools").is_none() && plain.get("tool_choice").is_none());
+        assert_eq!(plain["web_search"], true);
         assert_eq!(plain["messages"], serde_json::json!([{"role": "user", "content": "list it", "attachments": ["a1"]}]));
     }
 
