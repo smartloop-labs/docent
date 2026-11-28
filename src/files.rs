@@ -95,6 +95,52 @@ pub fn project_kind(root: &Path) -> Option<&'static str> {
     MARKERS.iter().find(|(marker, _)| root.join(marker).is_file()).map(|(_, kind)| *kind)
 }
 
+/// Extensions of source that runs as it is, with no manifest beside it:
+/// `(extension, kind)`.  Rust and Go are left out, as theirs builds only in a
+/// project (see `NEEDS_MANIFEST`).
+const SCRIPTS: [(&str, &str); 14] = [
+    ("sh", "Shell"),
+    ("bash", "Shell"),
+    ("zsh", "Shell"),
+    ("fish", "Shell"),
+    ("py", "code"),
+    ("js", "code"),
+    ("mjs", "code"),
+    ("ts", "code"),
+    ("rb", "code"),
+    ("pl", "code"),
+    ("lua", "code"),
+    ("php", "code"),
+    ("ps1", "code"),
+    ("swift", "code"),
+];
+
+/// Top-level entries looked at for a script, at most: a folder of thousands
+/// of files isn't walked to learn what it is.
+const SCRIPT_SCAN: usize = 400;
+
+/// The kind of a folder that holds scripts and no manifest, from the files
+/// at its top: a repository of shell scripts is a code project too, though
+/// nothing in it says so by name.  "Shell" when a shell script is among them,
+/// else "code"; none for a folder of documents.
+pub fn script_kind(root: &Path) -> Option<&'static str> {
+    let mut found = None;
+    for entry in fs::read_dir(root).ok()?.flatten().take(SCRIPT_SCAN) {
+        let path = entry.path();
+        let hidden = path.file_name().and_then(|n| n.to_str()).is_none_or(|n| n.starts_with('.'));
+        if hidden || !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+        match SCRIPTS.iter().find(|(e, _)| e.eq_ignore_ascii_case(ext)) {
+            Some((_, "Shell")) => return Some("Shell"),
+            Some((_, kind)) => found = Some(*kind),
+            None => {}
+        }
+    }
+    found
+}
+
 /// Languages whose source doesn't build without a manifest beside it:
 /// `(extension, manifest, language)`.
 const NEEDS_MANIFEST: [(&str, &str, &str); 2] = [("rs", "Cargo.toml", "Rust"), ("go", "go.mod", "Go")];
@@ -3183,5 +3229,36 @@ mod tests {
         assert_eq!(test_command(root, Some("JavaScript/TypeScript")).as_deref(), Some("make test-e2e"));
         package(r#""test": "vitest run", "test:e2e": "playwright test""#);
         assert_eq!(test_command(root, Some("JavaScript/TypeScript")).as_deref(), Some("npm run --silent test:e2e"));
+    }
+}
+
+#[cfg(test)]
+mod script_kind_tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_of_scripts_is_a_code_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str| std::fs::write(dir.path().join(name), "x\n").unwrap();
+
+        // Documents alone say nothing.
+        write("README.md");
+        write("notes.txt");
+        assert_eq!(script_kind(dir.path()), None);
+        // Nor a hidden script, nor Rust or Go source, which needs a manifest.
+        write(".hook.sh");
+        write("main.rs");
+        write("tool.go");
+        assert_eq!(script_kind(dir.path()), None);
+
+        // A script that runs as it is does, and a shell script names the kind.
+        write("build.py");
+        assert_eq!(script_kind(dir.path()), Some("code"));
+        write("jade.SH");
+        assert_eq!(script_kind(dir.path()), Some("Shell"));
+
+        // A manifest still decides for itself; this is only the fallback.
+        assert_eq!(project_kind(dir.path()), None);
+        assert_eq!(script_kind(std::path::Path::new("/no/such/folder")), None);
     }
 }
