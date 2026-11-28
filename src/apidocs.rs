@@ -760,7 +760,7 @@ fn java_jar(home: &Path, group: &str, artifact: &str, version: &str) -> Option<P
 /// describes; from a jar of classes alone, the names of its classes.
 fn java(jar: &Path, artifact: &str) -> Option<Vec<Section>> {
     let mut archive = zip::ZipArchive::new(fs::File::open(jar).ok()?).ok()?;
-    let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let mut names: Vec<String> = archive.file_names().filter_map(|n| n.ok()).map(|n| n.into_owned()).collect();
     // Its top packages first, and each package's docs before its classes.
     names.sort_by_key(|n| (n.matches('/').count(), !n.ends_with("package-info.java"), n.clone()));
     let mut sections = Vec::new();
