@@ -6000,12 +6000,15 @@ fn capability_list(list: &str) -> Result<Vec<String>, String> {
 
 /// The kind of code project at `root`, as in "Rust", when prompts there are
 /// answered with code: by its mark when it has one (set when it was
-/// linked), else by its files.
+/// linked), else by its files: a manifest, or with none, scripts at its
+/// top.  Without the scripts a repository of shell scripts was no code
+/// project, so a follow-up there that named no file ("apply the changes")
+/// went as plain chat: no word on how to give files, and none written.
 fn code_kind(root: &std::path::Path) -> Option<&'static str> {
     match docent::kind(root) {
         Some(docent::Kind::Code) => Some(files::project_kind(root).unwrap_or("code")),
         Some(docent::Kind::Documents) => None,
-        None => files::project_kind(root),
+        None => files::project_kind(root).or_else(|| files::script_kind(root)),
     }
 }
 
