@@ -1,0 +1,21 @@
+version: 2
+
+# Smartloop's crate registry (see .cargo/config.toml). It is public, but
+# Dependabot only reaches hosts declared here, so without this entry every
+# cargo update fails on "egress not allowlisted dl.smartloop.ai".
+registries:
+  smartloop:
+    type: cargo-registry
+    registry: smartloop
+    url: https://dl.smartloop.ai/crates/
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    registries:
+      - smartloop
+    schedule:
+      interval: weekly
+    # Security updates only: zero turns off routine version-bump PRs, and
+    # security updates have their own limit.
+    open-pull-requests-limit: 0
