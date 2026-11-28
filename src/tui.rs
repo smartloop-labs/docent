@@ -177,10 +177,6 @@ enum AppEvent {
     /// A reply's script finished, or went on in the background: as
     /// `Shell`, with the project it ran for.
     Ran(usize, String, String, Option<Ended>),
-    /// A `web_search` call's result, by the call's id.
-    Searched(String, String),
-    /// What a web call still running is doing: "Reading docs.rs".
-    Searching(String),
     /// A reply's scripts left unrun, as one before them failed or was
     /// stopped: off the running list, and out of the chat.
     Unrun(Vec<usize>),
@@ -891,12 +887,6 @@ fn pairs_part(segment: &str, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-/// The host of `url`, to name a page being read: `docs.rs`.
-fn host(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    rest.split(['/', '?', '#']).next().filter(|h| !h.is_empty()).unwrap_or(url)
-}
-
 /// A file a reply is still giving: its name and how many lines have come,
 /// not its code. Once its block is done it's written, and it shows as its
 /// change against the file there; a whole file streaming in line by line
@@ -1293,17 +1283,6 @@ struct Tooling {
     failed: Option<String>,
     /// Why the next round isn't sent, once it's known it won't be.
     stop: Option<String>,
-    /// `web_search` and `web_fetch` calls of the last reply not started
-    /// yet, by id.
-    searches: Vec<(String, WebCall)>,
-}
-
-/// A call of the web tools, run off the UI thread.
-#[derive(Clone, Debug, PartialEq)]
-enum WebCall {
-    Search(String),
-    /// A page's URL, and the character to read it from.
-    Fetch(String, usize),
 }
 
 /// One tool call of a reply, as it runs.
@@ -1344,29 +1323,6 @@ impl Tooling {
                     let (result, note) = self.explore(&call.arguments);
                     shown.push_str(&format!("\n\n{}\n", note));
                     c.result = Some(result);
-                    return c;
-                }
-                // A web search runs off the UI thread, with no question:
-                // its result comes when the pages are read.
-                if call.name == crate::web::TOOL {
-                    match crate::web::query(&call.arguments) {
-                        Ok(query) => {
-                            shown.push_str(&format!("\n\nSearching the web: {}\n", query.replace('\n', " ")));
-                            self.searches.push((c.id.clone(), WebCall::Search(query)));
-                        }
-                        Err(why) => c.result = Some(why),
-                    }
-                    return c;
-                }
-                if call.name == crate::web::FETCH_TOOL {
-                    match crate::web::fetch_args(&call.arguments) {
-                        Ok((url, start)) => {
-                            let from = if start > 0 { format!(" (from character {})", start) } else { String::new() };
-                            shown.push_str(&format!("\n\nReading {}{}\n", url, from));
-                            self.searches.push((c.id.clone(), WebCall::Fetch(url, start)));
-                        }
-                        Err(why) => c.result = Some(why),
-                    }
                     return c;
                 }
                 match bash_command(&call.name, &call.arguments) {
@@ -1437,12 +1393,10 @@ fn bash_command(name: &str, arguments: &str) -> Result<(String, Option<String>),
     // `bash` by habit, on Windows too, runs as the tool offered there.
     if name != chat::TOOL_NAME && name != "bash" {
         return Err(format!(
-            "Error: there's no tool named `{}`; the tools are `{}`, `{}`, `{}` and `{}`.",
+            "Error: there's no tool named `{}` to run here; the tools run here are `{}` and `{}`.",
             name,
             chat::TOOL_NAME,
-            files::EXPLORE_TOOL,
-            crate::web::TOOL,
-            crate::web::FETCH_TOOL
+            files::EXPLORE_TOOL
         ));
     }
     let arguments: serde_json::Value = serde_json::from_str(arguments)
@@ -1696,10 +1650,6 @@ struct App {
     /// should it not come; the task's `Entry::Finished` goes under it. The
     /// next prompt waits for it.
     summarizing: Option<(usize, String)>,
-    /// The web calls still running: when the first started, what they're
-    /// doing, and how many. No turn streams while they run, so this is
-    /// what the status line says.
-    searching: Option<(Instant, String, usize)>,
     /// Summaries asked for, for their ids.
     summaries: usize,
     /// A summary couldn't be asked for this session, and why was said.
@@ -1809,7 +1759,6 @@ impl App {
             task_started: Instant::now(),
             task_tokens: 0,
             summarizing: None,
-            searching: None,
             summaries: 0,
             summary_failed: false,
             command_round: 0,
@@ -2121,9 +2070,9 @@ impl App {
 
     /// Start the turn `sent`, its tool rounds from none.
     fn start_sent(&mut self, project: String, sent: Sent, files: Vec<Attachment>) {
-        // Every turn offers `web_search`, and one with a working directory
-        // `bash` too, run there. Its tool rounds start over: it's a new
-        // request, not one going on.
+        // A turn with a working directory offers `bash`, run there; the
+        // framework offers `web_search` on every turn and runs it itself.
+        // Its tool rounds start over: it's a new request, not one going on.
         self.tooling = Some(Tooling { sent: sent.clone(), ..Default::default() });
         self.start_turn(project, sent, files, Vec::new());
     }
@@ -3003,49 +2952,6 @@ impl App {
         self.tool_round_done();
     }
 
-    /// The last reply's `web_search` and `web_fetch` calls, started each
-    /// on a thread of its own, their pages coming back as `Searched`.
-    fn start_searches(&mut self) {
-        let searches = self.tooling.as_mut().map(|t| std::mem::take(&mut t.searches)).unwrap_or_default();
-        for (id, call) in searches {
-            let doing = match &call {
-                WebCall::Search(_) => "Searching the web".to_string(),
-                WebCall::Fetch(url, _) => format!("Reading {}", host(url)),
-            };
-            self.searching = Some(match self.searching.take() {
-                Some((started, _, running)) => (started, doing, running + 1),
-                None => (Instant::now(), doing, 1),
-            });
-            if cfg!(test) {
-                continue;
-            }
-            self.spawn(move |_, tx| {
-                let result = match call {
-                    WebCall::Search(query) => {
-                        let steps = tx.clone();
-                        crate::web::search(&query, move |step| drop(steps.send(AppEvent::Searching(step.to_string()))))
-                    }
-                    WebCall::Fetch(url, start) => crate::web::fetch(&url, start),
-                };
-                let _ = tx.send(AppEvent::Searched(id, result));
-            });
-        }
-    }
-
-    /// A `web_search` call's pages are in: its result, and the round goes
-    /// on once every call of the reply has one. One for a turn since
-    /// stopped finds no call, and goes nowhere.
-    fn searched(&mut self, id: String, result: String) {
-        self.searching = match self.searching.take() {
-            Some((started, doing, running)) if running > 1 => Some((started, doing, running - 1)),
-            _ => None,
-        };
-        let Some(tooling) = &mut self.tooling else { return };
-        let Some(call) = tooling.calls.iter_mut().find(|c| c.id == id && c.result.is_none()) else { return };
-        call.result = Some(result);
-        self.tool_round_done();
-    }
-
     /// The last reply's tool calls, once each has its result and nothing
     /// else is going on (its files' check, a question about its commands,
     /// another turn), go back to the agent in a turn of their own, which
@@ -3196,7 +3102,6 @@ impl App {
                                 // The post-run skill: what the reply gave to
                                 // remember is kept for the next sessions.
                                 let remembered = files::remembered(&reply.text);
-                                self.start_searches();
                                 match files::remember(&root, &remembered) {
                                     Ok(added) if added.is_empty() => {}
                                     Ok(added) => self.entries.push(Entry::Notice(format!("Remembered: {}", added.join("; ")))),
@@ -3216,19 +3121,17 @@ impl App {
                                 if !commands.is_empty() {
                                     self.commands = Some((cwd, commands));
                                 }
-                                self.start_searches();
                                 self.run_commands();
                             } else if !turn.calls.is_empty()
                                 && let Some(tooling) = &mut self.tooling
                             {
-                                // No working directory: only `web_search`
-                                // was offered, so only searches run; a
-                                // command has nowhere to.
+                                // No working directory: no tool of
+                                // Docent's was offered, and a command the
+                                // model calls anyway has nowhere to run.
                                 let text = reply.text.clone();
                                 let (commands, shown) = tooling.called(&text, turn.calls);
                                 tooling.resolve(&commands, "Not run: this turn has no working folder; only `web_search` and `web_fetch` are available.");
                                 reply.text.push_str(&shown);
-                                self.start_searches();
                                 self.tool_round_done();
                             }
                         }
@@ -3286,12 +3189,6 @@ impl App {
             AppEvent::Diagnostics(id, servers, problems) => self.diagnostics_ended(id, servers, problems),
             AppEvent::PreRun(done) => self.pre_run_done(*done),
             AppEvent::Ran(id, project, output, code) => self.ran(id, project, output, code),
-            AppEvent::Searched(id, result) => self.searched(id, result),
-            AppEvent::Searching(step) => {
-                if let Some((_, doing, _)) = &mut self.searching {
-                    *doing = step.trim_end_matches(['.', '…']).to_string();
-                }
-            }
             AppEvent::Uploaded(ids) => {
                 if let Some(tooling) = &mut self.tooling {
                     tooling.sent.attachments = ids;
@@ -4959,12 +4856,6 @@ impl App {
                     detail.push_str(&format!(" · {} tokens", turn.tokens));
                 }
                 lines.push(working(what, detail));
-            }
-            // A web call runs between a turn's rounds, with nothing
-            // streaming: said here, or the wait reads as a stall.
-            (_, None) if self.tooling.is_some() && self.searching.is_some() => {
-                let (started, doing, _) = self.searching.as_ref().unwrap();
-                lines.push(working(doing.clone(), format_duration(started.elapsed())));
             }
             (_, None) if self.summarizing.is_some() => lines.push(working("Summarizing".to_string(), "esc skips".to_string())),
             _ => {}
@@ -8161,7 +8052,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_with_no_folder_still_searches_the_web() {
+    fn a_command_called_on_a_turn_with_no_folder_is_not_run() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = runtime.enter();
         let mut app = app();
@@ -8180,27 +8071,17 @@ mod tests {
             whole: Vec::new(),
             calls: Vec::new(),
         });
-        let calls = vec![
-            chat::ToolCall { id: "call_1".into(), name: "web_search".into(), arguments: r#"{"query": "events next weekend"}"#.into() },
-            chat::ToolCall { id: "call_2".into(), name: "bash".into(), arguments: r#"{"command": "ls"}"#.into() },
-        ];
+        // The web tools are the framework's, run there: a call that reaches
+        // here is one of Docent's own, which this turn never offered.
+        let calls = vec![chat::ToolCall { id: "call_2".into(), name: "bash".into(), arguments: r#"{"command": "ls"}"#.into() }];
         app.apply(AppEvent::Chat(ChatEvent::ToolCalls(calls)));
         app.apply(AppEvent::TurnDone(Ok(TurnStats { tokens: 1, elapsed: Duration::from_secs(1), cut_off: false })));
-        // The search waits for its pages; the command has nowhere to run.
-        assert!(app.turn.is_none() && app.ask.is_none() && app.commands.is_none());
-        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
-        assert!(shown.text.contains("Searching the web: events next weekend"), "{}", shown.text);
-        let tooling = app.tooling.as_ref().unwrap();
-        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no working folder")));
-        // With no turn streaming, the status line says what the search is at.
-        assert!(screen(&app, 80, 24).contains("Searching the web…"), "{}", screen(&app, 80, 24));
-        app.apply(AppEvent::Searching("Reading docs.rs".into()));
-        assert!(screen(&app, 80, 24).contains("Reading docs.rs…"), "{}", screen(&app, 80, 24));
-        app.apply(AppEvent::Searched("call_1".into(), "Web search results for: events next weekend".into()));
-        assert!(app.searching.is_none());
+        // The command has nowhere to run: it's answered so, with no question,
+        // and the round goes back to the agent.
+        assert!(app.ask.is_none() && app.commands.is_none());
         assert!(app.turn.is_some(), "the next round was sent");
         let rounds = &app.tooling.as_ref().unwrap().rounds;
-        assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: events next weekend");
+        assert!(rounds.last().unwrap()["content"].as_str().is_some_and(|r| r.contains("no working folder")), "{:?}", rounds);
     }
 
     #[test]
@@ -8253,34 +8134,6 @@ mod tests {
         assert_eq!(tooling.sent.whole, ["src/main.rs"]);
         assert_eq!(app.turn.as_ref().unwrap().whole, ["src/main.rs"]);
 
-        // A web search waits for its pages, with no question, then goes on.
-        let search = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "web_search".into(), arguments: arguments.into() };
-        reply(&mut app, vec![search("call_3", r#"{"query": "tokio select"}"#), search("call_4", "{}")]);
-        assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the search");
-        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
-        assert!(shown.text.contains("\n\nSearching the web: tokio select\n"), "{}", shown.text);
-        let tooling = app.tooling.as_ref().unwrap();
-        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("no `query` given")));
-        app.apply(AppEvent::Searched("call_9".into(), "stray".into()));
-        assert!(app.turn.is_none());
-        app.apply(AppEvent::Searched("call_3".into(), "Web search results for: tokio select".into()));
-        assert!(app.turn.is_some(), "the next round was sent");
-        let rounds = &app.tooling.as_ref().unwrap().rounds;
-        assert_eq!(rounds[rounds.len() - 2]["content"], "Web search results for: tokio select");
-
-        // So does reading a page by its URL; a URL that isn't http(s) is
-        // answered at once.
-        let fetch = |id: &str, arguments: &str| chat::ToolCall { id: id.into(), name: "web_fetch".into(), arguments: arguments.into() };
-        reply(&mut app, vec![fetch("call_5", r#"{"url": "https://docs.rs/tokio", "start": 12000}"#), fetch("call_6", r#"{"url": "ftp://x"}"#)]);
-        assert!(app.ask.is_none() && app.turn.is_none(), "the round waits on the page");
-        let Some(Entry::Reply(shown)) = app.entries.last() else { panic!() };
-        assert!(shown.text.contains("\n\nReading https://docs.rs/tokio (from character 12000)\n"), "{}", shown.text);
-        let tooling = app.tooling.as_ref().unwrap();
-        assert!(tooling.calls[1].result.as_deref().is_some_and(|r| r.contains("isn't an http(s) URL")));
-        app.apply(AppEvent::Searched("call_5".into(), "https://docs.rs/tokio\n\npage".into()));
-        assert!(app.turn.is_some(), "the next round was sent");
-        let rounds = &app.tooling.as_ref().unwrap().rounds;
-        assert_eq!(rounds[rounds.len() - 2]["content"], "https://docs.rs/tokio\n\npage");
     }
 
     #[test]

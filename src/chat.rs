@@ -133,8 +133,10 @@ pub struct Request<'a> {
     pub session_id: &'a str,
     /// Offer the `bash` and `explore` tools: on any turn with a working
     /// directory, where its commands run and its files are read.
-    /// `web_search` and `web_fetch` are offered either way. A server that won't give tools
-    /// to the model it picked ignores them and answers in text, as before.
+    /// `web_search` and `web_fetch` are the framework's own: it offers them
+    /// to the model and runs them itself, on every turn, so they aren't sent
+    /// from here. A server that won't give tools to the model it picked
+    /// ignores them and answers in text, as before.
     pub tools: bool,
     /// The turn's tool rounds so far, after the user's message: each
     /// assistant message with its `tool_calls`, then a `tool` message with
@@ -313,15 +315,13 @@ pub fn request_body(request: &Request) -> serde_json::Value {
         "project_id": request.project_id,
         "stream": true,
     });
-    // `web_search` and `web_fetch` go on every turn: they need no folder, only the model
-    // asking for it.
-    let tools = if request.tools {
-        serde_json::json!([bash_tool(), explore_tool(), crate::web::tool(), crate::web::fetch_tool()])
-    } else {
-        serde_json::json!([crate::web::tool(), crate::web::fetch_tool()])
-    };
-    body["tools"] = tools;
-    body["tool_choice"] = serde_json::json!("auto");
+    // Docent's own tools, which it runs: they need a folder. The framework
+    // adds `web_search` and `web_fetch` to whatever is sent here, on every
+    // turn, and runs those itself.
+    if request.tools {
+        body["tools"] = serde_json::json!([bash_tool(), explore_tool()]);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
     body
 }
 
@@ -698,8 +698,8 @@ mod tests {
         assert_eq!(body["tools"][0]["function"]["name"], TOOL_NAME);
         assert_eq!(body["tools"][0]["function"]["parameters"]["required"], serde_json::json!(["command"]));
         assert_eq!(body["tools"][1]["function"]["name"], crate::files::EXPLORE_TOOL);
-        assert_eq!(body["tools"][2]["function"]["name"], crate::web::TOOL);
-        assert_eq!(body["tools"][3]["function"]["name"], crate::web::FETCH_TOOL);
+        // The web tools are the framework's to offer and run, not sent from here.
+        assert_eq!(body["tools"].as_array().unwrap().len(), 2);
         assert!(body.get("cwd").is_none());
         let roles: Vec<&str> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
@@ -709,10 +709,9 @@ mod tests {
         );
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
 
-        // A turn that isn't making files offers the web tools alone.
+        // A turn that isn't making files sends no tools: the framework's are all it has.
         let plain = request_body(&Request { system: None, tools: false, rounds: &[], attachments: &["a1".into()], ..request });
-        assert_eq!(plain["tools"].as_array().unwrap().len(), 2);
-        assert_eq!(plain["tools"][0]["function"]["name"], crate::web::TOOL);
+        assert!(plain.get("tools").is_none() && plain.get("tool_choice").is_none());
         assert_eq!(plain["messages"], serde_json::json!([{"role": "user", "content": "list it", "attachments": ["a1"]}]));
     }
 
